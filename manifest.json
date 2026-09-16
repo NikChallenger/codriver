@@ -1,0 +1,10 @@
+{
+  "id": "codriver",
+  "name": "CoDriver",
+  "version": "0.5.0",
+  "minAppVersion": "1.5.0",
+  "description": "Chat with your Obsidian vault through connected LLM providers.",
+  "author": "NikChallenger",
+  "authorUrl": "https://github.com/NikChallenger",
+  "isDesktopOnly": false
+}
