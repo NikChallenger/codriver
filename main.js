@@ -24774,6 +24774,7 @@
             `${this.plugin.getDiagnosticLogPath() || "The CoDriver diagnostic log"}\nThis file is refreshed when CoDriver restarts.`
           );
           setting.descEl?.addClass("codriver-diagnostic-log-file-description");
+          if (setting.descEl) setting.settingEl.appendChild(setting.descEl);
         }
         setting
           .addToggle((toggle) => {
