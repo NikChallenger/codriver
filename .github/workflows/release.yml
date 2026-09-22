@@ -1,0 +1,120 @@
+name: Prepare Attested Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public release tag, for example 0.5.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-draft-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-attest:
+    if: github.repository == 'NikChallenger/codriver' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out the exact public tag
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Verify immutable release identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(node -p "require('./manifest.json').version")" = "$RELEASE_TAG"
+          git fetch origin main --depth=1
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+      - name: Rebuild and verify the committed bundle
+        run: |
+          npm run build
+          git diff --exit-code -- main.js
+          rm src/generated/vendorAssets.js
+          rmdir src/generated
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Attest exact release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+      - name: Transfer exact release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: codriver-${{ inputs.tag }}-release-assets
+          path: |
+            main.js
+            manifest.json
+            styles.css
+          if-no-files-found: error
+          retention-days: 1
+
+  prepare-draft:
+    needs: build-and-attest
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check out release notes from the exact tag
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Download attested assets
+        uses: actions/download-artifact@v4
+        with:
+          name: codriver-${{ inputs.tag }}-release-assets
+          path: release-assets
+      - name: Create or verify the matching draft
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="docs/releases/$RELEASE_TAG.md"
+          test -s "$notes"
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq "[.[] | select(.tag_name == \"$RELEASE_TAG\")][0]")"
+          if [ "$release_json" = "null" ]; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --title "CoDriver $RELEASE_TAG" \
+              --notes-file "$notes" \
+              release-assets/main.js \
+              release-assets/manifest.json \
+              release-assets/styles.css
+          else
+            test "$(printf '%s' "$release_json" | jq -r '.draft')" = "true"
+            test "$(printf '%s' "$release_json" | jq -r '.name')" = "CoDriver $RELEASE_TAG"
+            existing_body="$(printf '%s' "$release_json" | jq -r '.body')"
+            test "$existing_body" = "$(cat "$notes")"
+          fi
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > "$RUNNER_TEMP/actual-assets.txt"
+          printf '%s\n' main.js manifest.json styles.css > "$RUNNER_TEMP/expected-assets.txt"
+          diff -u "$RUNNER_TEMP/expected-assets.txt" "$RUNNER_TEMP/actual-assets.txt"
+          mkdir "$RUNNER_TEMP/existing-assets"
+          gh release download "$RELEASE_TAG" --dir "$RUNNER_TEMP/existing-assets"
+          cmp release-assets/main.js "$RUNNER_TEMP/existing-assets/main.js"
+          cmp release-assets/manifest.json "$RUNNER_TEMP/existing-assets/manifest.json"
+          cmp release-assets/styles.css "$RUNNER_TEMP/existing-assets/styles.css"

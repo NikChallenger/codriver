@@ -1,0 +1,17 @@
+{
+  "name": "codriver-obsidian-plugin",
+  "version": "0.5.1",
+  "description": "Chat with your vault through connected language model providers.",
+  "main": "main.js",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "llm",
+    "openai-compatible"
+  ],
+  "author": "NikChallenger",
+  "license": "MIT"
+}

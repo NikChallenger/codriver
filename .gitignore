@@ -1,0 +1,14 @@
+node_modules/
+.pnpm-store/
+dist/
+/data.json
+/main.js.map
+*.d.ts
+.obsidian/
+.DS_Store
+npm-debug.log*
+coverage/
+sessions/
+skills/
+logs/
+/release/

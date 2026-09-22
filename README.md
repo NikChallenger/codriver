@@ -48,6 +48,7 @@ CoDriver works with your vault through its built-in MCP server. Its configurable
 - Active-note content is never injected automatically.
 - Provider keys use Obsidian secret storage.
 - Proposed edits are revalidated before application or rollback.
+- MCP arguments are validated locally against each tool's discovered schema without coercion; invalid calls are returned to the model and are never executed.
 - Diagnostics exclude note content, prompts, provider responses, tool data, transcripts, and secrets.
 
 Your selected provider still receives the context required for the current request. Review that provider's privacy and retention terms before sending sensitive material.
@@ -61,7 +62,9 @@ Your selected provider still receives the context required for the current reque
 
 To update CoDriver, download the latest versions of the same three files, replace the installed copies, and reload Obsidian.
 
-The public GitHub repository is a binary distribution surface. Development source code is maintained privately. GitHub's automatically generated source archives contain only public distribution metadata and are not installable CoDriver packages.
+The public GitHub repository contains the reviewed source snapshot and generated release artifacts for each public version. Its root `build.mjs` rebuilds `main.js` without registry dependencies, and the committed bundle must match that build exactly. Private release-control instructions, internal automation, and tests are not included in the public snapshot.
+
+GitHub's automatically generated source archives are source snapshots, not installable CoDriver packages. Install CoDriver using the three assets attached to a matching GitHub release.
 
 ## Requirements
 

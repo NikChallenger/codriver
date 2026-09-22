@@ -1,0 +1,38 @@
+name: Validate Public Source
+
+on:
+  push:
+    branches:
+      - main
+      - "review/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.repository == 'NikChallenger/codriver'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Validate public metadata
+        run: >-
+          node -e "const p=require('./package.json'),m=require('./manifest.json'),v=require('./versions.json');
+          if(p.version!==m.version||p.description!==m.description||v[m.version]!==m.minAppVersion||m.description.includes('Obsidian'))process.exit(1)"
+      - name: Rebuild the plugin
+        run: npm run build
+      - name: Require an exact reproducible bundle
+        run: |
+          git diff --exit-code -- main.js
+          rm src/generated/vendorAssets.js
+          rmdir src/generated
+          test -z "$(git status --porcelain --untracked-files=all)"
