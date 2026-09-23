@@ -153,7 +153,7 @@
 }
 
 .codriver-settings-navigation-page > .codriver-session-history-setting + .codriver-diagnostic-logging-setting {
-  margin-top: var(--size-4-2);
+  margin-top: var(--size-4-3);
   padding-top: var(--size-4-2);
 }
 
