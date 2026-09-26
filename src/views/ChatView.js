@@ -361,6 +361,18 @@ class ChatView extends ItemView {
       cls: `codriver-chat-message codriver-chat-message-${message.role} codriver-chat-message-${message.status ?? "complete"}`
     });
 
+    if (message.maxToolsWarning) {
+      bubble.addClass("codriver-context-warning-card");
+      this.renderMaxToolsWarning(bubble, message);
+      return;
+    }
+
+    if (message.mcpLimitWarning) {
+      bubble.addClass("codriver-context-warning-card");
+      this.renderMcpCallLimitWarning(bubble, message);
+      return;
+    }
+
     if (message.contextBudgetWarning) {
       bubble.addClass("codriver-context-warning-card");
       this.renderContextBudgetWarning(bubble, message);
@@ -1067,7 +1079,7 @@ class ChatView extends ItemView {
       {
         decision: "continue-session",
         label: "Continue for session",
-        title: "Continue and skip context size warnings for this session."
+        title: "Continue and skip context size warnings for this user request."
       },
       {
         decision: "stop",
@@ -1089,6 +1101,86 @@ class ChatView extends ItemView {
         event.stopPropagation();
         for (const item of buttons) item.disabled = true;
         const result = await this.chatController.resolveContextBudgetWarning(warning.id, definition.decision);
+        if (result?.ok === false && result.message) new Notice(result.message);
+        this.render();
+      });
+      return button;
+    });
+  }
+
+  renderMaxToolsWarning(card, message) {
+    const warning = message.maxToolsWarning;
+    if (!warning) return;
+    const header = card.createDiv({ cls: "codriver-context-warning-header" });
+    const heading = header.createDiv({ cls: "codriver-context-warning-heading" });
+    const icon = heading.createSpan({ cls: "codriver-context-warning-icon", attr: { "aria-hidden": "true" } });
+    setIcon(icon, "triangle-alert");
+    heading.createSpan({ cls: "codriver-context-warning-title", text: warning.title || "Max tools warning" });
+    const body = card.createDiv({ cls: "codriver-context-warning-body" });
+    body.createDiv({
+      cls: "codriver-context-warning-copy",
+      text: warning.status === "pending"
+        ? `${formatNumber(warning.totalTools)} MCP tools are available; Max tools is ${formatNumber(warning.maximumTools)}. ${formatNumber(warning.excludedTools)} would be excluded. Continue sends all tools for this request.`
+        : message.content
+    });
+    if (warning.status !== "pending") return;
+    const actions = card.createDiv({ cls: "codriver-context-warning-actions", attr: {
+      role: "group", "aria-label": "Max tools warning actions"
+    } });
+    const buttons = [
+      ["continue", "Continue", "Send all available MCP tools for this user request."],
+      ["stop", "Stop", "Stop this request before sending its MCP tool catalog to the model."]
+    ].map(([decision, label, title]) => {
+      const button = actions.createEl("button", {
+        cls: `codriver-approval-button codriver-context-warning-${decision}`,
+        text: label, attr: { title, "aria-label": title }
+      });
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        for (const item of buttons) item.disabled = true;
+        const result = await this.chatController.resolveMaxToolsWarning(warning.id, decision);
+        if (result?.ok === false && result.message) new Notice(result.message);
+        this.render();
+      });
+      return button;
+    });
+  }
+
+  renderMcpCallLimitWarning(card, message) {
+    const warning = message.mcpLimitWarning;
+    if (!warning) return;
+    const header = card.createDiv({ cls: "codriver-context-warning-header" });
+    const heading = header.createDiv({ cls: "codriver-context-warning-heading" });
+    const icon = heading.createSpan({ cls: "codriver-context-warning-icon", attr: { "aria-hidden": "true" } });
+    setIcon(icon, "triangle-alert");
+    heading.createSpan({ cls: "codriver-context-warning-title", text: warning.title || "Max calls warning" });
+    const body = card.createDiv({ cls: "codriver-context-warning-body" });
+    body.createDiv({
+      cls: "codriver-context-warning-copy",
+      text: warning.status === "pending"
+        ? `Max calls (${formatNumber(warning.maximumCalls)}) was reached before the next automatic MCP tool call.`
+        : (message.content || "Automatic MCP tool chain stopped.")
+    });
+    if (warning.status !== "pending") return;
+    const actions = card.createDiv({ cls: "codriver-context-warning-actions", attr: {
+      role: "group", "aria-label": "Max calls warning actions"
+    } });
+    const definitions = [
+      ["continue", "Continue", "Run the next automatic MCP call, then warn again at the next limit."],
+      ["continue-session", "Continue for session", "Continue this user request without further Max calls warnings."],
+      ["stop", "Stop", "Stop the pending automatic MCP tool chain."]
+    ];
+    const buttons = definitions.map(([decision, label, title]) => {
+      const button = actions.createEl("button", {
+        cls: `codriver-approval-button codriver-context-warning-${decision}`,
+        text: label, attr: { title, "aria-label": title }
+      });
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        for (const item of buttons) item.disabled = true;
+        const result = await this.chatController.resolveMcpLimitWarning(warning.id, decision);
         if (result?.ok === false && result.message) new Notice(result.message);
         this.render();
       });
@@ -1628,13 +1720,46 @@ class ChatView extends ItemView {
       this.renderMcpToolCallBlock(body, "Output", toolCall.output);
     }
 
+    if (toolCall.outputWarning?.status === "pending") {
+      const warning = body.createDiv({ cls: "codriver-mcp-output-warning", attr: { role: "alert" } });
+      warning.createDiv({ cls: "codriver-mcp-output-warning-title", text: "Output chars warning" });
+      warning.createDiv({
+        text: `This tool returned ${formatNumber(toolCall.outputWarning.currentCharacters)} characters, above Output chars ${formatNumber(toolCall.outputWarning.maximumCharacters)}. Review Arguments and Output, then choose Continue to send the full result or Stop to send an error to the model.`
+      });
+    }
+
     if (toolCall.error) {
       body.createDiv({ cls: "codriver-mcp-call-error-text", text: toolCall.error });
     }
 
     this.renderMcpToolCallCardActions(card, toolCall);
 
-    const actions = card.createDiv({ cls: "codriver-mcp-call-actions" });
+    const actions = card.createDiv({
+      cls: "codriver-mcp-call-actions",
+      ...(toolCall.outputWarning?.status === "pending"
+        ? { attr: { role: "group", "aria-label": "MCP output size warning actions" } }
+        : {})
+    });
+    if (toolCall.outputWarning?.status === "pending") {
+      const buttons = [
+        ["continue", "Continue", "Send this complete MCP tool result to the model."],
+        ["stop", "Stop", "Send a tool error to the model without this result."]
+      ].map(([decision, label, title]) => {
+        const button = actions.createEl("button", {
+          cls: `codriver-approval-button codriver-context-warning-${decision}`,
+          text: label, attr: { title, "aria-label": title }
+        });
+        button.addEventListener("click", async (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          for (const item of buttons) item.disabled = true;
+          const result = await this.chatController.resolveMcpLimitWarning(toolCall.outputWarning.id, decision);
+          if (result?.ok === false && result.message) new Notice(result.message);
+          this.render();
+        });
+        return button;
+      });
+    }
     if (toolCall.executionBlockMessage) {
       actions.createDiv({ cls: "codriver-mcp-call-error-text", text: toolCall.executionBlockMessage });
     }
@@ -2040,7 +2165,8 @@ class ChatView extends ItemView {
       });
     }
 
-    if (!(toolCall.status === "running" && toolCall.toolName === CODRIVER_VAULT_MOVE_FILE_TOOL_NAME)) {
+    if (toolCall.status !== "output-review" &&
+      !(toolCall.status === "running" && toolCall.toolName === CODRIVER_VAULT_MOVE_FILE_TOOL_NAME)) {
       const deleteButton = actions.createEl("button", {
         cls: "codriver-message-action-button",
         attr: {
@@ -2051,7 +2177,8 @@ class ChatView extends ItemView {
       deleteButton.addEventListener("click", (event) => {
         event.stopPropagation();
         this.clearMcpToolCallCollapseState(toolCall.id);
-        this.chatController.deleteMcpToolCall(toolCall.id);
+        const result = this.chatController.deleteMcpToolCall(toolCall.id);
+        if (result?.ok === false && result.message) new Notice(result.message);
         this.render();
       });
     }
@@ -3472,8 +3599,8 @@ function formatContextWarningOutcome(outcome) {
   const labels = {
     "waiting-for-decision": "Waiting for decision",
     "continued-once": "Continued once",
-    "continued-for-session": "Continued for session",
-    "suppressed-for-session": "Continued by session setting",
+    "continued-for-session": "Continued for this request",
+    "suppressed-for-request": "Continued for this request",
     stopped: "Stopped",
     invalidated: "No longer available"
   };
@@ -3491,6 +3618,10 @@ function getMcpToolCallStatusLabel(status) {
 
   if (status === "running") {
     return "Running";
+  }
+
+  if (status === "output-review") {
+    return "Waiting for output review";
   }
 
   if (status === "complete") {

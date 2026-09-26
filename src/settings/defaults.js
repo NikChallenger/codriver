@@ -30,11 +30,9 @@ const DEFAULT_SETTINGS = {
   maxSessionHistory: 5,
   sessionStartupBehavior: "new",
   maxMcpTools: DEFAULT_MAX_MCP_TOOLS,
-  maxAutomaticMcpToolCalls: 6,
+  maxAutomaticMcpToolCalls: 10,
   mcpToolTimeoutSeconds: 60,
   maxMcpToolResultChars: 60000,
-  maxRecentMcpToolResults: 4,
-  maxRecentMcpToolResultContextChars: 24000,
   maxRequestContextChars: DEFAULT_MAX_REQUEST_CONTEXT_CHARS,
   enableCoDriverVaultTools: true,
   codriverVaultToolSettings: Object.fromEntries(

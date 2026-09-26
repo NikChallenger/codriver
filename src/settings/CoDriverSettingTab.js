@@ -49,16 +49,25 @@ const MCP_TOOL_LIMIT_FIELDS = [
     min: 0,
     max: 200,
     ariaLabel: "Maximum model-facing MCP tools",
-    description: "Maximum total model-facing MCP tools per request, including CoDriver Vault and external MCP tools. 0 means Unlimited."
+    description: "Warn before a request exposes more MCP tools than this value. Continue sends all available tools for that request. 0 means Unlimited."
   },
   {
     key: "maxAutomaticMcpToolCalls",
     label: "Max calls",
-    fallback: 6,
+    fallback: 10,
     min: 1,
     max: 20,
     ariaLabel: "Maximum automatic MCP tool calls",
     description: "Maximum MCP tool calls CoDriver may run automatically while completing one user request."
+  },
+  {
+    key: "maxMcpToolResultChars",
+    label: "Output chars",
+    fallback: 60000,
+    min: 1000,
+    max: 240000,
+    ariaLabel: "Maximum MCP tool result characters",
+    description: "Warn before one MCP tool result above this size is sent to the model. Continue sends the complete result."
   },
   {
     key: "mcpToolTimeoutSeconds",
@@ -68,33 +77,6 @@ const MCP_TOOL_LIMIT_FIELDS = [
     max: 600,
     ariaLabel: "MCP tool timeout seconds",
     description: "Maximum time CoDriver waits for one MCP tool call before marking it as failed."
-  },
-  {
-    key: "maxMcpToolResultChars",
-    label: "Output chars",
-    fallback: 60000,
-    min: 1000,
-    max: 240000,
-    ariaLabel: "Maximum MCP tool result characters",
-    description: "Maximum characters kept from one MCP tool result for the current chat card and immediate model follow-up. Longer output is marked as truncated."
-  },
-  {
-    key: "maxRecentMcpToolResults",
-    label: "Recent count",
-    fallback: 4,
-    min: 1,
-    max: 20,
-    ariaLabel: "Maximum remembered MCP tool results",
-    description: "Maximum completed MCP tool results kept in this chat session for later turns."
-  },
-  {
-    key: "maxRecentMcpToolResultContextChars",
-    label: "Memory chars",
-    fallback: 24000,
-    min: 1000,
-    max: 120000,
-    ariaLabel: "Maximum remembered MCP tool result characters",
-    description: "Maximum characters kept from each remembered MCP tool result when it is added to a later provider request."
   }
 ];
 
@@ -1850,37 +1832,20 @@ class ProviderSettingsModal extends Modal {
         ]
       });
 
-      const groundingSetting = new Setting(contentEl)
-        .setName("Google Search grounding")
-        .setDesc("Use Google Search for grounded responses.")
-        .addToggle((toggle) => {
-          toggle
-            .setValue(this.draft.enableGoogleSearch === true)
+      new Setting(contentEl)
+        .setName("Tool mode")
+        .addDropdown((dropdown) => {
+          dropdown
+            .addOption("custom-tools", "Custom tools")
+            .addOption("google-search", "Google Search")
+            .setValue(this.draft.enableGoogleSearch === true ? "google-search" : "custom-tools")
             .onChange((value) => {
-              this.draft.enableGoogleSearch = value;
-              this.render();
+              this.draft.enableGoogleSearch = value === "google-search";
             });
         });
-
-      groundingSetting.settingEl.classList.add("codriver-gemini-grounding-setting");
-      groundingSetting.controlEl.createSpan({
-        cls: "codriver-gemini-custom-tools-label",
-        text: "Custom tools"
-      });
-      groundingSetting.addToggle((toggle) => {
-        toggle
-          .setValue(this.draft.enableGroundedCustomTools === true)
-          .setDisabled?.(this.draft.enableGoogleSearch !== true);
-        toggle.toggleEl?.setAttribute("aria-label", "Custom tools");
-        toggle.toggleEl?.setAttribute(
-          "title",
-          this.draft.enableGoogleSearch === true
-            ? "Combine Google Search with enabled custom tools"
-            : "Enable Google Search grounding to use custom tools"
-        );
-        toggle.onChange((value) => {
-          this.draft.enableGroundedCustomTools = value;
-        });
+      contentEl.createDiv({
+        cls: "codriver-gemini-tool-mode-note",
+        text: "Gemma models cannot combine Google Search and custom tools. Choose one mode."
       });
 
     } else {

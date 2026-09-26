@@ -161,6 +161,8 @@ function normalizeSettings(settings) {
   settings.maxMcpTools = normalizeMaxMcpTools(settings.maxMcpTools);
   settings.maxAutomaticMcpToolCalls = normalizeMaxAutomaticMcpToolCalls(settings.maxAutomaticMcpToolCalls);
   settings.mcpToolTimeoutSeconds = normalizeMcpToolTimeoutSeconds(settings.mcpToolTimeoutSeconds);
+  delete settings.maxRecentMcpToolResults;
+  delete settings.maxRecentMcpToolResultContextChars;
   settings.maxRequestContextChars = normalizeMaxRequestContextChars(settings.maxRequestContextChars);
   settings.enableCoDriverVaultTools = settings.enableCoDriverVaultTools !== false;
   settings.codriverVaultToolSettings = normalizeCodriverVaultToolSettings(settings.codriverVaultToolSettings);
@@ -208,8 +210,7 @@ function createProviderSettings(type, id = "") {
       topK: "",
       thinkingBudget: "",
       thinkingLevel: "",
-      enableGoogleSearch: false,
-      enableGroundedCustomTools: false
+      enableGoogleSearch: false
     };
   }
 
@@ -289,7 +290,7 @@ function normalizeProviderSettings(provider, index = 0) {
     normalizedProvider.thinkingBudget = normalizeOptionalNonNegativeIntegerText(provider?.thinkingBudget);
     normalizedProvider.thinkingLevel = normalizeThinkingLevel(provider?.thinkingLevel);
     normalizedProvider.enableGoogleSearch = provider?.enableGoogleSearch === true;
-    normalizedProvider.enableGroundedCustomTools = provider?.enableGroundedCustomTools === true;
+    delete normalizedProvider.enableGroundedCustomTools;
     delete normalizedProvider.reasoningEffort;
     delete normalizedProvider.includeThoughts;
   } else {

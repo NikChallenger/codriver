@@ -23,7 +23,7 @@ CoDriver puts your preferred language models in the right sidebar. Create, impro
 | Provider type | Endpoint | Notes |
 | --- | --- | --- |
 | OpenAI | Your provider's OpenAI-compatible `/v1` endpoint | Hosted services and local servers are supported. |
-| Gemini | `https://generativelanguage.googleapis.com` | The API version defaults to `v1beta`. |
+| Gemini | `https://generativelanguage.googleapis.com` | The API version defaults to `v1beta`. Tool mode selects Google Search or Custom tools; Google Search mode does not expose MCP tools to the model. |
 | Anthropic | `https://api.anthropic.com` | Uses the native Claude Messages API. The endpoint is fixed. |
 
 If the test fails, check the endpoint, API key, account access, and local server status. OpenAI-compatible endpoints commonly end in `/v1`.
@@ -41,6 +41,7 @@ CoDriver works with your vault through its built-in MCP server. Its configurable
 - **Attachments and audio:** Add supported files to the conversation and transcribe audio.
 - **Skills and commands:** Reuse instructions, local references, and prompt templates.
 - **MCP:** Connect external HTTP tools, or stdio tools on supported desktop runtimes.
+- **MCP limits:** Max tools warns before an oversized catalog is sent to the model; Continue sends all available tools for that request. Max calls warns before another automatic tool call. Continue for session skips further Max calls warnings for the current request. Output chars lets you review a large tool result before sending it to the model. Earlier eligible results remain available during the live session; Maximum context size reviews the combined request.
 - **Local sessions:** Keep chat history on your device without saving attachment contents, transcripts, or tool results in it.
 
 ## Safety and privacy

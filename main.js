@@ -2208,6 +2208,7 @@
     const { capturePatchWorkList } = require("./PatchWorkList");
     const { createCoreSystemPrompt } = require("./CorePrompt");
     const {
+      GEMINI_PROVIDER_TYPE,
       MCP_HTTP_TRANSPORT,
       MCP_STDIO_TRANSPORT,
       OPENAI_COMPATIBLE_PROVIDER_TYPE
@@ -2285,12 +2286,6 @@
     const DEFAULT_MAX_MCP_TOOL_RESULT_CHARS = 60000;
     const MIN_MCP_TOOL_RESULT_CHARS = 1000;
     const MAX_MCP_TOOL_RESULT_CHARS_SETTING = 240000;
-    const DEFAULT_MAX_RECENT_MCP_TOOL_RESULTS = 4;
-    const MIN_RECENT_MCP_TOOL_RESULTS = 1;
-    const MAX_RECENT_MCP_TOOL_RESULTS_SETTING = 20;
-    const DEFAULT_MAX_RECENT_MCP_TOOL_RESULT_CONTEXT_CHARS = 24000;
-    const MIN_RECENT_MCP_TOOL_RESULT_CONTEXT_CHARS = 1000;
-    const MAX_RECENT_MCP_TOOL_RESULT_CONTEXT_CHARS_SETTING = 120000;
     const MAX_RECENT_MCP_TOOL_ARGUMENT_CONTEXT_CHARS = 2000;
     const MAX_CONTINUATION_REQUEST_CONTEXT_CHARS = 4000;
     const MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS = 2000;
@@ -2301,7 +2296,7 @@
     const MAX_MCP_DIAGNOSTIC_TOOLS = 200;
     const MAX_MCP_DIAGNOSTIC_ERRORS = 32;
     const MAX_MCP_DIAGNOSTIC_LABEL_CHARS = 160;
-    const DEFAULT_MAX_AUTOMATIC_MCP_TOOL_CALLS = 6;
+    const DEFAULT_MAX_AUTOMATIC_MCP_TOOL_CALLS = 10;
     const DEFAULT_MCP_TOOL_TIMEOUT_SECONDS = 60;
     const MIN_MCP_TOOL_TIMEOUT_SECONDS = 0.05;
     const MAX_MCP_TOOL_TIMEOUT_SECONDS = 600;
@@ -2476,13 +2471,14 @@
     }
 
     function serializeMessage(message) {
+      const expiredMcpWarning = message.mcpLimitWarning?.status === "pending" || message.maxToolsWarning?.status === "pending";
       return {
         id: message.id,
         role: message.role,
         author: message.author,
         time: message.time,
-        status: message.status,
-        content: message.content,
+        status: expiredMcpWarning ? "error" : message.status,
+        content: expiredMcpWarning ? "This MCP limit warning expired when the session was saved. Send a new request." : message.content,
         commandName: typeof message.commandName === "string" ? message.commandName : undefined,
         createdAt: message.createdAt,
         sendToProvider: message.sendToProvider,
@@ -2577,6 +2573,7 @@
         createdAt: toolCall.createdAt,
         error: toolCall.error,
         output: toolCall.output,
+        outputWarning: toolCall.outputWarning ? { ...toolCall.outputWarning } : undefined,
         groupId: toolCall.groupId,
         groupIndex: toolCall.groupIndex,
         groupSize: toolCall.groupSize,
@@ -2620,10 +2617,12 @@
             : audioTranscriptionToolCall
               ? (toolCall.audioTranscriptionReview?.path ? { path: toolCall.audioTranscriptionReview.path } : {})
               : (isPlainObject(toolCall.arguments) ? cloneJsonValue(toolCall.arguments) : {}),
-        status: approvalExpired ? "cancelled" : toolCall.status,
+        status: toolCall.status === "output-review" ? "error" : (approvalExpired ? "cancelled" : toolCall.status),
         time: toolCall.time,
         createdAt: toolCall.createdAt,
-        error: approvalExpired
+        error: toolCall.status === "output-review"
+          ? "MCP output review expired when the session was saved. Request the result again."
+          : approvalExpired
           ? (deleteNoteToolCall
               ? "Delete note approval expired after session restore. Prepare the delete request again."
               : (audioTranscriptionToolCall
@@ -3371,6 +3370,7 @@
       return status === "pending" ||
         status === "queued" ||
         status === "running" ||
+        status === "output-review" ||
         status === "complete" ||
         status === "error" ||
         status === "rejected" ||
@@ -3486,7 +3486,10 @@
         this.requestInfoById = new Map();
         this.sessionRequestInfoByPath = new Map();
         this.pendingContextBudgetOverrides = new Map();
-        this.contextBudgetWarningsSuppressed = false;
+        this.pendingMaxToolsWarnings = new Map();
+        this.resolvingMaxToolsWarning = false;
+        this.pendingMcpLimitActions = new Map();
+        this.resolvingMcpLimitAction = false;
         this.lastRequestAutoSkillIds = [];
         this.manualMcpServerIds = new Set(this.getDefaultManualMcpServerIds());
         this.skillMcpResolution = {
@@ -3762,12 +3765,12 @@
         loadingMessage.status = "loading";
         loadingMessage.author = action.model || this.getSelectedModelLabel();
         loadingMessage.time = currentTimeLabel();
-        loadingMessage.content = "Thinking";
+        loadingMessage.content = "";
         loadingMessage.hidden = false;
         delete loadingMessage.contextBudgetWarning;
 
         if (decision === "continue-session") {
-          this.contextBudgetWarningsSuppressed = true;
+          action.contextBudgetScope.suppressed = true;
         }
 
         const activeRequest = this.createActiveRequest(loadingMessage.id);
@@ -3780,12 +3783,12 @@
         );
         void this.logDiagnostic(
           decision === "continue-session"
-            ? "provider.context_budget.session_suppression.enabled"
+            ? "provider.context_budget.request_suppression.enabled"
             : "provider.context_budget.continued",
           {
             ...action.diagnostic,
             status: "continued",
-            scope: decision === "continue-session" ? "session" : "call"
+            scope: decision === "continue-session" ? "request" : "call"
           }
         );
         await this.notifyStateChanged();
@@ -3933,7 +3936,249 @@
           });
         }
         this.pendingContextBudgetOverrides.clear();
-        this.contextBudgetWarningsSuppressed = false;
+      }
+
+      resetMaxToolsWarningSession(message = "This Max tools warning expired when the session changed.") {
+        for (const action of this.pendingMaxToolsWarnings.values()) {
+          const loadingMessage = this.messages.find((item) => item.id === action.messageId);
+          if (!loadingMessage) continue;
+          loadingMessage.status = "error";
+          loadingMessage.content = message;
+          loadingMessage.sendToProvider = false;
+          loadingMessage.maxToolsWarning = { ...loadingMessage.maxToolsWarning, status: "invalidated" };
+        }
+        this.pendingMaxToolsWarnings.clear();
+      }
+
+      async resolveMaxToolsWarning(actionId, decision) {
+        const action = this.pendingMaxToolsWarnings.get(actionId);
+        if (!action) return { ok: false, reason: "not-found", message: "This Max tools warning is no longer active." };
+        if (decision !== "continue" && decision !== "stop") {
+          return { ok: false, reason: "invalid-action", message: "This Max tools warning action is unavailable." };
+        }
+        if (this.sending || this.resolvingMaxToolsWarning) {
+          return { ok: false, reason: "busy", message: "Wait for the current response." };
+        }
+        const loadingMessage = this.messages.find((item) => item.id === action.messageId);
+        const provider = action.providerId
+          ? this.providerRegistry.get(action.providerId)
+          : this.providerRegistry.first();
+        const currentCatalog = this.createRequestBoundMcpCatalog(action.requestSkills, { unlimitedForRequest: true });
+        const skillsCurrent = action.requestSkills.every((skill) =>
+          this.isSkillAvailableForRetainedRequest(this.skillRegistry.get(skill.id))
+        );
+        const current = Boolean(
+          loadingMessage?.maxToolsWarning?.status === "pending" &&
+          action.sessionId === this.currentSessionId &&
+          this.getMaxMcpTools() === action.maximumTools &&
+          provider &&
+          (this.settings.selectedProviderId || this.providerRegistry.first()?.id || "") === action.providerId &&
+          this.getSelectedModelId() === action.model &&
+          getProviderContinuationBinding(provider) === action.providerBinding &&
+          skillsCurrent &&
+          currentCatalog.ok && currentCatalog.fingerprint === action.catalogFingerprint
+        );
+        if (!current) {
+          this.pendingMaxToolsWarnings.delete(actionId);
+          if (loadingMessage) {
+            loadingMessage.status = "error";
+            loadingMessage.content = "The originating MCP request changed. Send a new request.";
+            loadingMessage.sendToProvider = false;
+            loadingMessage.maxToolsWarning = { ...loadingMessage.maxToolsWarning, status: "invalidated" };
+          }
+          this.markRequestInfoError("The originating MCP request changed. Send a new request.");
+          await this.persistCurrentSession();
+          await this.notifyStateChanged();
+          return { ok: false, reason: "stale", message: "The originating MCP request changed. Send a new request." };
+        }
+
+        this.pendingMaxToolsWarnings.delete(actionId);
+        if (decision === "stop") {
+          loadingMessage.status = "complete";
+          loadingMessage.content = "Request stopped before the MCP catalog was sent to the model.";
+          loadingMessage.sendToProvider = false;
+          loadingMessage.maxToolsWarning = { ...loadingMessage.maxToolsWarning, status: "stopped" };
+          const currentInfo = normalizeRequestInfo(this.requestInfo);
+          this.requestInfo = {
+            ...currentInfo, status: "cancelled", updatedAt: Date.now(),
+            durationMs: currentInfo.startedAt ? Math.max(0, Date.now() - currentInfo.startedAt) : 0,
+            error: ""
+          };
+          this.rememberRequestInfo(this.requestInfo);
+          await this.persistCurrentSession();
+          await this.notifyStateChanged();
+          return { ok: true, reason: "stopped", message: "Request stopped." };
+        }
+
+        action.scope.unlimited = true;
+        loadingMessage.status = "loading";
+        loadingMessage.author = action.model;
+        loadingMessage.content = "";
+        delete loadingMessage.maxToolsWarning;
+        const activeRequest = this.createActiveRequest(loadingMessage.id);
+        this.activeRequest = activeRequest;
+        this.sending = true;
+        this.resolvingMaxToolsWarning = true;
+        await this.notifyStateChanged();
+        try {
+          return await action.resume({ activeRequest, loadingMessage });
+        } catch (error) {
+          if (this.isRequestCancelled(activeRequest)) return { ok: false, reason: "cancelled" };
+          const detail = error instanceof Error ? error.message : "Unknown provider error.";
+          loadingMessage.status = "error";
+          loadingMessage.author = "CoDriver";
+          loadingMessage.content = `Unable to complete the request. ${detail}`;
+          loadingMessage.sendToProvider = false;
+          this.applyProviderErrorMetadata(error);
+          this.markRequestInfoError(detail);
+          return { ok: false, reason: "provider-error", message: loadingMessage.content };
+        } finally {
+          if (this.activeRequest === activeRequest) {
+            this.activeRequest = null;
+            this.sending = false;
+          }
+          this.resolvingMaxToolsWarning = false;
+          await this.persistCurrentSession();
+          await this.notifyStateChanged();
+        }
+      }
+
+      resetMcpLimitWarningSession(message = "This MCP limit warning expired when the session changed.") {
+        for (const action of this.pendingMcpLimitActions.values()) {
+          if (action.kind === "output") {
+            const call = this.mcpToolCalls.find((item) => item.id === action.toolCallId);
+            if (call) {
+              call.output = "";
+              call.status = "error";
+              call.error = message;
+              call.outputWarning = { ...call.outputWarning, status: "invalidated" };
+            }
+          } else {
+            const warningMessage = this.messages.find((item) => item.id === action.messageId);
+            if (warningMessage?.mcpLimitWarning) {
+              warningMessage.mcpLimitWarning.status = "invalidated";
+              warningMessage.status = "error";
+              warningMessage.content = message;
+            }
+          }
+          this.stopMcpLimitChain(action.chainState, message);
+        }
+        this.pendingMcpLimitActions.clear();
+      }
+
+      stopMcpLimitChain(chainState, message) {
+        if (!chainState) return;
+        chainState.stopped = message;
+        this.clearProviderContinuationContext(chainState);
+        for (const call of this.mcpToolCalls) {
+          if (this.mcpToolChainStates.get(call) !== chainState) continue;
+          if (call.status === "output-review") {
+            call.output = "";
+            call.status = "error";
+            call.error = message;
+            call.outputWarning = { ...call.outputWarning, status: "invalidated" };
+          } else if (isExecutableMcpToolCallStatus(call.status)) {
+            call.status = "cancelled";
+            call.error = message;
+          }
+          if (call.status === "cancelled" || call.status === "error") call.followUpSent = true;
+        }
+      }
+
+      isMcpLimitActionCurrent(action) {
+        if (action.sessionId !== this.currentSessionId || action.chainState?.stopped) return false;
+        if (action.kind === "calls" && this.getMaxAutomaticMcpToolCalls() !== action.limitValue) return false;
+        if (action.kind === "output" && this.getMaxMcpToolResultChars() !== action.limitValue) return false;
+        const provider = action.providerId
+          ? this.providerRegistry.get(action.providerId)
+          : this.providerRegistry.first();
+        return Boolean(provider &&
+          (this.settings.selectedProviderId || this.providerRegistry.first()?.id || "") === action.providerId &&
+          this.getSelectedModelId() === action.model &&
+          getProviderContinuationBinding(provider) === action.providerBinding &&
+          this.isProviderContinuationConfigurationCurrent(action.chainState, provider, action.model, []));
+      }
+
+      async resolveMcpLimitWarning(actionId, decision) {
+        const action = this.pendingMcpLimitActions.get(actionId);
+        if (!action) return { ok: false, reason: "not-found", message: "This MCP limit warning is no longer active." };
+        const choices = action.kind === "output"
+          ? ["continue", "stop"]
+          : ["continue", "continue-session", "stop"];
+        if (!choices.includes(decision)) {
+          return { ok: false, reason: "invalid-action", message: "This MCP limit warning action is unavailable." };
+        }
+        if (this.sending || this.resolvingMcpLimitAction) return { ok: false, reason: "busy", message: "Wait for the current response." };
+        const toolCall = this.mcpToolCalls.find((item) => item.id === action.toolCallId);
+        const expectedStatus = action.kind === "output" ? "output-review" : ["queued", "pending"];
+        if (!toolCall || !(Array.isArray(expectedStatus) ? expectedStatus.includes(toolCall.status) : toolCall.status === expectedStatus) ||
+          !this.isMcpLimitActionCurrent(action)) {
+          this.pendingMcpLimitActions.delete(actionId);
+          this.stopMcpLimitChain(action.chainState, "The originating MCP request changed. Send a new request.");
+          if (action.kind === "calls") {
+            const warningMessage = this.messages.find((item) => item.id === action.messageId);
+            if (warningMessage?.mcpLimitWarning) {
+              warningMessage.mcpLimitWarning.status = "invalidated";
+              warningMessage.status = "error";
+            }
+          }
+          await this.persistCurrentSession();
+          await this.notifyStateChanged();
+          return { ok: false, reason: "stale", message: "The originating MCP request changed. Send a new request." };
+        }
+
+        this.pendingMcpLimitActions.delete(actionId);
+        this.resolvingMcpLimitAction = true;
+        try {
+          if (action.kind === "calls") {
+            const warningMessage = this.messages.find((item) => item.id === action.messageId);
+            if (warningMessage?.mcpLimitWarning) {
+              warningMessage.mcpLimitWarning.status = decision === "stop" ? "stopped" : "continued";
+              warningMessage.status = "complete";
+              warningMessage.content = decision === "stop" ? "Automatic tool chain stopped." : "Automatic tool chain continued.";
+            }
+            if (decision === "stop") {
+              this.stopMcpLimitChain(action.chainState, "Automatic MCP tool chain stopped by the user at Max calls.");
+            } else {
+              if (decision === "continue-session") {
+                action.chainState.maxCallsWarningSuppressed = true;
+              } else {
+                action.chainState.maxCalls = action.chainState.executedCount + 1;
+              }
+              await this.runAutomaticMcpToolChain(this.getMcpToolCallGroup(toolCall), {
+                chainState: action.chainState
+              });
+            }
+          } else {
+            toolCall.outputWarning = { ...toolCall.outputWarning, status: decision === "stop" ? "stopped" : "continued" };
+            toolCall.status = decision === "stop" || action.resultIsError ? "error" : "complete";
+            toolCall.error = decision === "stop"
+              ? "The user stopped this MCP tool result because it exceeded Output chars. The tool already ran; its output was not sent."
+              : (action.resultIsError ? "MCP tool returned an error result." : "");
+            if (decision === "stop") toolCall.output = "";
+            toolCall.time = currentTimeLabel();
+            this.recordMcpToolResultInChain(action.chainState, toolCall);
+            this.rememberRecentMcpToolResult(toolCall);
+            const group = this.getMcpToolCallGroup(toolCall);
+            if (group.some(isAutomaticMcpToolCallReady)) {
+              await this.runAutomaticMcpToolChain(group, { chainState: action.chainState });
+            } else {
+              await this.continueAfterMcpToolGroupIfReady(toolCall, { chainState: action.chainState });
+            }
+          }
+          void this.logDiagnostic("mcp.limit_warning.resolved", {
+            kind: action.kind,
+            decision,
+            toolCallId: safeDiagnosticLabel(action.toolCallId),
+            chainId: safeDiagnosticLabel(action.chainState?.chainId)
+          });
+          await this.persistCurrentSession();
+          await this.notifyStateChanged();
+          return { ok: true, message: decision === "stop" ? "MCP limit warning stopped." : "MCP limit warning continued." };
+        } finally {
+          this.resolvingMcpLimitAction = false;
+          await this.notifyStateChanged();
+        }
       }
 
       getAvailableModels() {
@@ -4050,6 +4295,9 @@
       }
 
       deleteMessage(messageId) {
+        if ([...this.pendingMaxToolsWarnings.values()].some((action) => action.messageId === messageId)) {
+          return { ok: false, message: "Choose an action for the pending Max tools warning first." };
+        }
         this.messages = this.messages.filter((message) => message.id !== messageId);
         void this.persistCurrentSession();
       }
@@ -4065,6 +4313,9 @@
       }
 
       deleteMcpToolCall(toolCallId) {
+        if (this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning || this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction) {
+          return { ok: false, message: "Choose an action for the pending MCP limit warning first." };
+        }
         const toolCall = this.mcpToolCalls.find((item) => item.id === toolCallId);
         if (toolCall?.status === "running" && isCodriverVaultMoveFileToolCall(toolCall)) {
           return {
@@ -4111,7 +4362,7 @@
       }
 
       canSendDraft(content) {
-        if (this.sending || this.pendingContextBudgetOverrides.size > 0 || this.hasPendingDraftAttachments() || !this.getSelectedModelId()) {
+        if (this.sending || this.pendingContextBudgetOverrides.size > 0 || this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning || this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction || this.hasPendingDraftAttachments() || !this.getSelectedModelId()) {
           return false;
         }
 
@@ -4425,7 +4676,7 @@
       }
 
       async startNewSession(options = {}) {
-        if (this.sending) {
+        if (this.sending || this.resolvingMaxToolsWarning || this.resolvingMcpLimitAction) {
           return {
             ok: false,
             message: "Wait for the current response before starting a new session."
@@ -4433,6 +4684,8 @@
         }
 
         this.resetContextBudgetWarningSession();
+        this.resetMaxToolsWarningSession();
+        this.resetMcpLimitWarningSession();
         const savedSession = await this.persistCurrentSession();
         this.sessionMode = normalizeSessionMode(options.sessionMode);
         this.setCurrentSessionId(createId("session"));
@@ -4515,7 +4768,7 @@
           };
         }
 
-        if (this.sending) {
+        if (this.sending || this.resolvingMaxToolsWarning || this.resolvingMcpLimitAction) {
           return {
             ok: false,
             message: "Wait for the current response before loading a session."
@@ -4523,6 +4776,8 @@
         }
 
         this.resetContextBudgetWarningSession();
+        this.resetMaxToolsWarningSession();
+        this.resetMcpLimitWarningSession();
         await this.persistCurrentSession();
         const snapshot = await this.sessionStorage.loadSession(sessionPath);
         this.restoreSessionSnapshot(snapshot, {
@@ -4551,7 +4806,7 @@
           };
         }
 
-        if (this.sending) {
+        if (this.sending || this.resolvingMaxToolsWarning || this.resolvingMcpLimitAction) {
           return {
             ok: false,
             message: "Wait for the current response before loading a session."
@@ -4559,6 +4814,8 @@
         }
 
         this.resetContextBudgetWarningSession();
+        this.resetMaxToolsWarningSession();
+        this.resetMcpLimitWarningSession();
         const sessions = await this.sessionStorage.listSessions();
         const latestSession = sessions[0];
         if (!latestSession) {
@@ -4605,7 +4862,10 @@
 
       restoreSessionSnapshot(snapshot, options = {}) {
         this.pendingContextBudgetOverrides.clear();
-        this.contextBudgetWarningsSuppressed = false;
+        this.pendingMaxToolsWarnings.clear();
+        this.resolvingMaxToolsWarning = false;
+        this.pendingMcpLimitActions.clear();
+        this.resolvingMcpLimitAction = false;
         this.sessionMode = normalizeSessionMode(snapshot?.sessionMode);
         this.setCurrentSessionId(
           normalizeChatSessionId(snapshot?.sessionId) ||
@@ -5272,7 +5532,7 @@
           toolCall.patchAppliedAutomatically = proposal.applicationAuthorizationSource === "automatic-tool-permission";
           toolCall.status = "complete";
           toolCall.error = "";
-          toolCall.output = formatMcpToolResult(createAppliedPatchToolResult(proposal), this.getMaxMcpToolResultChars());
+          toolCall.output = formatMcpToolResult(createAppliedPatchToolResult(proposal));
           const owner = this.mcpToolChainStates.get(toolCall);
           if (owner === chainState) this.recordMcpToolResultInChain(owner, toolCall);
           this.rememberRecentMcpToolResult(toolCall);
@@ -5330,11 +5590,25 @@
       }
 
       async sendMessage(content, options = {}) {
+        if (this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning) {
+          return {
+            ok: false,
+            reason: "max-tools-warning-pending",
+            message: "Choose an action for the pending Max tools warning first."
+          };
+        }
         if (this.pendingContextBudgetOverrides.size > 0) {
           return {
             ok: false,
             reason: "context-warning-pending",
             message: "Choose an action for the pending context size warning first."
+          };
+        }
+        if (this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction) {
+          return {
+            ok: false,
+            reason: "mcp-limit-warning-pending",
+            message: "Choose an action for the pending MCP limit warning first."
           };
         }
         const trimmed = String(content ?? "").trim();
@@ -5368,6 +5642,8 @@
         const effectiveContent = commandExpansion?.content || skillCommand?.prompt || trimmed || fallbackAttachmentPrompt;
         const displayContent = command ? `${trimmed}` : (skillCommand?.prompt ? effectiveContent : (trimmed || fallbackAttachmentPrompt));
         const pendingContinuation = this.pendingRequestContinuation;
+        const contextBudgetScope = { suppressed: false };
+        const maxToolsScope = { unlimited: false, routingDecision: null };
         const userMessage = {
           id: createId("message"),
           role: "user",
@@ -5460,11 +5736,20 @@
             loadingMessage,
             overrideContextBudget = false
           }) => {
+            const disableMcpTools = provider.type === GEMINI_PROVIDER_TYPE && provider.toolMode === "google-search";
             if (!skillCommand) {
               const knownRequestSkills = this.getRequestSkills([]);
-              const knownMcpCatalog = this.createRequestBoundMcpCatalog(knownRequestSkills, {
-                updateAttachmentState: true
+              const knownPreflight = this.getRequestMaxToolsPreflight(knownRequestSkills, maxToolsScope, {
+                updateAttachmentState: true,
+                disableTools: disableMcpTools
               });
+              if (!knownPreflight.catalog) {
+                return await this.blockRequestForMaxTools(loadingMessage, knownPreflight, {
+                  phase: "before-routing", provider, model, requestSkills: knownRequestSkills,
+                  scope: maxToolsScope, resume: runRequestProviderWorkflow
+                });
+              }
+              const knownMcpCatalog = knownPreflight.catalog;
               if (!knownMcpCatalog.ok) {
                 return await this.blockRequestForMcpDependencies(loadingMessage, knownMcpCatalog, {
                   phase: "before-routing",
@@ -5472,7 +5757,7 @@
                 });
               }
             }
-            const routingDecision = skillCommand
+            const routingDecision = maxToolsScope.routingDecision ?? (skillCommand
               ? {
                 skills: [],
                 noteChangeRequested: null,
@@ -5483,10 +5768,11 @@
                 loadingMessage,
                 overrideContextBudget,
                 resume: runRequestProviderWorkflow,
+                contextBudgetScope,
                 pendingContinuation,
                 activeNotePathContext,
                 commandContextCharacters: commandRoutingExpansion?.content.length ?? 0
-              });
+              }));
             if (routingDecision?.blocked) {
               return {
                 ok: false,
@@ -5500,6 +5786,7 @@
                 reason: "cancelled"
               };
             }
+            maxToolsScope.routingDecision = routingDecision;
 
             const continuesPreviousRequest = Boolean(
               pendingContinuation && routingDecision?.continuesPreviousRequest === true
@@ -5535,9 +5822,17 @@
             });
             this.lastRequestAutoSkillIds = routedSkills.map((skill) => skill.id);
             const requestSkills = this.getRequestSkills(routedSkills);
-            const boundMcpCatalog = this.createRequestBoundMcpCatalog(requestSkills, {
-              updateAttachmentState: true
+            const boundPreflight = this.getRequestMaxToolsPreflight(requestSkills, maxToolsScope, {
+              updateAttachmentState: true,
+              disableTools: disableMcpTools
             });
+            if (!boundPreflight.catalog) {
+              return await this.blockRequestForMaxTools(loadingMessage, boundPreflight, {
+                phase: "after-routing", provider, model, requestSkills,
+                scope: maxToolsScope, resume: runRequestProviderWorkflow
+              });
+            }
+            const boundMcpCatalog = boundPreflight.catalog;
             if (!boundMcpCatalog.ok) {
               return await this.blockRequestForMcpDependencies(loadingMessage, boundMcpCatalog, {
                 phase: skillCommand ? "manual-skill" : "after-routing",
@@ -5558,12 +5853,15 @@
               providerBinding: getProviderContinuationBinding(provider),
               model,
               boundMcpCatalog,
+              maxToolsUnlimited: maxToolsScope.unlimited,
+              mcpToolsDisabled: disableMcpTools,
               audioTranscriptionConfiguration: activeRequest?.audioTranscriptionConfiguration,
               rootUserContent: continuesPreviousRequest
                 ? pendingContinuation.rootUserContent
                 : effectiveContent,
               currentUserContent: effectiveContent,
               continuationContext,
+              contextBudgetScope,
               activeNotePathContext,
               priorToolResults: continuesPreviousRequest
                 ? pendingContinuation.toolResults
@@ -6022,6 +6320,8 @@
           pendingPatchIds: new Set(),
           executedCount: 0,
           maxCalls: this.getMaxAutomaticMcpToolCalls(),
+          baseMaxCalls: this.getMaxAutomaticMcpToolCalls(),
+          maxCallsWarningSuppressed: false,
           toolResults: [],
           toolResultSignatures: new Map(),
           attachmentContext: null,
@@ -6034,11 +6334,14 @@
           providerBinding: typeof options.providerBinding === "string" ? options.providerBinding : "",
           nativeToolFingerprint: typeof options.nativeToolFingerprint === "string" ? options.nativeToolFingerprint : "",
           boundMcpCatalog: options.boundMcpCatalog?.ok === true ? options.boundMcpCatalog : null,
+          maxToolsUnlimited: options.maxToolsUnlimited === true,
+          mcpToolsDisabled: options.mcpToolsDisabled === true,
           audioTranscriptionConfiguration: options.audioTranscriptionConfiguration ?? null,
           model: typeof options.model === "string" ? options.model.trim() : "",
           rootUserContent: truncateText(options.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
           currentUserContent: truncateText(options.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
           continuationContext: options.continuationContext ?? null,
+          contextBudgetScope: options.contextBudgetScope ?? { suppressed: false },
           activeNotePathContext: normalizeActiveNotePathContext(options.activeNotePathContext),
           priorToolResults: Array.isArray(options.priorToolResults) ? [...options.priorToolResults] : [],
           providerContext: null,
@@ -6077,6 +6380,8 @@
         if (state.boundMcpCatalog?.ok !== true || !Array.isArray(state.boundMcpCatalog.entries)) {
           state.boundMcpCatalog = null;
         }
+        state.maxToolsUnlimited = state.maxToolsUnlimited === true;
+        state.mcpToolsDisabled = state.mcpToolsDisabled === true;
         state.model = typeof state.model === "string" ? state.model.trim() : "";
 
         state.rootUserContent = truncateText(state.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS);
@@ -6262,24 +6567,6 @@
         );
       }
 
-      getMaxRecentMcpToolResults() {
-        return clampInteger(
-          this.settings.maxRecentMcpToolResults,
-          DEFAULT_MAX_RECENT_MCP_TOOL_RESULTS,
-          MIN_RECENT_MCP_TOOL_RESULTS,
-          MAX_RECENT_MCP_TOOL_RESULTS_SETTING
-        );
-      }
-
-      getMaxRecentMcpToolResultContextChars() {
-        return clampInteger(
-          this.settings.maxRecentMcpToolResultContextChars,
-          DEFAULT_MAX_RECENT_MCP_TOOL_RESULT_CONTEXT_CHARS,
-          MIN_RECENT_MCP_TOOL_RESULT_CONTEXT_CHARS,
-          MAX_RECENT_MCP_TOOL_RESULT_CONTEXT_CHARS_SETTING
-        );
-      }
-
       async runAutomaticMcpToolChain(toolCalls, options = {}) {
         const chainState = options.chainState ?? this.createMcpToolChainState();
         if (!toolCalls.some(isAutomaticMcpToolCallReady)) {
@@ -6315,9 +6602,9 @@
           if (!isAutomaticMcpToolCallReady(toolCall)) continue;
           const audioBlock = this.getAudioCreateChainBlock(chainState, toolCall);
           if (audioBlock) return audioBlock;
-          if (chainState.executedCount >= chainState.maxCalls) {
-            this.stopMcpToolChainAtLimit(toolCall, chainState);
-            return { ok: false, reason: "tool-chain-limit" };
+          if (!chainState.maxCallsWarningSuppressed && chainState.executedCount >= chainState.maxCalls) {
+            await this.blockMcpToolChainAtLimit(toolCall, chainState);
+            return { ok: false, reason: "tool-chain-limit-warning" };
           }
           const stepNumber = ++chainState.executedCount;
           void this.logDiagnostic("mcp.tool_chain.automatic.step.started", {
@@ -6325,6 +6612,7 @@
             toolCall: createMcpToolExecutionDiagnostic(toolCall)
           });
           await this.executeMcpToolCall(toolCall.id, { chainState, stepNumber, trigger: "automatic" });
+          if (toolCall.status === "output-review") return { ok: false, reason: "tool-output-warning" };
           void this.logDiagnostic("mcp.tool_chain.automatic.step.completed", {
             ...createMcpToolChainDiagnostic(chainState), stepNumber,
             toolCall: createMcpToolExecutionDiagnostic(toolCall), output: createMcpToolOutputDiagnostic(toolCall)
@@ -6337,19 +6625,38 @@
         });
       }
 
-      stopMcpToolChainAtLimit(toolCall, chainState) {
-        const message = `Automatic MCP tool chain stopped after ${chainState.maxCalls} tool call(s). Increase the maximum automatic MCP tool calls setting to continue automatically.`;
-        this.clearProviderContinuationContext(chainState);
-        toolCall.status = "error";
-        toolCall.error = message;
-        toolCall.time = currentTimeLabel();
-        this.notifyStateChanged();
-        void this.logDiagnostic("mcp.tool_call.auto_chain.limit_reached", {
-          ...createMcpToolExecutionDiagnostic(toolCall),
-          ...createMcpToolChainDiagnostic(chainState),
-          executedCount: chainState.executedCount,
-          maxCalls: chainState.maxCalls
+      async blockMcpToolChainAtLimit(toolCall, chainState) {
+        const actionId = createId("mcp-call-limit");
+        const provider = chainState.providerId
+          ? this.providerRegistry.get(chainState.providerId)
+          : this.providerRegistry.first();
+        const message = {
+          id: createId("message"), role: "assistant", author: "CoDriver",
+          time: currentTimeLabel(), status: "warning", sendToProvider: false,
+          content: `Max calls ${chainState.baseMaxCalls} reached before the next automatic MCP tool call.`,
+          createdAt: Date.now(),
+          mcpLimitWarning: {
+            id: actionId, kind: "calls", status: "pending",
+            title: "Max calls warning", currentCalls: chainState.executedCount,
+            maximumCalls: chainState.baseMaxCalls
+          }
+        };
+        this.messages.push(message);
+        this.pendingMcpLimitActions.set(actionId, {
+          kind: "calls", messageId: message.id, toolCallId: toolCall.id,
+          chainState, sessionId: this.currentSessionId,
+          limitValue: chainState.baseMaxCalls,
+          providerId: provider?.id ?? "",
+          providerBinding: getProviderContinuationBinding(provider),
+          model: chainState.model || this.getSelectedModelId()
         });
+        void this.logDiagnostic("mcp.tool_chain.call_limit.warned", {
+          ...createMcpToolChainDiagnostic(chainState),
+          toolCallId: safeDiagnosticLabel(toolCall.id),
+          maximumCalls: chainState.baseMaxCalls
+        });
+        await this.notifyStateChanged();
+        await this.persistCurrentSession();
       }
 
       getProviderMessages(
@@ -6464,7 +6771,6 @@
         }
 
         const toolResults = this.getMcpToolResultsForContext(chainState, [])
-          .slice(-this.getMaxRecentMcpToolResults())
           .map((result) => ({
             toolCallId: result.toolCallId,
             serverId: result.serverId,
@@ -6472,7 +6778,7 @@
             toolName: result.toolName,
             status: result.status,
             error: result.error || "",
-            output: truncateText(result.output || "", this.getMaxRecentMcpToolResultContextChars()),
+            output: result.output || "",
             createdAt: result.createdAt
           }));
         this.pendingRequestContinuation = {
@@ -7440,9 +7746,17 @@
           firstPartyEntries: this.getFirstPartyMcpTools(),
           manualServerIds: this.getManualMcpServerIds(),
           skillResolution,
-          maxTools: this.getMaxMcpTools(),
+          maxTools: options.unlimitedForRequest === true || options.disableTools === true ? 0 : this.getMaxMcpTools(),
           isServerRuntimeBlocked: (server) => this.isMcpServerRuntimeBlocked(server)
         });
+        if (options.disableTools === true && catalog.ok) {
+          if (catalog.requiredCount > 0) {
+            const error = { code: "provider-mode-required-tools", requiredCount: catalog.requiredCount };
+            return { ...catalog, ok: false, entries: [], fingerprint: "", error, errors: [error], skillResolution };
+          }
+          const emptyCatalog = buildRequestBoundMcpCatalog({ maxTools: 0 });
+          return { ...emptyCatalog, skillResolution, errors: [] };
+        }
         return {
           ...catalog,
           skillResolution,
@@ -7454,6 +7768,58 @@
         return normalizeMaxTools(this.settings?.maxMcpTools);
       }
 
+      getRequestMaxToolsPreflight(skills, scope, options = {}) {
+        const fullCatalog = this.createRequestBoundMcpCatalog(skills, {
+          ...options,
+          unlimitedForRequest: true
+        });
+        if (!fullCatalog.ok) return { catalog: fullCatalog, fullCatalog };
+        const maximumTools = this.getMaxMcpTools();
+        if (scope.unlimited !== true && maximumTools > 0 && fullCatalog.entries.length > maximumTools) {
+          return { catalog: null, fullCatalog, maximumTools };
+        }
+        const catalog = scope.unlimited === true
+          ? fullCatalog
+          : this.createRequestBoundMcpCatalog(skills, options);
+        return { catalog, fullCatalog, maximumTools };
+      }
+
+      async blockRequestForMaxTools(loadingMessage, preflight, options = {}) {
+        const actionId = createId("max-tools");
+        const totalTools = preflight.fullCatalog.entries.length;
+        const maximumTools = preflight.maximumTools;
+        const excludedTools = totalTools - maximumTools;
+        loadingMessage.status = "warning";
+        loadingMessage.author = "CoDriver";
+        loadingMessage.time = currentTimeLabel();
+        loadingMessage.content = `${totalTools} MCP tools are available, above Max tools ${maximumTools}. ${excludedTools} would be excluded.`;
+        loadingMessage.hidden = false;
+        loadingMessage.sendToProvider = false;
+        loadingMessage.maxToolsWarning = {
+          id: actionId, status: "pending", title: "Max tools warning",
+          totalTools, maximumTools, excludedTools
+        };
+        this.pendingMaxToolsWarnings.set(actionId, {
+          messageId: loadingMessage.id,
+          sessionId: this.currentSessionId,
+          phase: options.phase,
+          providerId: options.provider?.id ?? "",
+          providerBinding: getProviderContinuationBinding(options.provider),
+          model: options.model,
+          requestSkills: options.requestSkills,
+          scope: options.scope,
+          resume: options.resume,
+          maximumTools,
+          catalogFingerprint: preflight.fullCatalog.fingerprint
+        });
+        void this.logDiagnostic("mcp.request_catalog.max_tools_warned", {
+          phase: safeDiagnosticLabel(options.phase), totalTools, maximumTools, excludedTools
+        });
+        await this.persistCurrentSession();
+        await this.notifyStateChanged();
+        return { ok: false, reason: "max-tools-warning" };
+      }
+
       getMcpDependencyBlockedMessage(catalog) {
         const error = catalog?.errors?.[0] ?? catalog?.error;
         if (!error) {
@@ -7461,6 +7827,9 @@
         }
         if (error.code === "required-tools-over-limit") {
           return `Skill dependencies require ${error.requiredCount} model-facing tools, above Max tools ${error.maxTools}. Increase Max tools or narrow the skill requirements, then retry.`;
+        }
+        if (error.code === "provider-mode-required-tools") {
+          return "An active skill requires MCP tools, but this Gemini provider is in Google Search mode. Select Custom tools in provider settings and retry.";
         }
 
         const skillLabel = error.skillName || error.skillId || "The active skill";
@@ -7641,6 +8010,9 @@
       }
 
       async approveMcpToolCall(toolCallId) {
+        if (this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning || this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction) {
+          return { ok: false, message: "Choose an action for the pending MCP limit warning first." };
+        }
         const toolCall = this.mcpToolCalls.find((item) => item.id === toolCallId);
         if (!toolCall) {
           return {
@@ -7791,6 +8163,9 @@
       }
 
       async setMcpToolCallAutomaticPermission(toolCallId, allowAutomaticExecution) {
+        if (this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning || this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction) {
+          return { ok: false, message: "Choose an action for the pending MCP limit warning first." };
+        }
         const toolCall = this.mcpToolCalls.find((item) => item.id === toolCallId);
         if (!toolCall) {
           return {
@@ -7917,6 +8292,9 @@
       }
 
       async executeMcpToolCall(toolCallId, options = {}) {
+        if (this.pendingMaxToolsWarnings.size > 0 || this.pendingMcpLimitActions.size > 0) {
+          return { ok: false, message: "Choose an action for the pending MCP limit warning first." };
+        }
         const toolCall = this.mcpToolCalls.find((item) => item.id === toolCallId);
         if (!toolCall) {
           return {
@@ -8195,7 +8573,37 @@
           }
 
           if (isCodriverVaultToolCall(toolCall)) capturePatchWorkList(options.chainState, toolCall.toolName, result);
-          toolCall.output = formatMcpToolResult(result, this.getMaxMcpToolResultChars());
+          toolCall.output = formatMcpToolResult(result);
+          const outputLimit = this.getMaxMcpToolResultChars();
+          if (toolCall.output.length > outputLimit) {
+            const chainState = options.chainState ?? this.getMcpToolChainStateForToolCall(toolCall);
+            const provider = chainState.providerId
+              ? this.providerRegistry.get(chainState.providerId)
+              : this.providerRegistry.first();
+            const actionId = createId("mcp-output-limit");
+            toolCall.status = "output-review";
+            toolCall.time = currentTimeLabel();
+            toolCall.outputWarning = {
+              id: actionId, status: "pending", currentCharacters: toolCall.output.length,
+              maximumCharacters: outputLimit
+            };
+            this.pendingMcpLimitActions.set(actionId, {
+              kind: "output", toolCallId: toolCall.id, chainState,
+              sessionId: this.currentSessionId, resultIsError: result?.isError === true,
+              limitValue: outputLimit,
+              providerId: provider?.id ?? "",
+              providerBinding: getProviderContinuationBinding(provider),
+              model: chainState.model || this.getSelectedModelId()
+            });
+            void this.logDiagnostic("mcp.tool_output.limit.warned", {
+              ...createMcpToolExecutionDiagnostic(toolCall),
+              outputLength: toolCall.output.length,
+              maximumCharacters: outputLimit
+            });
+            await this.notifyStateChanged();
+            await this.persistCurrentSession();
+            return { ok: false, reason: "tool-output-warning", message: "Review the MCP tool result before continuing." };
+          }
           toolCall.status = result?.isError === true ? "error" : "complete";
           toolCall.error = result?.isError === true ? "MCP tool returned an error result." : "";
           toolCall.time = currentTimeLabel();
@@ -8730,7 +9138,7 @@
                 ? createPatchNoteSessionArguments(toolCall)
                 : (toolCall.arguments ?? {})
           ), MAX_RECENT_MCP_TOOL_ARGUMENT_CONTEXT_CHARS),
-          output: truncateText(toolCall.output || "", this.getMaxRecentMcpToolResultContextChars()),
+          output: toolCall.output || "",
           vaultPaths: getRecentMcpToolResultVaultPaths(toolCall),
           linkMetadataIncluded: isLinkMetadataToolResult(toolCall),
           originalRequestContent: truncateText(this.getOriginalRequestForToolCall(toolCall)?.content ?? "", 2000),
@@ -8740,7 +9148,6 @@
         this.recentMcpToolResults = this.recentMcpToolResults
           .filter((result) => result.toolCallId !== item.toolCallId);
         this.recentMcpToolResults.push(item);
-        this.recentMcpToolResults = this.recentMcpToolResults.slice(-this.getMaxRecentMcpToolResults());
         return item;
       }
 
@@ -8800,7 +9207,10 @@
             .map((skillId) => this.skillRegistry.get(skillId))
             .filter((skill) => this.isSkillAvailableForRetainedRequest(skill))
           : this.getRequestSkills([]);
-        const currentCatalog = this.createRequestBoundMcpCatalog(requestSkills);
+        const currentCatalog = this.createRequestBoundMcpCatalog(requestSkills, {
+          unlimitedForRequest: state.maxToolsUnlimited === true,
+          disableTools: state.mcpToolsDisabled === true
+        });
         return currentCatalog.ok === true &&
           currentCatalog.fingerprint === state.boundMcpCatalog.fingerprint;
       }
@@ -8821,7 +9231,10 @@
             .map((skillId) => this.skillRegistry.get(skillId))
             .filter((skill) => this.isSkillAvailableForRetainedRequest(skill))
           : this.getSkillsForMcpAttachmentState();
-        const currentCatalog = this.createRequestBoundMcpCatalog(requestSkills);
+        const currentCatalog = this.createRequestBoundMcpCatalog(requestSkills, {
+          unlimitedForRequest: state.maxToolsUnlimited === true,
+          disableTools: state.mcpToolsDisabled === true
+        });
         return currentCatalog.ok === true &&
           catalogHasMcpTool(currentCatalog, serverId, toolName);
       }
@@ -9827,6 +10240,7 @@
           overrideContextBudget = false,
           resume = null,
           mcpChainState = null,
+          contextBudgetScope = null,
           providerContinuationMessages = [],
           contextMessageLength = null,
           commandContextCharacters = 0
@@ -9851,6 +10265,7 @@
           };
         }
         const providerState = mcpChainState ? this.ensureMcpToolChainState(mcpChainState) : null;
+        const effectiveContextBudgetScope = providerState?.contextBudgetScope ?? contextBudgetScope ?? { suppressed: false };
         const hasMeasuredProviderContext = Boolean(
           providerState?.providerContext && providerState.providerContextCharacters > 0
         );
@@ -9895,8 +10310,8 @@
           const explicitBypassOutcome = consumeContextBudgetOverride(overrideContextBudget);
           if (explicitBypassOutcome) {
             contextBudgetOutcome = explicitBypassOutcome;
-          } else if (this.contextBudgetWarningsSuppressed) {
-            contextBudgetOutcome = "suppressed-for-session";
+          } else if (effectiveContextBudgetScope.suppressed === true) {
+            contextBudgetOutcome = "suppressed-for-request";
           } else {
             await this.blockProviderRequestForContextBudget({
               loadingMessage,
@@ -9908,6 +10323,7 @@
               diagnostic,
               resume,
               mcpChainState,
+              contextBudgetScope: effectiveContextBudgetScope,
               nativeTools
             });
             return {
@@ -9930,13 +10346,13 @@
         if (contextBudgetOutcome) {
           this.recordContextBudgetWarningOutcome({ phase, context, budget }, contextBudgetOutcome, "waiting");
           void this.logDiagnostic(
-            contextBudgetOutcome === "suppressed-for-session"
-              ? "provider.context_budget.session_suppression.applied"
+            contextBudgetOutcome === "suppressed-for-request"
+              ? "provider.context_budget.request_suppression.applied"
               : "provider.context_budget.continued",
             {
               ...diagnostic,
               status: "continued",
-              scope: contextBudgetOutcome === "continued-once" ? "call" : "session"
+              scope: contextBudgetOutcome === "continued-once" ? "call" : "request"
             }
           );
         } else {
@@ -10002,7 +10418,7 @@
         };
       }
 
-      async blockProviderRequestForContextBudget({ loadingMessage, phase, provider, model, context, budget, diagnostic, resume, mcpChainState = null, nativeTools = [] }) {
+      async blockProviderRequestForContextBudget({ loadingMessage, phase, provider, model, context, budget, diagnostic, resume, mcpChainState = null, contextBudgetScope = null, nativeTools = [] }) {
         const message = createContextBudgetBlockedMessage(context, budget);
         const actionId = createId("context-budget");
         if (loadingMessage) {
@@ -10025,6 +10441,7 @@
             };
             this.pendingContextBudgetOverrides.set(actionId, {
               chainState: mcpChainState,
+              contextBudgetScope: contextBudgetScope ?? { suppressed: false },
               context,
               budget,
               diagnostic,
@@ -10523,6 +10940,7 @@
               startedAt: requestStartedAt,
               overrideContextBudget: routingOptions.overrideContextBudget,
               resume: routingOptions.resume ?? null,
+              contextBudgetScope: routingOptions.contextBudgetScope,
               commandContextCharacters: routingOptions.commandContextCharacters ?? 0
             });
             if (sent.blocked) {
@@ -11141,7 +11559,8 @@
     function isBlockingMcpToolGroupFollowUp(toolCall) {
       return toolCall?.status === "pending" ||
         toolCall?.status === "queued" ||
-        toolCall?.status === "running";
+        toolCall?.status === "running" ||
+        toolCall?.status === "output-review";
     }
 
     function isCompletedMcpToolResult(toolCall) {
@@ -12363,7 +12782,7 @@
       return String(value ?? "").replace(/\s+/g, " ").trim();
     }
 
-    function formatMcpToolResult(result, maxChars = DEFAULT_MAX_MCP_TOOL_RESULT_CHARS) {
+    function formatMcpToolResult(result) {
       const sections = [];
       const content = Array.isArray(result?.content) ? result.content : [];
 
@@ -12397,7 +12816,7 @@
         .filter(Boolean)
         .join("\n\n");
 
-      return truncateText(output || "Tool completed without textual output.", maxChars);
+      return output || "Tool completed without textual output.";
     }
 
     function formatJsonForDisplay(value) {
@@ -14188,6 +14607,8 @@
       settings.maxMcpTools = normalizeMaxMcpTools(settings.maxMcpTools);
       settings.maxAutomaticMcpToolCalls = normalizeMaxAutomaticMcpToolCalls(settings.maxAutomaticMcpToolCalls);
       settings.mcpToolTimeoutSeconds = normalizeMcpToolTimeoutSeconds(settings.mcpToolTimeoutSeconds);
+      delete settings.maxRecentMcpToolResults;
+      delete settings.maxRecentMcpToolResultContextChars;
       settings.maxRequestContextChars = normalizeMaxRequestContextChars(settings.maxRequestContextChars);
       settings.enableCoDriverVaultTools = settings.enableCoDriverVaultTools !== false;
       settings.codriverVaultToolSettings = normalizeCodriverVaultToolSettings(settings.codriverVaultToolSettings);
@@ -14235,8 +14656,7 @@
           topK: "",
           thinkingBudget: "",
           thinkingLevel: "",
-          enableGoogleSearch: false,
-          enableGroundedCustomTools: false
+          enableGoogleSearch: false
         };
       }
 
@@ -14316,7 +14736,7 @@
         normalizedProvider.thinkingBudget = normalizeOptionalNonNegativeIntegerText(provider?.thinkingBudget);
         normalizedProvider.thinkingLevel = normalizeThinkingLevel(provider?.thinkingLevel);
         normalizedProvider.enableGoogleSearch = provider?.enableGoogleSearch === true;
-        normalizedProvider.enableGroundedCustomTools = provider?.enableGroundedCustomTools === true;
+        delete normalizedProvider.enableGroundedCustomTools;
         delete normalizedProvider.reasoningEffort;
         delete normalizedProvider.includeThoughts;
       } else {
@@ -22381,6 +22801,7 @@
         this.id = settings.id;
         this.name = settings.name;
         this.type = GEMINI_PROVIDER_TYPE;
+        this.toolMode = settings.enableGoogleSearch === true ? "google-search" : "custom-tools";
         this.supportsStreaming = true;
         this.defaultModel = settings.model;
         this.models = Array.isArray(settings.models) ? settings.models : [];
@@ -24356,16 +24777,25 @@
         min: 0,
         max: 200,
         ariaLabel: "Maximum model-facing MCP tools",
-        description: "Maximum total model-facing MCP tools per request, including CoDriver Vault and external MCP tools. 0 means Unlimited."
+        description: "Warn before a request exposes more MCP tools than this value. Continue sends all available tools for that request. 0 means Unlimited."
       },
       {
         key: "maxAutomaticMcpToolCalls",
         label: "Max calls",
-        fallback: 6,
+        fallback: 10,
         min: 1,
         max: 20,
         ariaLabel: "Maximum automatic MCP tool calls",
         description: "Maximum MCP tool calls CoDriver may run automatically while completing one user request."
+      },
+      {
+        key: "maxMcpToolResultChars",
+        label: "Output chars",
+        fallback: 60000,
+        min: 1000,
+        max: 240000,
+        ariaLabel: "Maximum MCP tool result characters",
+        description: "Warn before one MCP tool result above this size is sent to the model. Continue sends the complete result."
       },
       {
         key: "mcpToolTimeoutSeconds",
@@ -24375,33 +24805,6 @@
         max: 600,
         ariaLabel: "MCP tool timeout seconds",
         description: "Maximum time CoDriver waits for one MCP tool call before marking it as failed."
-      },
-      {
-        key: "maxMcpToolResultChars",
-        label: "Output chars",
-        fallback: 60000,
-        min: 1000,
-        max: 240000,
-        ariaLabel: "Maximum MCP tool result characters",
-        description: "Maximum characters kept from one MCP tool result for the current chat card and immediate model follow-up. Longer output is marked as truncated."
-      },
-      {
-        key: "maxRecentMcpToolResults",
-        label: "Recent count",
-        fallback: 4,
-        min: 1,
-        max: 20,
-        ariaLabel: "Maximum remembered MCP tool results",
-        description: "Maximum completed MCP tool results kept in this chat session for later turns."
-      },
-      {
-        key: "maxRecentMcpToolResultContextChars",
-        label: "Memory chars",
-        fallback: 24000,
-        min: 1000,
-        max: 120000,
-        ariaLabel: "Maximum remembered MCP tool result characters",
-        description: "Maximum characters kept from each remembered MCP tool result when it is added to a later provider request."
       }
     ];
 
@@ -26157,37 +26560,20 @@
             ]
           });
 
-          const groundingSetting = new Setting(contentEl)
-            .setName("Google Search grounding")
-            .setDesc("Use Google Search for grounded responses.")
-            .addToggle((toggle) => {
-              toggle
-                .setValue(this.draft.enableGoogleSearch === true)
+          new Setting(contentEl)
+            .setName("Tool mode")
+            .addDropdown((dropdown) => {
+              dropdown
+                .addOption("custom-tools", "Custom tools")
+                .addOption("google-search", "Google Search")
+                .setValue(this.draft.enableGoogleSearch === true ? "google-search" : "custom-tools")
                 .onChange((value) => {
-                  this.draft.enableGoogleSearch = value;
-                  this.render();
+                  this.draft.enableGoogleSearch = value === "google-search";
                 });
             });
-
-          groundingSetting.settingEl.classList.add("codriver-gemini-grounding-setting");
-          groundingSetting.controlEl.createSpan({
-            cls: "codriver-gemini-custom-tools-label",
-            text: "Custom tools"
-          });
-          groundingSetting.addToggle((toggle) => {
-            toggle
-              .setValue(this.draft.enableGroundedCustomTools === true)
-              .setDisabled?.(this.draft.enableGoogleSearch !== true);
-            toggle.toggleEl?.setAttribute("aria-label", "Custom tools");
-            toggle.toggleEl?.setAttribute(
-              "title",
-              this.draft.enableGoogleSearch === true
-                ? "Combine Google Search with enabled custom tools"
-                : "Enable Google Search grounding to use custom tools"
-            );
-            toggle.onChange((value) => {
-              this.draft.enableGroundedCustomTools = value;
-            });
+          contentEl.createDiv({
+            cls: "codriver-gemini-tool-mode-note",
+            text: "Gemma models cannot combine Google Search and custom tools. Choose one mode."
           });
 
         } else {
@@ -26723,11 +27109,9 @@
       maxSessionHistory: 5,
       sessionStartupBehavior: "new",
       maxMcpTools: DEFAULT_MAX_MCP_TOOLS,
-      maxAutomaticMcpToolCalls: 6,
+      maxAutomaticMcpToolCalls: 10,
       mcpToolTimeoutSeconds: 60,
       maxMcpToolResultChars: 60000,
-      maxRecentMcpToolResults: 4,
-      maxRecentMcpToolResultContextChars: 24000,
       maxRequestContextChars: DEFAULT_MAX_REQUEST_CONTEXT_CHARS,
       enableCoDriverVaultTools: true,
       codriverVaultToolSettings: Object.fromEntries(
@@ -32946,6 +33330,18 @@
           cls: `codriver-chat-message codriver-chat-message-${message.role} codriver-chat-message-${message.status ?? "complete"}`
         });
 
+        if (message.maxToolsWarning) {
+          bubble.addClass("codriver-context-warning-card");
+          this.renderMaxToolsWarning(bubble, message);
+          return;
+        }
+
+        if (message.mcpLimitWarning) {
+          bubble.addClass("codriver-context-warning-card");
+          this.renderMcpCallLimitWarning(bubble, message);
+          return;
+        }
+
         if (message.contextBudgetWarning) {
           bubble.addClass("codriver-context-warning-card");
           this.renderContextBudgetWarning(bubble, message);
@@ -33652,7 +34048,7 @@
           {
             decision: "continue-session",
             label: "Continue for session",
-            title: "Continue and skip context size warnings for this session."
+            title: "Continue and skip context size warnings for this user request."
           },
           {
             decision: "stop",
@@ -33674,6 +34070,86 @@
             event.stopPropagation();
             for (const item of buttons) item.disabled = true;
             const result = await this.chatController.resolveContextBudgetWarning(warning.id, definition.decision);
+            if (result?.ok === false && result.message) new Notice(result.message);
+            this.render();
+          });
+          return button;
+        });
+      }
+
+      renderMaxToolsWarning(card, message) {
+        const warning = message.maxToolsWarning;
+        if (!warning) return;
+        const header = card.createDiv({ cls: "codriver-context-warning-header" });
+        const heading = header.createDiv({ cls: "codriver-context-warning-heading" });
+        const icon = heading.createSpan({ cls: "codriver-context-warning-icon", attr: { "aria-hidden": "true" } });
+        setIcon(icon, "triangle-alert");
+        heading.createSpan({ cls: "codriver-context-warning-title", text: warning.title || "Max tools warning" });
+        const body = card.createDiv({ cls: "codriver-context-warning-body" });
+        body.createDiv({
+          cls: "codriver-context-warning-copy",
+          text: warning.status === "pending"
+            ? `${formatNumber(warning.totalTools)} MCP tools are available; Max tools is ${formatNumber(warning.maximumTools)}. ${formatNumber(warning.excludedTools)} would be excluded. Continue sends all tools for this request.`
+            : message.content
+        });
+        if (warning.status !== "pending") return;
+        const actions = card.createDiv({ cls: "codriver-context-warning-actions", attr: {
+          role: "group", "aria-label": "Max tools warning actions"
+        } });
+        const buttons = [
+          ["continue", "Continue", "Send all available MCP tools for this user request."],
+          ["stop", "Stop", "Stop this request before sending its MCP tool catalog to the model."]
+        ].map(([decision, label, title]) => {
+          const button = actions.createEl("button", {
+            cls: `codriver-approval-button codriver-context-warning-${decision}`,
+            text: label, attr: { title, "aria-label": title }
+          });
+          button.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            for (const item of buttons) item.disabled = true;
+            const result = await this.chatController.resolveMaxToolsWarning(warning.id, decision);
+            if (result?.ok === false && result.message) new Notice(result.message);
+            this.render();
+          });
+          return button;
+        });
+      }
+
+      renderMcpCallLimitWarning(card, message) {
+        const warning = message.mcpLimitWarning;
+        if (!warning) return;
+        const header = card.createDiv({ cls: "codriver-context-warning-header" });
+        const heading = header.createDiv({ cls: "codriver-context-warning-heading" });
+        const icon = heading.createSpan({ cls: "codriver-context-warning-icon", attr: { "aria-hidden": "true" } });
+        setIcon(icon, "triangle-alert");
+        heading.createSpan({ cls: "codriver-context-warning-title", text: warning.title || "Max calls warning" });
+        const body = card.createDiv({ cls: "codriver-context-warning-body" });
+        body.createDiv({
+          cls: "codriver-context-warning-copy",
+          text: warning.status === "pending"
+            ? `Max calls (${formatNumber(warning.maximumCalls)}) was reached before the next automatic MCP tool call.`
+            : (message.content || "Automatic MCP tool chain stopped.")
+        });
+        if (warning.status !== "pending") return;
+        const actions = card.createDiv({ cls: "codriver-context-warning-actions", attr: {
+          role: "group", "aria-label": "Max calls warning actions"
+        } });
+        const definitions = [
+          ["continue", "Continue", "Run the next automatic MCP call, then warn again at the next limit."],
+          ["continue-session", "Continue for session", "Continue this user request without further Max calls warnings."],
+          ["stop", "Stop", "Stop the pending automatic MCP tool chain."]
+        ];
+        const buttons = definitions.map(([decision, label, title]) => {
+          const button = actions.createEl("button", {
+            cls: `codriver-approval-button codriver-context-warning-${decision}`,
+            text: label, attr: { title, "aria-label": title }
+          });
+          button.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            for (const item of buttons) item.disabled = true;
+            const result = await this.chatController.resolveMcpLimitWarning(warning.id, decision);
             if (result?.ok === false && result.message) new Notice(result.message);
             this.render();
           });
@@ -34213,13 +34689,46 @@
           this.renderMcpToolCallBlock(body, "Output", toolCall.output);
         }
 
+        if (toolCall.outputWarning?.status === "pending") {
+          const warning = body.createDiv({ cls: "codriver-mcp-output-warning", attr: { role: "alert" } });
+          warning.createDiv({ cls: "codriver-mcp-output-warning-title", text: "Output chars warning" });
+          warning.createDiv({
+            text: `This tool returned ${formatNumber(toolCall.outputWarning.currentCharacters)} characters, above Output chars ${formatNumber(toolCall.outputWarning.maximumCharacters)}. Review Arguments and Output, then choose Continue to send the full result or Stop to send an error to the model.`
+          });
+        }
+
         if (toolCall.error) {
           body.createDiv({ cls: "codriver-mcp-call-error-text", text: toolCall.error });
         }
 
         this.renderMcpToolCallCardActions(card, toolCall);
 
-        const actions = card.createDiv({ cls: "codriver-mcp-call-actions" });
+        const actions = card.createDiv({
+          cls: "codriver-mcp-call-actions",
+          ...(toolCall.outputWarning?.status === "pending"
+            ? { attr: { role: "group", "aria-label": "MCP output size warning actions" } }
+            : {})
+        });
+        if (toolCall.outputWarning?.status === "pending") {
+          const buttons = [
+            ["continue", "Continue", "Send this complete MCP tool result to the model."],
+            ["stop", "Stop", "Send a tool error to the model without this result."]
+          ].map(([decision, label, title]) => {
+            const button = actions.createEl("button", {
+              cls: `codriver-approval-button codriver-context-warning-${decision}`,
+              text: label, attr: { title, "aria-label": title }
+            });
+            button.addEventListener("click", async (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              for (const item of buttons) item.disabled = true;
+              const result = await this.chatController.resolveMcpLimitWarning(toolCall.outputWarning.id, decision);
+              if (result?.ok === false && result.message) new Notice(result.message);
+              this.render();
+            });
+            return button;
+          });
+        }
         if (toolCall.executionBlockMessage) {
           actions.createDiv({ cls: "codriver-mcp-call-error-text", text: toolCall.executionBlockMessage });
         }
@@ -34625,7 +35134,8 @@
           });
         }
 
-        if (!(toolCall.status === "running" && toolCall.toolName === CODRIVER_VAULT_MOVE_FILE_TOOL_NAME)) {
+        if (toolCall.status !== "output-review" &&
+          !(toolCall.status === "running" && toolCall.toolName === CODRIVER_VAULT_MOVE_FILE_TOOL_NAME)) {
           const deleteButton = actions.createEl("button", {
             cls: "codriver-message-action-button",
             attr: {
@@ -34636,7 +35146,8 @@
           deleteButton.addEventListener("click", (event) => {
             event.stopPropagation();
             this.clearMcpToolCallCollapseState(toolCall.id);
-            this.chatController.deleteMcpToolCall(toolCall.id);
+            const result = this.chatController.deleteMcpToolCall(toolCall.id);
+            if (result?.ok === false && result.message) new Notice(result.message);
             this.render();
           });
         }
@@ -36057,8 +36568,8 @@
       const labels = {
         "waiting-for-decision": "Waiting for decision",
         "continued-once": "Continued once",
-        "continued-for-session": "Continued for session",
-        "suppressed-for-session": "Continued by session setting",
+        "continued-for-session": "Continued for this request",
+        "suppressed-for-request": "Continued for this request",
         stopped: "Stopped",
         invalidated: "No longer available"
       };
@@ -36076,6 +36587,10 @@
 
       if (status === "running") {
         return "Running";
+      }
+
+      if (status === "output-review") {
+        return "Waiting for output review";
       }
 
       if (status === "complete") {

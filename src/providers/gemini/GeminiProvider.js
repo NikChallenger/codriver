@@ -6,6 +6,7 @@ class GeminiProvider {
     this.id = settings.id;
     this.name = settings.name;
     this.type = GEMINI_PROVIDER_TYPE;
+    this.toolMode = settings.enableGoogleSearch === true ? "google-search" : "custom-tools";
     this.supportsStreaming = true;
     this.defaultModel = settings.model;
     this.models = Array.isArray(settings.models) ? settings.models : [];
