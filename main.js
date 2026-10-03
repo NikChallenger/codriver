@@ -13809,7 +13809,7 @@
   },
   "src/constants.js": function(module, exports, require) {
     const VIEW_TYPE_CODRIVER = "codriver-chat-view";
-    const CODRIVER_PLUGIN_VERSION = "0.5.2";
+    const CODRIVER_PLUGIN_VERSION = "0.5.3";
     const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:1234/v1";
     const DEFAULT_GEMINI_BASE_ENDPOINT = "https://generativelanguage.googleapis.com";
     const DEFAULT_GEMINI_API_VERSION = "v1beta";
@@ -14451,11 +14451,11 @@
   "src/generated/releaseNotes.js": function(module, exports, require) {
     // Generated from current public release notes by build.mjs.
     module.exports = {
-      "version": "0.5.2",
+      "version": "0.5.3",
       "blocks": [
         {
           "type": "p",
-          "text": "This release makes model selection, skill navigation, and everyday chat controls easier to use on desktop and mobile."
+          "text": "Includes the improvements from 0.5.2 and the release fixes in 0.5.3."
         },
         {
           "type": "h3",
@@ -14496,6 +14496,10 @@
         {
           "type": "li",
           "text": "Improved layout and text alignment in Session history and Diagnostic logging settings."
+        },
+        {
+          "type": "li",
+          "text": "Fixed release packaging and build verification issues encountered in 0.5.2"
         }
       ]
     };
