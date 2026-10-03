@@ -63,7 +63,11 @@ Your selected provider still receives the context required for the current reque
 
 To update CoDriver, download the latest versions of the same three files, replace the installed copies, and reload Obsidian.
 
+The chat shows a compact release notes banner on first installation and after a newer version is installed. **What's new** opens the local notes window; **Dismiss** hides the banner. Either action remembers the version in local plugin settings, so the banner stays hidden after reopening the chat or restarting the plugin. The notes window never opens automatically and requires no network access.
+
 The public GitHub repository contains the reviewed source snapshot and generated release artifacts for each public version. Its root `build.mjs` rebuilds `main.js` without registry dependencies, and the committed bundle must match that build exactly. Private release-control instructions, internal automation, and tests are not included in the public snapshot.
+
+The build embeds only `docs/releases/<manifest version>.md` in `main.js`. Release authors update that file with the matching version metadata; the build rejects missing, empty, mismatched, oversized, or non-ASCII notes. Supported notes formatting is paragraphs, level-two/three headings, and dash lists; other markup is displayed as plain text. Links and images in these notes do not load external resources.
 
 GitHub's automatically generated source archives are source snapshots, not installable CoDriver packages. Install CoDriver using the three assets attached to a matching GitHub release.
 

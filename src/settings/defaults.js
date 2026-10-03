@@ -17,6 +17,7 @@ const MIN_MCP_TOOLS = 0;
 const MAX_MCP_TOOLS_SETTING = 200;
 
 const DEFAULT_SETTINGS = {
+  releaseNotesAcknowledgedVersion: "",
   providers: [],
   mcpServers: [],
   selectedProviderId: null,

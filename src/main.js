@@ -1,4 +1,6 @@
 const { Notice, Platform, Plugin } = require("obsidian");
+const { ReleaseNotes } = require("./views/ReleaseNotes");
+const { normalizeReleaseNotesVersion } = require("./settings/ReleaseNotesSettings");
 const { ChatController, COMMAND_ACTION_SESSION_MODE } = require("./chat/ChatController");
 const {
   DEFAULT_MAX_MCP_TOOLS,
@@ -95,6 +97,7 @@ function hasPersistedApiKey(settings) {
 }
 
 function normalizeSettings(settings) {
+  settings.releaseNotesAcknowledgedVersion = normalizeReleaseNotesVersion(settings.releaseNotesAcknowledgedVersion);
   const providers = Array.isArray(settings.providers)
     ? settings.providers
     : [];
@@ -607,6 +610,14 @@ class CoDriverPlugin extends Plugin {
     this.commandActionModal = null;
 
     await this.loadSettings();
+    this.releaseNotes = new ReleaseNotes(this.app, {
+      version: this.manifest.version,
+      getAcknowledgedVersion: () => this.settings.releaseNotesAcknowledgedVersion,
+      acknowledge: async (version) => {
+        await this.persistSettings(version);
+      },
+      refresh: () => this.refreshChatViews()
+    });
     this.sessionStorage = new SessionStorage(this.app, this.manifest.id);
     this.skillFolderLoader = new SkillFolderLoader(this.app, this.settings.skillFolderPath);
     this.commandFolderLoader = new CommandFolderLoader(this.app, this.settings.commandFolderPath);
@@ -633,7 +644,7 @@ class CoDriverPlugin extends Plugin {
     );
     this.registerView(
       VIEW_TYPE_CODRIVER,
-      (leaf) => new ChatView(leaf, this.chatController, this.diagnosticLogger)
+      (leaf) => new ChatView(leaf, this.chatController, this.diagnosticLogger, this.releaseNotes)
     );
 
     this.addRibbonIcon("messages-square", "Open CoDriver", () => {
@@ -682,6 +693,7 @@ class CoDriverPlugin extends Plugin {
   }
 
   onunload() {
+    this.releaseNotes?.dispose();
     this.commandActionModal?.close?.();
     this.commandActionModal = null;
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_CODRIVER);
@@ -806,17 +818,30 @@ class CoDriverPlugin extends Plugin {
       ) &&
       typeof this.saveData === "function"
     ) {
-      await this.saveData(createPersistableSettings(this.settings));
+      await this.persistSettings();
     }
   }
 
   async saveSettings() {
     this.settings = normalizeSettings(this.settings);
-    await this.saveData(createPersistableSettings(this.settings));
+    await this.persistSettings();
     this.registerProviders();
     this.chatController?.updateSettings(this.settings, this.providerRegistry);
     await this.diagnosticLogger?.refresh();
     this.refreshChatViews();
+  }
+
+  persistSettings(acknowledgedVersion = null) {
+    // Serialize snapshots so another settings save cannot overwrite acknowledgement.
+    const write = async () => {
+      const snapshot = acknowledgedVersion === null ? this.settings
+        : { ...this.settings, releaseNotesAcknowledgedVersion: acknowledgedVersion };
+      await this.saveData(createPersistableSettings(snapshot));
+      if (acknowledgedVersion !== null) this.settings.releaseNotesAcknowledgedVersion = acknowledgedVersion;
+    };
+    const pending = (this.settingsWritePromise ?? Promise.resolve()).then(write);
+    this.settingsWritePromise = pending.catch(() => {});
+    return pending;
   }
 
   getDiagnosticLogPath() {

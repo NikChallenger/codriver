@@ -493,6 +493,7 @@ function createEmptyRequestInfo() {
       estimatedTokens: 0,
       sections: []
     },
+    latestCallContext: null,
     tokens: {
       input: null,
       output: null,
@@ -561,6 +562,7 @@ function normalizeRequestInfo(info) {
     updatedAt: readFiniteNumber(info.updatedAt, 0),
     durationMs: readFiniteNumber(info.durationMs, 0),
     context: normalizeRequestInfoContext(info.context),
+    latestCallContext: normalizeLatestCallContext(info.latestCallContext),
     tokens: normalizeRequestInfoTokens(info.tokens),
     transcription: normalizeRequestInfoTranscription(info.transcription),
     contextWarning: normalizeRequestInfoContextWarning(info.contextWarning),
@@ -584,6 +586,15 @@ function normalizeRequestInfoContextWarning(value) {
     estimatedTokens: readFiniteNumber(value.estimatedTokens, 0),
     maximumCharacters: readFiniteNumber(value.maximumCharacters, 0),
     maximumTokens: readFiniteNumber(value.maximumTokens, 0)
+  };
+}
+
+function normalizeLatestCallContext(value) {
+  if (!value || typeof value !== "object") return null;
+  const totalCharacters = Math.max(0, readFiniteNumber(value.totalCharacters, 0));
+  return {
+    totalCharacters,
+    estimatedTokens: estimateTokensFromChars(totalCharacters)
   };
 }
 
@@ -8278,6 +8289,7 @@ class ChatController {
         ...current.tokens,
         estimatedInput: context.estimatedTokens
       },
+      latestCallContext: normalizeLatestCallContext(context),
       contextWarning: {
         outcome: "waiting-for-decision",
         phase,
@@ -8318,6 +8330,7 @@ class ChatController {
       updatedAt: Date.now(),
       durationMs: Math.max(0, Date.now() - requestStartedAt),
       context: cumulativeContext,
+      latestCallContext: normalizeLatestCallContext(requestContext),
       tokens: {
         ...current.tokens,
         estimatedInput: cumulativeContext.estimatedTokens

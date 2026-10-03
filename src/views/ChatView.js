@@ -1,4 +1,7 @@
-const { ItemView, Keymap, MarkdownRenderer, Notice, Platform, setIcon, SuggestModal } = require("obsidian");
+const { ItemView, Keymap, MarkdownRenderer, Notice, Platform, setIcon } = require("obsidian");
+const { SessionHistoryPopover } = require("./SessionHistoryPopover");
+const { bindModelPicker } = require("./ModelPickerPopover");
+const { SessionLoadModal } = require("./SessionLoadModal");
 const { VIEW_TYPE_CODRIVER } = require("../constants");
 const { formatBytes } = require("../attachments/AttachmentExtractor");
 const {
@@ -20,6 +23,7 @@ const TIMELINE_BOTTOM_STICKY_THRESHOLD_PX = 48;
 const REASONING_BOTTOM_STICKY_THRESHOLD_PX = 2;
 const THINKING_SHIMMER_DURATION_MS = 1800;
 const THINKING_SHIMMER_PROBE_DELAY_MS = 320;
+let skillSuggestionListSequence = 0;
 
 function findCommandTokenRange(value, commandName) {
   const escapedName = String(commandName ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -30,45 +34,22 @@ function findCommandTokenRange(value, commandName) {
   return { start, end: start + match[2].length };
 }
 
-class SessionLoadModal extends SuggestModal {
-  constructor(app, sessions, onChooseSession) {
-    super(app);
-    this.sessions = sessions;
-    this.onChooseSession = onChooseSession;
-    this.setPlaceholder("Session history");
-  }
-
-  getSuggestions(query) {
-    const normalizedQuery = query.trim().toLowerCase();
-    if (!normalizedQuery) {
-      return this.sessions;
-    }
-
-    return this.sessions.filter((session) => (
-      (session.displayName ?? "").toLowerCase().includes(normalizedQuery) ||
-      session.name.toLowerCase().includes(normalizedQuery) ||
-      session.path.toLowerCase().includes(normalizedQuery)
-    ));
-  }
-
-  renderSuggestion(session, el) {
-    el.createDiv({ cls: "codriver-session-suggestion-name", text: session.displayName ?? session.name });
-  }
-
-  onChooseSuggestion(session) {
-    void this.onChooseSession(session);
-  }
-}
-
 function initializeChatSurface(surface, chatController, diagnostics = null) {
   surface.chatController = chatController;
   surface.diagnostics = diagnostics;
   surface.fileInputEl = null;
+  surface.sessionHistoryPopover = null;
+  surface.sessionHistoryPending = false;
+  surface.sessionHistoryRequest = 0;
   surface.messageInputEl = null;
   surface.draftMessage = "";
   surface.draftCommandId = "";
   surface.commandMenuOpen = false;
   surface.commandSuggestionIndex = 0;
+  surface.skillSuggestionIndex = 0;
+  surface.skillSuggestionQuery = null;
+  surface.skillSuggestionDismissed = false;
+  surface.skillSelectionPending = false;
   surface.focusCommandInputAfterRender = false;
   surface.draftSelectionStart = null;
   surface.draftSelectionEnd = null;
@@ -96,9 +77,10 @@ function initializeChatSurface(surface, chatController, diagnostics = null) {
 }
 
 class ChatView extends ItemView {
-  constructor(leaf, chatController, diagnostics = null) {
+  constructor(leaf, chatController, diagnostics = null, releaseNotes = null) {
     super(leaf);
     initializeChatSurface(this, chatController, diagnostics);
+    this.releaseNotes = releaseNotes;
   }
 
   getViewType() {
@@ -138,6 +120,8 @@ class ChatView extends ItemView {
   }
 
   async onClose() {
+    this.modelPickerPopover?.close();
+    this.closeSessionHistory();
     this.chatController.setStateChangeHandler(null);
     this.clearAllMcpToolCallCollapseTimers();
     this.fileInputEl = null;
@@ -230,6 +214,8 @@ class ChatView extends ItemView {
   }
 
   render() {
+    this.modelPickerPopover?.close();
+    this.closeSessionHistory();
     this.captureDraftMessage();
     const timelineScrollState = this.captureTimelineScrollState();
     const root = this.contentEl;
@@ -241,6 +227,7 @@ class ChatView extends ItemView {
     }
     root.empty();
     root.addClass("codriver-chat-view");
+    this.releaseNotes?.render(root, () => this.messageInputEl?.focus());
 
     const timeline = this.renderTimeline(root);
     this.renderComposer(root);
@@ -2388,6 +2375,8 @@ class ChatView extends ItemView {
       }
     });
     input.addEventListener("keydown", (event) => {
+      if (event.isComposing || event.keyCode === 229) return;
+      if (this.handleSkillSuggestionKeydown(event, suggestions, input)) return;
       if (this.handleAtomicCommandKeydown(event, input)) return;
       if (this.handleCommandSuggestionKeydown(event, suggestions, input)) return;
       if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
@@ -2397,6 +2386,7 @@ class ChatView extends ItemView {
       event.preventDefault();
       void submitDraft();
     });
+    this.renderSkillSuggestions(suggestions, input);
     this.renderCommandSuggestions(suggestions, input);
     if (this.focusCommandInputAfterRender) {
       this.focusCommandInputAfterRender = false;
@@ -2426,45 +2416,22 @@ class ChatView extends ItemView {
 
     this.renderContextPicker(contextPicker, fileInput);
     const modelPicker = modelControls.createDiv({ cls: "codriver-model-picker" });
-    const modelSelect = modelPicker.createEl("select", {
-      cls: "codriver-bottom-model-select",
-      attr: {
-        "aria-label": "Select model"
-      }
-    });
     const modelChoices = this.chatController.getModelChoices();
-    if (modelChoices.length === 0) {
-      modelSelect.createEl("option", {
-        text: "No visible models",
-        value: ""
-      });
-    } else {
-      for (const provider of modelChoices) {
-        const group = modelSelect.createEl("optgroup", {
-          attr: { label: provider.providerName }
-        });
-        for (const model of provider.models) {
-          group.createEl("option", {
-            text: model,
-            value: encodeModelOptionValue(provider.providerId, model)
-          });
-        }
-      }
-    }
 
     const selectedProviderId = this.chatController.getSelectedProviderId();
     const selectedModelId = this.chatController.getSelectedModelId();
-    modelSelect.value = encodeModelOptionValue(selectedProviderId, selectedModelId);
     const modelPickerButton = modelPicker.createEl("button", {
       cls: "codriver-model-picker-button",
       attr: {
         type: "button",
-        tabindex: "-1",
-        "aria-hidden": "true",
+        "aria-label": "Select model",
         title: selectedModelId ? `Model: ${selectedModelId}` : "Select model"
       }
     });
     setIcon(modelPickerButton, "bot");
+    this.modelPickerButtonEl = modelPickerButton;
+    modelPickerButton.disabled = modelChoices.length === 0;
+    if (modelPickerButton.disabled) modelPickerButton.title = "No visible models";
     modelPicker.createDiv({
       cls: "codriver-selected-model-name",
       text: selectedModelId || "No model",
@@ -2472,11 +2439,20 @@ class ChatView extends ItemView {
         title: selectedModelId || "No model selected"
       }
     });
-    modelSelect.addEventListener("change", () => {
-      this.draftMessage = this.getComposerValue(input);
-      const selection = decodeModelOptionValue(modelSelect.value);
-      void this.chatController.selectModel(selection.modelId, selection.providerId);
-      this.render();
+    bindModelPicker(this, modelPickerButton, {
+      label: "Select model", preferAbove: true,
+      selectedValue: encodeModelOptionValue(selectedProviderId, selectedModelId),
+      groups: modelChoices.map((provider) => ({
+        label: provider.providerName,
+        models: provider.models.map((model) => ({ model, label: model, value: encodeModelOptionValue(provider.providerId, model) }))
+      })),
+      onChoose: (value) => {
+        this.draftMessage = this.getComposerValue(input);
+        const selection = decodeModelOptionValue(value);
+        void this.chatController.selectModel(selection.modelId, selection.providerId);
+        this.render();
+        this.modelPickerButtonEl?.focus();
+      }
     });
     this.renderMcpServerPicker(modelControls);
     this.renderRequestInfoButton(modelControls);
@@ -2487,9 +2463,12 @@ class ChatView extends ItemView {
       new Notice(result.message);
       this.render();
     });
-    this.renderSessionActionButton(trailingActions, "history", "Session history", async () => {
-      await this.openSessionLoadModal();
+    const historyButton = this.renderSessionActionButton(trailingActions, "history", "Session history", async () => {
+      await this.openSessionHistory(historyButton);
     });
+    this.sessionHistoryButtonEl = historyButton;
+    historyButton.setAttribute("aria-haspopup", "dialog");
+    historyButton.setAttribute("aria-expanded", "false");
 
     sendButton = trailingActions.createEl("button", {
       cls: "codriver-send-button",
@@ -2696,6 +2675,7 @@ class ChatView extends ItemView {
       event.preventDefault();
       void onClick();
     });
+    return button;
   }
 
   renderMcpServerPicker(container) {
@@ -2767,14 +2747,33 @@ class ChatView extends ItemView {
   }
 
   renderRequestInfoButton(container) {
+    const info = this.chatController.getRequestInfo?.() ?? {};
+    const budget = this.chatController.getRequestContextBudget?.() ?? {};
+    const callCharacters = info.latestCallContext?.totalCharacters;
+    const maximumCharacters = budget.maximumCharacters;
+    const showRing = Number.isFinite(callCharacters) &&
+      Number.isFinite(maximumCharacters) && maximumCharacters > 0;
+    const usagePercent = showRing
+      ? Math.min(100, Math.max(0, callCharacters / maximumCharacters * 100))
+      : 0;
+    const usageLabel = showRing
+      ? `Request info. ~${callCharacters > maximumCharacters ? "100%+" : `${Math.round(usagePercent)}%`} context used`
+      : "Request info";
     const button = container.createEl("button", {
       cls: "codriver-request-info-button",
       attr: {
-        title: "Request info"
+        title: usageLabel
       }
     });
     button.toggleClass("is-active", this.requestInfoOpen);
     setIcon(button, "info");
+    if (showRing) {
+      const ring = button.createSpan({
+        cls: "codriver-request-info-ring",
+        attr: { "aria-hidden": "true" }
+      });
+      ring.style.setProperty("--codriver-context-usage", `${usagePercent}%`);
+    }
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -2788,7 +2787,6 @@ class ChatView extends ItemView {
       return;
     }
 
-    const info = this.chatController.getRequestInfo();
     const panel = container.createDiv({ cls: "codriver-request-info-panel" });
 
     const contextSection = panel.createDiv({ cls: "codriver-request-info-section" });
@@ -2947,40 +2945,92 @@ class ChatView extends ItemView {
     });
   }
 
-  async openSessionLoadModal() {
+  closeSessionHistory() {
+    this.sessionHistoryRequest = (this.sessionHistoryRequest ?? 0) + 1;
+    this.sessionHistoryPending = false;
+    this.sessionHistoryPopover?.close();
+    this.sessionHistoryPopover = null;
+  }
+
+  async openSessionHistory(button) {
+    if (this.sessionHistoryPopover || this.sessionHistoryPending) {
+      this.closeSessionHistory();
+      button.focus();
+      return;
+    }
+    const request = this.sessionHistoryRequest = (this.sessionHistoryRequest ?? 0) + 1;
+    this.sessionHistoryPending = true;
     try {
       const sessions = await this.chatController.listSavedSessions();
+      if (request !== this.sessionHistoryRequest || !button.isConnected) return;
       if (sessions.length === 0) {
         new Notice("No saved CoDriver sessions found.");
         return;
       }
 
-      new SessionLoadModal(this.app, sessions, async (session) => {
-        const result = await this.chatController.loadSavedSession(session.path);
-        new Notice(result.message);
-        this.render();
-      }).open();
+      const onChooseSession = async (session) => {
+        try {
+          const result = await this.chatController.loadSavedSession(session.path);
+          if (result?.ok === false) {
+            new Notice(result.message || "Unable to load session.");
+            return;
+          }
+          this.render();
+          this.sessionHistoryButtonEl?.focus();
+        } catch {
+          new Notice("Unable to load session.");
+        }
+      };
+      if (Platform?.isMobile) {
+        new SessionLoadModal(this.app, sessions, onChooseSession).open();
+        return;
+      }
+      const popover = new SessionHistoryPopover(button, sessions, onChooseSession,
+        () => { if (this.sessionHistoryPopover === popover) this.sessionHistoryPopover = null; });
+      this.sessionHistoryPopover = popover;
+      popover.open();
     } catch (error) {
+      if (request !== this.sessionHistoryRequest) return;
       const message = error instanceof Error ? error.message : "Unable to load sessions.";
       new Notice(message);
+    } finally {
+      if (request === this.sessionHistoryRequest) this.sessionHistoryPending = false;
     }
   }
 
   renderSkillSuggestions(container, input) {
     container.empty();
+    container.removeAttribute?.("role");
+    container.removeAttribute?.("aria-label");
+    this.clearSkillSuggestionAccessibility(input);
     const value = this.getComposerValue(input);
     const matches = this.chatController.handleDraftInput(value);
+    if (this.skillSuggestionQuery !== value) {
+      this.skillSuggestionQuery = value;
+      this.skillSuggestionIndex = 0;
+      this.skillSuggestionDismissed = false;
+    }
 
-    if (!value.startsWith("/") || matches.length === 0) {
+    if (!value.startsWith("/") || matches.length === 0 || this.skillSuggestionDismissed) {
       container.addClass("is-hidden");
       return;
     }
 
+    const listId = container.getAttribute("id") || `codriver-skills-${++skillSuggestionListSequence}`;
+    container.setAttribute("id", listId);
+    container.setAttribute("role", "listbox");
+    container.setAttribute("aria-label", "Skills");
+    input.setAttribute("aria-controls", listId);
+    input.setAttribute("aria-haspopup", "listbox");
+    this.skillSuggestionIndex = Math.min(this.skillSuggestionIndex ?? 0, matches.length - 1);
+    input.setAttribute("aria-activedescendant", `${listId}-${this.skillSuggestionIndex}`);
     container.removeClass("is-hidden");
-    for (const skill of matches) {
+    matches.forEach((skill, index) => {
       const activationLabel = this.chatController.getSkillActivationLabel(skill.id);
+      const selected = index === this.skillSuggestionIndex;
       const option = container.createDiv({
-        cls: `codriver-skill-suggestion ${activationLabel ? "is-active" : ""}`
+        cls: `codriver-skill-suggestion ${activationLabel ? "is-active" : ""} ${selected ? "is-selected" : ""}`,
+        attr: { id: `${listId}-${index}`, role: "option", "aria-selected": String(selected) }
       });
       const header = option.createDiv({ cls: "codriver-skill-suggestion-header" });
       header.createDiv({ cls: "codriver-skill-suggestion-name", text: skill.name });
@@ -2988,22 +3038,79 @@ class ChatView extends ItemView {
         header.createDiv({ cls: "codriver-skill-suggestion-status", text: activationLabel });
       }
       option.createDiv({ cls: "codriver-skill-suggestion-description", text: skill.description });
-      option.addEventListener("click", async () => {
-        if (skill.requiresInput && skill.command) {
-          this.setComposerValue(input, `/${skill.command} `);
-          input.focus();
-          container.addClass("is-hidden");
-          return;
-        }
+      option.addEventListener("mousedown", (event) => event.preventDefault());
+      option.addEventListener("click", () => { void this.selectSuggestedSkill(skill, input, container); });
+      if (selected) option.scrollIntoView?.({ block: "nearest" });
+    });
+  }
 
-        const result = await this.chatController.selectSkill(skill.id);
-        if (result?.ok === false && result.message) {
-          new Notice(result.message);
-        }
-        this.setComposerValue(input, "");
-        this.render();
-      });
+  clearSkillSuggestionAccessibility(input) {
+    input.removeAttribute?.("aria-activedescendant");
+    input.removeAttribute?.("aria-controls");
+    input.removeAttribute?.("aria-haspopup");
+  }
+
+  async selectSuggestedSkill(skill, input, container) {
+    if (this.skillSelectionPending) return;
+    this.skillSuggestionDismissed = true;
+    container.addClass("is-hidden");
+    this.clearSkillSuggestionAccessibility(input);
+    if (skill.requiresInput && skill.command) {
+      this.setComposerValue(input, `/${skill.command} `);
+      this.draftMessage = this.getComposerValue(input);
+      this.skillSuggestionQuery = this.draftMessage;
+      input.focus();
+      return;
     }
+
+    this.skillSelectionPending = true;
+    try {
+      const result = await this.chatController.selectSkill(skill.id);
+      if (result?.ok === false && result.message) new Notice(result.message);
+      this.setComposerValue(input, "");
+      this.draftMessage = "";
+      this.focusCommandInputAfterRender = true;
+      this.draftSelectionStart = 0;
+      this.draftSelectionEnd = 0;
+      this.render();
+    } catch {
+      new Notice("Unable to select skill.");
+    } finally {
+      this.skillSelectionPending = false;
+    }
+  }
+
+  handleSkillSuggestionKeydown(event, container, input) {
+    if (event.isComposing || event.keyCode === 229 || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return false;
+    if (this.skillSelectionPending && event.key === "Enter") {
+      event.preventDefault();
+      return true;
+    }
+    const value = this.getComposerValue(input);
+    if (!value.startsWith("/") || this.skillSuggestionDismissed || container.hasClass?.("is-hidden")) return false;
+    const matches = this.chatController.handleDraftInput(value);
+    if (!matches.length) return false;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      this.skillSuggestionDismissed = true;
+      container.addClass("is-hidden");
+      this.clearSkillSuggestionAccessibility(input);
+      return true;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const delta = event.key === "ArrowDown" ? 1 : -1;
+      this.skillSuggestionIndex = ((this.skillSuggestionIndex ?? 0) + delta + matches.length) % matches.length;
+      this.renderSkillSuggestions(container, input);
+      return true;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const index = Math.min(this.skillSuggestionIndex ?? 0, matches.length - 1);
+      void this.selectSuggestedSkill(matches[index], input, container);
+      return true;
+    }
+    return false;
   }
 
   updateCommandMenuFromInput(input) {

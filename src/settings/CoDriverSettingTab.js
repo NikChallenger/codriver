@@ -28,6 +28,8 @@ const {
   normalizeCommandFolderPath
 } = require("../commands/CommandFolderLoader");
 const { getBulkSelectionState } = require("../ui/BulkSelection");
+const { bindModelPicker } = require("../views/ModelPickerPopover");
+const { RemovalConfirmationModal } = require("../views/RemovalConfirmationModal");
 const {
   canShareDiagnosticLogFile,
   copyDiagnosticLog,
@@ -123,6 +125,7 @@ class CoDriverSettingTab extends PluginSettingTab {
   }
 
   display() {
+    this.modelPickerPopover?.close();
     const { containerEl } = this;
     const navigation = this.pendingSettingsNavigation;
     if (!navigation) {
@@ -168,6 +171,28 @@ class CoDriverSettingTab extends PluginSettingTab {
     }
 
     this.settingsIndexScrollTop = scrollTop;
+  }
+
+  hide() {
+    this.modelPickerPopover?.close();
+    this.removalConfirmationModal?.close();
+  }
+
+  confirmRemoval(kind, entry, remove) {
+    if (this.removalConfirmationModal) return;
+    const modal = new RemovalConfirmationModal(this.app, {
+      kind,
+      name: entry.name || entry.id,
+      onDelete: async () => {
+        await remove(entry.id);
+        this.display();
+      },
+      onClosed: () => {
+        if (this.removalConfirmationModal === modal) this.removalConfirmationModal = null;
+      }
+    });
+    this.removalConfirmationModal = modal;
+    modal.open();
   }
 
   renderSettingsIndex(containerEl, returnPageId = null) {
@@ -761,7 +786,13 @@ class CoDriverSettingTab extends PluginSettingTab {
     const current = normalizeAudioTranscriptionSettings(this.plugin.settings.audioTranscription);
     const choices = getAudioTranscriptionModelChoices(this.plugin.settings);
     const selectedValue = encodeAudioTranscriptionSelection(current.providerId, current.modelId);
-    const availableValues = new Set();
+    const groups = choices.map((provider) => ({
+      label: provider.providerName,
+      models: provider.models.map((model) => ({
+        model, label: model, value: encodeAudioTranscriptionSelection(provider.providerId, model)
+      }))
+    }));
+    const availableValues = new Set(groups.flatMap((group) => group.models.map((model) => model.value)));
     const setting = new Setting(container)
       .setName("Audio transcription")
       .addToggle((toggle) => {
@@ -798,56 +829,38 @@ class CoDriverSettingTab extends PluginSettingTab {
       });
     setting.settingEl.classList.add("codriver-audio-transcription-setting");
 
-    const select = setting.controlEl.createEl("select", {
-      cls: "codriver-audio-transcription-select",
+    const select = setting.controlEl.createEl("button", {
+      cls: "codriver-audio-transcription-select codriver-model-select-trigger",
+      text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId : `Unavailable: ${current.providerId} / ${current.modelId}`) : "Select model",
       attr: {
+        type: "button",
         "aria-label": "Select audio transcription model",
         title: AUDIO_TRANSCRIPTION_TOOLTIP
       }
     });
-    select.createEl("option", {
-      text: "Select model",
-      value: ""
-    });
-    for (const provider of choices) {
-      const group = select.createEl("optgroup", {
-        attr: { label: provider.providerName }
-      });
-      for (const model of provider.models) {
-        const value = encodeAudioTranscriptionSelection(provider.providerId, model);
-        availableValues.add(value);
-        group.createEl("option", {
-          text: model,
-          value
-        });
-      }
-    }
-
     if (current.providerId && current.modelId && !availableValues.has(selectedValue)) {
-      select.createEl("option", {
-        text: `Unavailable: ${current.providerId} / ${current.modelId}`,
-        value: selectedValue,
-        attr: { disabled: "" }
-      });
+      groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
     }
-    select.value = current.providerId && current.modelId ? selectedValue : "";
     select.disabled = !current.enabled && !this.pendingAudioTranscriptionEnable;
-    select.addEventListener("change", async () => {
-      const selection = decodeAudioTranscriptionSelection(select.value);
-      if (!selection.providerId || !selection.modelId) {
-        return;
+    bindModelPicker(this, select, {
+      label: "Select audio transcription model", groups, selectedValue,
+      onChoose: async (value) => {
+        const selection = decodeAudioTranscriptionSelection(value);
+        if (!selection.providerId || !selection.modelId) {
+          return;
+        }
+        const result = await this.plugin.updateAudioTranscriptionSettings({
+          enabled: current.enabled || this.pendingAudioTranscriptionEnable,
+          providerId: selection.providerId,
+          modelId: selection.modelId
+        });
+        if (!result.ok) {
+          new Notice(result.message);
+          return;
+        }
+        this.pendingAudioTranscriptionEnable = false;
+        this.display();
       }
-      const result = await this.plugin.updateAudioTranscriptionSettings({
-        enabled: current.enabled || this.pendingAudioTranscriptionEnable,
-        providerId: selection.providerId,
-        modelId: selection.modelId
-      });
-      if (!result.ok) {
-        new Notice(result.message);
-        return;
-      }
-      this.pendingAudioTranscriptionEnable = false;
-      this.display();
     });
 
     const resolution = resolveAudioTranscriptionSelection(this.plugin.settings);
@@ -896,9 +909,8 @@ class CoDriverSettingTab extends PluginSettingTab {
     createIconButton(actions, "pencil", "Edit model", () => {
       new ProviderSettingsModal(this.app, this.plugin, provider, () => this.display()).open();
     });
-    createIconButton(actions, "trash-2", "Remove model", async () => {
-      await this.plugin.removeProvider(provider.id);
-      this.display();
+    createIconButton(actions, "trash-2", "Remove model", () => {
+      this.confirmRemoval("provider", provider, (id) => this.plugin.removeProvider(id));
     });
     const defaultButton = createIconButton(actions, "star", "Set as default", async () => {
       await this.plugin.selectProvider(provider.id);
@@ -1088,9 +1100,8 @@ class CoDriverSettingTab extends PluginSettingTab {
     createIconButton(actions, "pencil", "Edit MCP server", () => {
       new McpServerSettingsModal(this.app, this.plugin, server, () => this.display()).open();
     });
-    createIconButton(actions, "trash-2", "Remove MCP server", async () => {
-      await this.plugin.removeMcpServer(server.id);
-      this.display();
+    createIconButton(actions, "trash-2", "Remove MCP server", () => {
+      this.confirmRemoval("MCP server", server, (id) => this.plugin.removeMcpServer(id));
     });
 
     if (runtimeBlocked) {
@@ -1601,12 +1612,21 @@ class ProviderSettingsModal extends Modal {
     this.render();
   }
 
+  onClose() {
+    this.modelPickerPopover?.close();
+    this.contentEl.empty();
+  }
+
   render(statusText = "", statusOk = null) {
+    this.modelPickerPopover?.close();
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("codriver-provider-modal");
 
-    contentEl.createEl("h2", { text: this.provider ? "Edit model" : "Add model" });
+    this.saveButtons = [];
+    const header = contentEl.createDiv({ cls: "codriver-provider-modal-header" });
+    header.createEl("h2", { text: this.provider ? "Edit model" : "Add model" });
+    this.renderActions(header, true);
 
     new Setting(contentEl)
       .setName("Provider type")
@@ -1674,15 +1694,27 @@ class ProviderSettingsModal extends Modal {
           });
       });
 
-    new Setting(contentEl)
-      .setName("Default model")
-      .addDropdown((dropdown) => {
-        populateModelDropdown(dropdown, this.draft);
-        dropdown.onChange((value) => {
-          this.draft.model = value;
-        });
-      })
-      .addButton((button) => {
+    const modelSetting = new Setting(contentEl).setName("Default model");
+    const models = Array.isArray(this.draft.models) ? this.draft.models : [];
+    const selectedValue = models.includes(this.draft.model) ? this.draft.model : models[0] ?? "";
+    const modelButton = modelSetting.controlEl.createEl("button", {
+      cls: "codriver-model-select-trigger",
+      text: selectedValue || "Load models first",
+      attr: { type: "button", "aria-label": "Select default model", title: selectedValue || "Load models first" }
+    });
+    modelButton.disabled = models.length === 0;
+    const pickerOptions = {
+      label: "Select default model", selectedValue,
+      groups: [{ label: "", models: models.map((model) => ({ model, label: model, value: model })) }],
+      onChoose: (value) => {
+        this.draft.model = value;
+        modelButton.textContent = value;
+        modelButton.title = value;
+        pickerOptions.selectedValue = value;
+      }
+    };
+    bindModelPicker(this, modelButton, pickerOptions);
+    modelSetting.addButton((button) => {
         button
           .setButtonText("Test connection")
           .onClick(async () => {
@@ -1709,7 +1741,11 @@ class ProviderSettingsModal extends Modal {
 
     this.renderGenerationParameters(contentEl);
 
-    new Setting(contentEl)
+    this.renderActions(contentEl);
+  }
+
+  renderActions(container, header = false) {
+    const setting = new Setting(container)
       .addButton((button) => {
         button
           .setButtonText("Cancel")
@@ -1719,13 +1755,30 @@ class ProviderSettingsModal extends Modal {
         button
           .setCta()
           .setButtonText("Save")
-          .onClick(async () => {
-            button.setDisabled(true);
-            await this.plugin.saveProviderDraft(this.draft);
-            this.close();
-            this.onSaved?.();
-          });
+          .setDisabled(this.saving === true)
+          .onClick(() => this.saveDraft());
+        this.saveButtons.push(button);
       });
+    if (header) {
+      setting.settingEl.removeClass("setting-item");
+      setting.settingEl.addClass("codriver-provider-modal-header-actions");
+    }
+  }
+
+  async saveDraft() {
+    if (this.saving) return;
+    this.saving = true;
+    for (const button of this.saveButtons) button.setDisabled(true);
+    try {
+      await this.plugin.saveProviderDraft(this.draft);
+      this.close();
+      this.onSaved?.();
+    } catch {
+      new Notice("Unable to save provider settings.");
+    } finally {
+      this.saving = false;
+      for (const button of this.saveButtons) button.setDisabled(false);
+    }
   }
 
   changeProviderType(type) {
@@ -2098,25 +2151,6 @@ function isMcpServerRuntimeBlocked(plugin, server) {
 function getProviderTypeLabel(type) {
   const option = PROVIDER_TYPE_OPTIONS.find((item) => item.value === type);
   return option?.label ?? "Provider";
-}
-
-function populateModelDropdown(dropdown, provider) {
-  const models = Array.isArray(provider?.models) ? provider.models : [];
-
-  if (models.length === 0) {
-    dropdown.addOption("", "Load models first");
-    dropdown.setValue("");
-    return;
-  }
-
-  for (const model of models) {
-    dropdown.addOption(model, model);
-  }
-
-  const selectedModel = provider?.model && models.includes(provider.model)
-    ? provider.model
-    : models[0];
-  dropdown.setValue(selectedModel);
 }
 
 function renderOptionalSlider(container, draft, options) {

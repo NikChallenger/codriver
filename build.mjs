@@ -5,6 +5,7 @@ import { dirname, extname, join, relative, resolve } from "node:path";
 const root = process.cwd();
 const sourceRoot = resolve(root, "src");
 const generatedVendorAssetPath = resolve(root, "src/generated/vendorAssets.js");
+const generatedReleaseNotesPath = resolve(root, "src/generated/releaseNotes.js");
 const watchMode = process.argv.includes("--watch");
 const externalModules = ["child_process", "obsidian"];
 const requiredFiles = [
@@ -57,8 +58,60 @@ function writeGeneratedVendorAssetModule() {
   writeFileSync(generatedVendorAssetPath, source, "utf8");
 }
 
+export function parseReleaseNotes(version, text) {
+  if (!/^\d+\.\d+\.\d+$/.test(version) || text.length > 20000 || /[^\x00-\x7F]/.test(text)) {
+    throw new Error("Invalid bundled release notes identity, size, or encoding.");
+  }
+  const lines = text.trim().split("\n");
+  if (lines.shift() !== `# CoDriver ${version}`) {
+    throw new Error("Release notes heading must match the manifest version.");
+  }
+  const blocks = [];
+  let paragraph = [];
+  const flush = () => {
+    if (paragraph.length) blocks.push({ type: "p", text: paragraph.join(" ") });
+    paragraph = [];
+  };
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const heading = /^(#{2,3})\s+(.+)$/.exec(trimmed);
+    if (!trimmed || heading || trimmed.startsWith("- ")) {
+      flush();
+      if (heading) blocks.push({ type: heading[1].length === 2 ? "h3" : "h4", text: heading[2] });
+      else if (trimmed.startsWith("- ")) blocks.push({ type: "li", text: trimmed.slice(2) });
+    } else {
+      paragraph.push(trimmed);
+    }
+  }
+  flush();
+  if (!blocks.some((block) => block.type === "p" || block.type === "li")) {
+    throw new Error("Current release notes must contain non-empty user-facing content.");
+  }
+  return { version, blocks };
+}
+
+function writeGeneratedReleaseNotesModule() {
+  const { version } = JSON.parse(readTextFileNormalized(resolve(root, "manifest.json")));
+  if (typeof version !== "string" || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || version.length > 32) {
+    throw new Error("Bundled release notes require an exact manifest release version.");
+  }
+  const packageVersion = JSON.parse(readTextFileNormalized(resolve(root, "package.json"))).version;
+  const constants = readTextFileNormalized(resolve(root, "src/constants.js"));
+  if (packageVersion !== version || !constants.includes(`const CODRIVER_PLUGIN_VERSION = "${version}";`)) {
+    throw new Error("Release notes build requires aligned manifest, package, and constants versions.");
+  }
+  const notesPath = resolve(root, "docs/releases", `${version}.md`);
+  const notes = parseReleaseNotes(version, readTextFileNormalized(notesPath));
+  mkdirSync(dirname(generatedReleaseNotesPath), { recursive: true });
+  const source = `// Generated from current public release notes by build.mjs.\nmodule.exports = ${JSON.stringify(notes, null, 2)};\n`;
+  if (!existsSync(generatedReleaseNotesPath) || readFileSync(generatedReleaseNotesPath, "utf8") !== source) {
+    writeFileSync(generatedReleaseNotesPath, source, "utf8");
+  }
+}
+
 function createBundle() {
   writeGeneratedVendorAssetModule();
+  writeGeneratedReleaseNotesModule();
 
   const modules = collectJavaScriptFiles(sourceRoot).map((filePath) => {
     const id = toModuleId(filePath);
@@ -162,4 +215,6 @@ if (watchMode) {
   };
 
   watch(resolve(root, "src"), { recursive: true }, rebuild);
+  watch(resolve(root, "docs/releases"), rebuild);
+  watch(resolve(root, "manifest.json"), rebuild);
 }
