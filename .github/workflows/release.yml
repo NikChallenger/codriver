@@ -47,7 +47,7 @@ jobs:
         run: |
           npm run build
           git diff --exit-code -- main.js
-          rm src/generated/vendorAssets.js
+          rm src/generated/vendorAssets.js src/generated/releaseNotes.js
           rmdir src/generated
           test -z "$(git status --porcelain --untracked-files=all)"
       - name: Attest exact release assets
@@ -88,6 +88,10 @@ jobs:
         with:
           name: codriver-${{ inputs.tag }}-release-assets
           path: release-assets
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
       - name: Create or verify the matching draft
         shell: bash
         run: |
@@ -118,3 +122,43 @@ jobs:
           cmp release-assets/main.js "$RUNNER_TEMP/existing-assets/main.js"
           cmp release-assets/manifest.json "$RUNNER_TEMP/existing-assets/manifest.json"
           cmp release-assets/styles.css "$RUNNER_TEMP/existing-assets/styles.css"
+      - name: Verify new build provenance for exact draft assets
+        shell: bash
+        env:
+          APPROVED_SHA: ${{ github.sha }}
+          BUILD_INVOCATION: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APPROVED_SHA"
+          gh --version
+          for asset in main.js manifest.json styles.css; do
+            gh attestation verify "$RUNNER_TEMP/existing-assets/$asset" \
+              --repo NikChallenger/codriver \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --signer-workflow NikChallenger/codriver/.github/workflows/release.yml \
+              --cert-identity https://github.com/NikChallenger/codriver/.github/workflows/release.yml@refs/heads/main \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --source-ref refs/heads/main \
+              --source-digest "$APPROVED_SHA" \
+              --signer-digest "$APPROVED_SHA" \
+              --deny-self-hosted-runners \
+              --format json > "$RUNNER_TEMP/$asset-verification.json"
+            node - "$RUNNER_TEMP/$asset-verification.json" "$RUNNER_TEMP/existing-assets/$asset" <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const { createHash } = require("node:crypto");
+          const { basename } = require("node:path");
+          const [evidencePath, assetPath] = process.argv.slice(2);
+          const results = JSON.parse(readFileSync(evidencePath, "utf8"));
+          const digest = createHash("sha256").update(readFileSync(assetPath)).digest("hex");
+          const matches = Array.isArray(results) && results.filter(({ verificationResult }) => {
+            const statement = verificationResult?.statement;
+            const predicate = statement?.predicate;
+            return statement?.predicateType === "https://slsa.dev/provenance/v1"
+              && predicate?.buildDefinition?.buildType === "https://actions.github.io/buildtypes/workflow/v1"
+              && predicate?.runDetails?.metadata?.invocationId === process.env.BUILD_INVOCATION
+              && statement?.subject?.some((subject) => subject.name === basename(assetPath) && subject.digest?.sha256 === digest);
+          });
+          if (!matches || matches.length === 0) throw new Error("No verified provenance for this exact build invocation and draft asset.");
+          console.log(JSON.stringify({ asset: basename(assetPath), sha256: digest, sourceCommit: process.env.APPROVED_SHA, invocation: process.env.BUILD_INVOCATION, verified: matches }));
+          NODE
+          done
