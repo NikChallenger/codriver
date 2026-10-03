@@ -14467,7 +14467,7 @@
         },
         {
           "type": "li",
-          "text": "See estimated context usage through a ring around the Request info button. The indicator reflects the latest prepared provider call, not cumulative session usage."
+          "text": "See estimated context usage as a percentage in the Request info button tooltip. The estimate reflects the latest prepared provider call, not cumulative session usage."
         },
         {
           "type": "h3",
@@ -35868,12 +35868,12 @@
         const budget = this.chatController.getRequestContextBudget?.() ?? {};
         const callCharacters = info.latestCallContext?.totalCharacters;
         const maximumCharacters = budget.maximumCharacters;
-        const showRing = Number.isFinite(callCharacters) &&
+        const showUsage = Number.isFinite(callCharacters) &&
           Number.isFinite(maximumCharacters) && maximumCharacters > 0;
-        const usagePercent = showRing
+        const usagePercent = showUsage
           ? Math.min(100, Math.max(0, callCharacters / maximumCharacters * 100))
           : 0;
-        const usageLabel = showRing
+        const usageLabel = showUsage
           ? `Request info. ~${callCharacters > maximumCharacters ? "100%+" : `${Math.round(usagePercent)}%`} context used`
           : "Request info";
         const button = container.createEl("button", {
@@ -35884,13 +35884,6 @@
         });
         button.toggleClass("is-active", this.requestInfoOpen);
         setIcon(button, "info");
-        if (showRing) {
-          const ring = button.createSpan({
-            cls: "codriver-request-info-ring",
-            attr: { "aria-hidden": "true" }
-          });
-          ring.style.setProperty("--codriver-context-usage", `${usagePercent}%`);
-        }
         button.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();

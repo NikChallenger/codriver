@@ -2751,12 +2751,12 @@ class ChatView extends ItemView {
     const budget = this.chatController.getRequestContextBudget?.() ?? {};
     const callCharacters = info.latestCallContext?.totalCharacters;
     const maximumCharacters = budget.maximumCharacters;
-    const showRing = Number.isFinite(callCharacters) &&
+    const showUsage = Number.isFinite(callCharacters) &&
       Number.isFinite(maximumCharacters) && maximumCharacters > 0;
-    const usagePercent = showRing
+    const usagePercent = showUsage
       ? Math.min(100, Math.max(0, callCharacters / maximumCharacters * 100))
       : 0;
-    const usageLabel = showRing
+    const usageLabel = showUsage
       ? `Request info. ~${callCharacters > maximumCharacters ? "100%+" : `${Math.round(usagePercent)}%`} context used`
       : "Request info";
     const button = container.createEl("button", {
@@ -2767,13 +2767,6 @@ class ChatView extends ItemView {
     });
     button.toggleClass("is-active", this.requestInfoOpen);
     setIcon(button, "info");
-    if (showRing) {
-      const ring = button.createSpan({
-        cls: "codriver-request-info-ring",
-        attr: { "aria-hidden": "true" }
-      });
-      ring.style.setProperty("--codriver-context-usage", `${usagePercent}%`);
-    }
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
