@@ -33,6 +33,6 @@ jobs:
       - name: Require an exact reproducible bundle
         run: |
           git diff --exit-code -- main.js
-          rm src/generated/vendorAssets.js
+          rm src/generated/vendorAssets.js src/generated/releaseNotes.js
           rmdir src/generated
           test -z "$(git status --porcelain --untracked-files=all)"
