@@ -1606,10 +1606,19 @@ class ProviderSettingsModal extends Modal {
     this.provider = provider ? copyProvider(provider) : null;
     this.draft = provider ? copyProvider(provider) : this.plugin.createProviderDraft(OPENAI_PROVIDER_TYPE);
     this.onSaved = onSaved;
+    // Obsidian's phone opening transition uses inline styles, not CSS animations.
+    // Gate only the supported native opening hook; leave native close behavior intact.
+    if (Platform.isMobile && typeof this.shouldAnimate === "boolean") {
+      this.shouldAnimate = false;
+    }
+    this.render();
   }
 
   onOpen() {
-    this.render();
+    // Content is ready before Obsidian measures and displays the mobile modal.
+    if (Platform.isMobile && this.shouldAnimate === false && this.bgEl) {
+      this.bgEl.style.opacity = this.dimBackground ? this.bgOpacity : "0";
+    }
   }
 
   onClose() {

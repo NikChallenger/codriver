@@ -13809,7 +13809,7 @@
   },
   "src/constants.js": function(module, exports, require) {
     const VIEW_TYPE_CODRIVER = "codriver-chat-view";
-    const CODRIVER_PLUGIN_VERSION = "0.5.3";
+    const CODRIVER_PLUGIN_VERSION = "0.5.4";
     const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:1234/v1";
     const DEFAULT_GEMINI_BASE_ENDPOINT = "https://generativelanguage.googleapis.com";
     const DEFAULT_GEMINI_API_VERSION = "v1beta";
@@ -14451,55 +14451,23 @@
   "src/generated/releaseNotes.js": function(module, exports, require) {
     // Generated from current public release notes by build.mjs.
     module.exports = {
-      "version": "0.5.3",
+      "version": "0.5.4",
       "blocks": [
         {
-          "type": "p",
-          "text": "Includes the improvements from 0.5.2 and the release fixes in 0.5.3."
-        },
-        {
           "type": "h3",
-          "text": "What's new"
+          "text": "Fixes"
         },
         {
           "type": "li",
-          "text": "Quickly filter models in Audio transcription, provider Default model, and the chat's Select model picker."
+          "text": "Fixed flickering when opening new or existing provider editors on mobile."
         },
         {
           "type": "li",
-          "text": "See estimated context usage as a percentage in the Request info button tooltip. The estimate reflects the latest prepared provider call, not cumulative session usage."
-        },
-        {
-          "type": "h3",
-          "text": "Improvements and fixes"
+          "text": "Fixed disappearing model pickers in Audio transcription and provider Default model settings."
         },
         {
           "type": "li",
-          "text": "Improved skill selection and filtering when typing `/`."
-        },
-        {
-          "type": "li",
-          "text": "Open Session history directly above its button on desktop."
-        },
-        {
-          "type": "li",
-          "text": "Find Save and Cancel at both the top and bottom of the provider editor."
-        },
-        {
-          "type": "li",
-          "text": "Confirm the named provider or external MCP server before removing it."
-        },
-        {
-          "type": "li",
-          "text": "Enjoy a wider chat workspace with smaller, consistent side margins on desktop and mobile."
-        },
-        {
-          "type": "li",
-          "text": "Improved layout and text alignment in Session history and Diagnostic logging settings."
-        },
-        {
-          "type": "li",
-          "text": "Fixed release packaging and build verification issues encountered in 0.5.2"
+          "text": "Improved model picker positioning when the mobile keyboard opens."
         }
       ]
     };
@@ -26429,10 +26397,19 @@
         this.provider = provider ? copyProvider(provider) : null;
         this.draft = provider ? copyProvider(provider) : this.plugin.createProviderDraft(OPENAI_PROVIDER_TYPE);
         this.onSaved = onSaved;
+        // Obsidian's phone opening transition uses inline styles, not CSS animations.
+        // Gate only the supported native opening hook; leave native close behavior intact.
+        if (Platform.isMobile && typeof this.shouldAnimate === "boolean") {
+          this.shouldAnimate = false;
+        }
+        this.render();
       }
 
       onOpen() {
-        this.render();
+        // Content is ready before Obsidian measures and displays the mobile modal.
+        if (Platform.isMobile && this.shouldAnimate === false && this.bgEl) {
+          this.bgEl.style.opacity = this.dimBackground ? this.bgOpacity : "0";
+        }
       }
 
       onClose() {
@@ -37460,8 +37437,11 @@
         if (this.element || this.button.disabled) return;
         const doc = this.button.ownerDocument;
         this.window = doc.defaultView;
+        this.mobile = doc.body.classList.contains("is-mobile");
         const listId = `codriver-model-list-${++modelListSequence}`;
-        this.element = doc.body.createDiv({
+        // Keep modal focus containment and stacking ownership intact.
+        this.host = this.button.closest(".modal") ?? doc.body;
+        this.element = this.host.createDiv({
           cls: "codriver-model-popover",
           attr: { id: `${listId}-dialog`, role: "dialog", "aria-label": this.options.label }
         });
@@ -37493,7 +37473,7 @@
           this.listen(this.window.visualViewport, "scroll", () => this.position());
         }
         this.renderOptions();
-        if (this.element) this.search.focus();
+        if (this.element && !this.mobile) this.search.focus();
         this.position();
       }
 
@@ -37562,24 +37542,42 @@
         if (!this.element) return;
         if (!this.button.isConnected) { this.close(); return; }
         const viewport = this.window.visualViewport;
-        const left = viewport?.offsetLeft ?? 0;
-        const top = viewport?.offsetTop ?? 0;
-        const width = viewport?.width ?? this.window.innerWidth;
-        const height = viewport?.height ?? this.window.innerHeight;
+        let left = viewport?.offsetLeft ?? 0;
+        let top = viewport?.offsetTop ?? 0;
+        let width = viewport?.width ?? this.window.innerWidth;
+        let height = viewport?.height ?? this.window.innerHeight;
+        if (this.host !== this.button.ownerDocument.body) {
+          const hostBounds = this.host.getBoundingClientRect();
+          const right = Math.min(left + width, hostBounds.right);
+          const bottom = Math.min(top + height, hostBounds.bottom);
+          left = Math.max(left, hostBounds.left);
+          top = Math.max(top, hostBounds.top);
+          width = Math.max(0, right - left);
+          height = Math.max(0, bottom - top);
+        }
         const anchor = this.button.getBoundingClientRect();
-        if (anchor.bottom < top || anchor.top > top + height || anchor.right < left || anchor.left > left + width) {
+        const offscreen = anchor.bottom < top || anchor.top > top + height || anchor.right < left || anchor.left > left + width;
+        if (offscreen && !this.mobile) {
           this.close(); return;
         }
         const above = anchor.top - top - 16;
         const below = top + height - anchor.bottom - 16;
         const upward = this.options.preferAbove ? above >= 120 || above >= below : below < 120 && above > below;
-        const availableHeight = Math.max(0, upward ? above : below);
+        let availableHeight = Math.max(0, upward ? above : below);
+        const viewportFallback = this.mobile && (offscreen || availableHeight < 80);
+        if (viewportFallback) availableHeight = Math.max(0, height - 16);
         if (availableHeight < 80) { this.close(); return; }
         this.element.style.width = `${Math.min(320, Math.max(0, width - 16))}px`;
         this.element.style.maxHeight = `${Math.min(360, availableHeight)}px`;
         const bounds = this.element.getBoundingClientRect();
-        this.element.style.left = `${Math.max(left + 8, Math.min(anchor.left, left + width - bounds.width - 8))}px`;
-        this.element.style.top = `${upward ? anchor.top - bounds.height - 8 : anchor.bottom + 8}px`;
+        const targetLeft = Math.max(left + 8, Math.min(anchor.left, left + width - bounds.width - 8));
+        const targetTop = viewportFallback ? top + 8 : upward ? anchor.top - bounds.height - 8 : anchor.bottom + 8;
+        // A transformed owning modal can establish the fixed-position containing block.
+        this.element.style.left = "0px";
+        this.element.style.top = "0px";
+        const origin = this.element.getBoundingClientRect();
+        this.element.style.left = `${targetLeft - origin.left}px`;
+        this.element.style.top = `${targetTop - origin.top}px`;
       }
 
       choose(model) {

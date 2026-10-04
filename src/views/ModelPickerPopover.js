@@ -18,8 +18,11 @@ class ModelPickerPopover {
     if (this.element || this.button.disabled) return;
     const doc = this.button.ownerDocument;
     this.window = doc.defaultView;
+    this.mobile = doc.body.classList.contains("is-mobile");
     const listId = `codriver-model-list-${++modelListSequence}`;
-    this.element = doc.body.createDiv({
+    // Keep modal focus containment and stacking ownership intact.
+    this.host = this.button.closest(".modal") ?? doc.body;
+    this.element = this.host.createDiv({
       cls: "codriver-model-popover",
       attr: { id: `${listId}-dialog`, role: "dialog", "aria-label": this.options.label }
     });
@@ -51,7 +54,7 @@ class ModelPickerPopover {
       this.listen(this.window.visualViewport, "scroll", () => this.position());
     }
     this.renderOptions();
-    if (this.element) this.search.focus();
+    if (this.element && !this.mobile) this.search.focus();
     this.position();
   }
 
@@ -120,24 +123,42 @@ class ModelPickerPopover {
     if (!this.element) return;
     if (!this.button.isConnected) { this.close(); return; }
     const viewport = this.window.visualViewport;
-    const left = viewport?.offsetLeft ?? 0;
-    const top = viewport?.offsetTop ?? 0;
-    const width = viewport?.width ?? this.window.innerWidth;
-    const height = viewport?.height ?? this.window.innerHeight;
+    let left = viewport?.offsetLeft ?? 0;
+    let top = viewport?.offsetTop ?? 0;
+    let width = viewport?.width ?? this.window.innerWidth;
+    let height = viewport?.height ?? this.window.innerHeight;
+    if (this.host !== this.button.ownerDocument.body) {
+      const hostBounds = this.host.getBoundingClientRect();
+      const right = Math.min(left + width, hostBounds.right);
+      const bottom = Math.min(top + height, hostBounds.bottom);
+      left = Math.max(left, hostBounds.left);
+      top = Math.max(top, hostBounds.top);
+      width = Math.max(0, right - left);
+      height = Math.max(0, bottom - top);
+    }
     const anchor = this.button.getBoundingClientRect();
-    if (anchor.bottom < top || anchor.top > top + height || anchor.right < left || anchor.left > left + width) {
+    const offscreen = anchor.bottom < top || anchor.top > top + height || anchor.right < left || anchor.left > left + width;
+    if (offscreen && !this.mobile) {
       this.close(); return;
     }
     const above = anchor.top - top - 16;
     const below = top + height - anchor.bottom - 16;
     const upward = this.options.preferAbove ? above >= 120 || above >= below : below < 120 && above > below;
-    const availableHeight = Math.max(0, upward ? above : below);
+    let availableHeight = Math.max(0, upward ? above : below);
+    const viewportFallback = this.mobile && (offscreen || availableHeight < 80);
+    if (viewportFallback) availableHeight = Math.max(0, height - 16);
     if (availableHeight < 80) { this.close(); return; }
     this.element.style.width = `${Math.min(320, Math.max(0, width - 16))}px`;
     this.element.style.maxHeight = `${Math.min(360, availableHeight)}px`;
     const bounds = this.element.getBoundingClientRect();
-    this.element.style.left = `${Math.max(left + 8, Math.min(anchor.left, left + width - bounds.width - 8))}px`;
-    this.element.style.top = `${upward ? anchor.top - bounds.height - 8 : anchor.bottom + 8}px`;
+    const targetLeft = Math.max(left + 8, Math.min(anchor.left, left + width - bounds.width - 8));
+    const targetTop = viewportFallback ? top + 8 : upward ? anchor.top - bounds.height - 8 : anchor.bottom + 8;
+    // A transformed owning modal can establish the fixed-position containing block.
+    this.element.style.left = "0px";
+    this.element.style.top = "0px";
+    const origin = this.element.getBoundingClientRect();
+    this.element.style.left = `${targetLeft - origin.left}px`;
+    this.element.style.top = `${targetTop - origin.top}px`;
   }
 
   choose(model) {

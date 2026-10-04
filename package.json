@@ -1,6 +1,6 @@
 {
   "name": "codriver-obsidian-plugin",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Chat with your vault through connected language model providers.",
   "main": "main.js",
   "scripts": {
