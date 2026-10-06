@@ -1,4 +1,8 @@
-const { Modal, Notice, Platform, PluginSettingTab, SecretComponent, Setting, setIcon } = require("obsidian");
+const { McpCredentialError } = require("../mcp/McpCredentials");
+const { ProviderCredentialError } = require("./ProviderCredentials");
+const { renderSecretInput } = require("./SecretInput");
+const { McpCommandError, formatMcpCommand, parseMcpCommand } = require("./McpServerForm");
+const { Modal, Notice, Platform, PluginSettingTab, Setting, setIcon } = require("obsidian");
 const {
   ANTHROPIC_PROVIDER_TYPE,
   DEFAULT_GEMINI_API_VERSION,
@@ -180,14 +184,26 @@ class CoDriverSettingTab extends PluginSettingTab {
 
   confirmRemoval(kind, entry, remove) {
     if (this.removalConfirmationModal) return;
+    let review;
+    try { review = this.plugin.prepareConnectionRemoval(kind, entry.id); }
+    catch { new Notice("Unable to review this connection. Refresh Settings and retry."); return; }
     const modal = new RemovalConfirmationModal(this.app, {
       kind,
       name: entry.name || entry.id,
-      onDelete: async () => {
-        await remove(entry.id);
+      secretName: review.secretName,
+      shared: review.shared,
+      onDelete: async (removeSecret, signal) => {
+        const result = await remove(entry.id, { review, removeSecret, signal });
         this.display();
+        return result;
+      },
+      onRetry: async (signal) => {
+        const result = await this.plugin.applyConnectionRemoval(review, true, true, signal);
+        this.display();
+        return result;
       },
       onClosed: () => {
+        this.plugin.forgetConnectionRemoval?.(review);
         if (this.removalConfirmationModal === modal) this.removalConfirmationModal = null;
       }
     });
@@ -910,7 +926,7 @@ class CoDriverSettingTab extends PluginSettingTab {
       new ProviderSettingsModal(this.app, this.plugin, provider, () => this.display()).open();
     });
     createIconButton(actions, "trash-2", "Remove model", () => {
-      this.confirmRemoval("provider", provider, (id) => this.plugin.removeProvider(id));
+      this.confirmRemoval("provider", provider, (id, options) => this.plugin.removeProvider(id, options));
     });
     const defaultButton = createIconButton(actions, "star", "Set as default", async () => {
       await this.plugin.selectProvider(provider.id);
@@ -1036,6 +1052,8 @@ class CoDriverSettingTab extends PluginSettingTab {
 
   renderMcpServerRow(container, server) {
     const runtimeBlocked = isMcpServerRuntimeBlocked(this.plugin, server);
+    const credentialStatus = this.plugin.getMcpCredentialStatus?.(server) ?? "";
+    const credentialBlocked = server.transport === MCP_HTTP_TRANSPORT && Boolean(credentialStatus);
     const discovering = this.discoveringMcpServerIds.has(server.id);
     const group = container.createDiv({ cls: "codriver-mcp-server-group" });
     const row = group.createDiv({ cls: "codriver-provider-row" });
@@ -1051,7 +1069,7 @@ class CoDriverSettingTab extends PluginSettingTab {
         "aria-label": "Enable MCP server"
       }
     });
-    enabled.checked = server.enabled !== false && !runtimeBlocked;
+    enabled.checked = server.enabled !== false;
     enabled.disabled = runtimeBlocked;
     if (runtimeBlocked) {
       enabled.title = getStdioMcpUnavailableMessage(this.plugin);
@@ -1096,12 +1114,12 @@ class CoDriverSettingTab extends PluginSettingTab {
       },
       discovering ? "is-loading" : ""
     );
-    discoverButton.disabled = runtimeBlocked || discovering;
+    discoverButton.disabled = runtimeBlocked || credentialBlocked || discovering;
     createIconButton(actions, "pencil", "Edit MCP server", () => {
       new McpServerSettingsModal(this.app, this.plugin, server, () => this.display()).open();
     });
     createIconButton(actions, "trash-2", "Remove MCP server", () => {
-      this.confirmRemoval("MCP server", server, (id) => this.plugin.removeMcpServer(id));
+      this.confirmRemoval("MCP server", server, (id, options) => this.plugin.removeMcpServer(id, options));
     });
 
     if (runtimeBlocked) {
@@ -1111,6 +1129,14 @@ class CoDriverSettingTab extends PluginSettingTab {
       });
     }
 
+    if (credentialStatus) {
+      new Setting(group).setName("Credentials need attention").setDesc(credentialStatus)
+        .addButton((button) => button.setButtonText("Retry migration").onClick(async () => {
+          button.setDisabled(true);
+          await this.plugin.retryMcpCredentialMigration(server.id);
+          this.display();
+        }));
+    }
     this.renderMcpToolRows(group, server, { disabled: runtimeBlocked });
   }
 
@@ -1606,6 +1632,11 @@ class ProviderSettingsModal extends Modal {
     this.provider = provider ? copyProvider(provider) : null;
     this.draft = provider ? copyProvider(provider) : this.plugin.createProviderDraft(OPENAI_PROVIDER_TYPE);
     this.onSaved = onSaved;
+    this.credentialInput = "";
+    this.savedKeyInput = "";
+    this.credentialAction = "keep";
+    this.showKey = false;
+    this.loadCredential();
     // Obsidian's phone opening transition uses inline styles, not CSS animations.
     // Gate only the supported native opening hook; leave native close behavior intact.
     if (Platform.isMobile && typeof this.shouldAnimate === "boolean") {
@@ -1623,10 +1654,67 @@ class ProviderSettingsModal extends Modal {
 
   onClose() {
     this.modelPickerPopover?.close();
+    this.clearCredential();
+    if (!this.keepPreparedChange) this.plugin.discardProviderCredentialDraft?.(this.saveCredentialDraft);
+    if (this.saveCredentialDraft) this.saveCredentialDraft.credentialInput = "";
+    this.saveCredentialDraft = null;
+    this.busyControls = null;
+    this.provider = null;
+    this.draft = null;
     this.contentEl.empty();
   }
 
+  clearCredential() {
+    if (this.secretInputEl) this.secretInputEl.value = "";
+    this.secretInputEl = null;
+    this.credentialInput = "";
+    this.savedKeyInput = "";
+    this.credentialAction = "keep";
+    this.showKey = false;
+  }
+
+  loadCredential() {
+    this.credentialError = "";
+    try {
+      const service = this.plugin.getProviderCredentialService?.();
+      service?.access?.assertStorage();
+      if (!this.draft.apiKeySecretName) return;
+      this.savedKeyInput = service.resolve(this.draft);
+      this.credentialInput = this.savedKeyInput;
+    } catch (error) {
+      this.credentialError = error instanceof ProviderCredentialError ? error.message : "Provider credentials are unavailable.";
+    }
+  }
+
+  credentialDraft() {
+    return { ...this.draft, credentialInput: this.credentialInput, credentialAction: this.credentialAction };
+  }
+
+  setBusyControls(allowCancel = false) {
+    this.modelPickerPopover?.close();
+    this.busyControls = new Map();
+    const visit = (parent) => {
+      for (const element of Array.from(parent.children ?? [])) {
+        if (["input", "textarea", "select", "button"].includes(element.tagName?.toLowerCase())) {
+          if (allowCancel && element.textContent === "Cancel") continue;
+          this.busyControls.set(element, element.disabled);
+          element.disabled = true;
+        }
+        visit(element);
+      }
+    };
+    visit(this.contentEl);
+  }
+
+  restoreBusyControls() {
+    for (const [element, disabled] of this.busyControls ?? []) element.disabled = disabled;
+    this.busyControls = null;
+  }
+
   render(statusText = "", statusOk = null) {
+    if (!this.draft) return;
+    if (this.secretInputEl) this.secretInputEl.value = "";
+    this.secretInputEl = null;
     this.modelPickerPopover?.close();
     const { contentEl } = this;
     contentEl.empty();
@@ -1677,7 +1765,6 @@ class ProviderSettingsModal extends Modal {
     if (this.draft.type === GEMINI_PROVIDER_TYPE) {
       new Setting(contentEl)
         .setName("API version")
-        .setDesc("Gemini REST API version.")
         .addText((text) => {
           text
             .setValue(this.draft.apiVersion || DEFAULT_GEMINI_API_VERSION)
@@ -1687,21 +1774,36 @@ class ProviderSettingsModal extends Modal {
         });
     }
 
-    new Setting(contentEl)
-      .setName("API key")
-      .setDesc("Stored in Obsidian secret storage.")
-      .addComponent((componentEl) => {
-        if (!SecretComponent || !this.app.secretStorage) {
-          componentEl.createSpan({ text: "Secret storage is unavailable in this Obsidian version." });
-          return;
-        }
-
-        return new SecretComponent(this.app, componentEl)
-          .setValue(this.draft.apiKeySecretName ?? "")
-          .onChange((value) => {
-            this.draft.apiKeySecretName = value.trim();
-          });
-      });
+    const keySetting = new Setting(contentEl).setName("API key");
+    this.secretInputEl = renderSecretInput(keySetting, {
+      value: this.credentialInput, visible: this.showKey, disabled: this.saving || this.testing,
+      label: "Provider API key", visibilityLabel: "API key", placeholder: "API key",
+      onVisibilityChange: (visible) => { this.showKey = visible; },
+      onChange: (value) => {
+        this.credentialInput = value;
+        const pending = this.plugin.pendingProviderKeys?.some((entry) => entry.id === this.provider?.id);
+        this.credentialAction = !value ? "clear" : !pending && !this.credentialError && value === this.savedKeyInput ? "keep" : "replace";
+      }
+    });
+    const credentialStatus = this.credentialError || (this.provider && this.plugin.getProviderCredentialStatus?.(this.provider)) || "";
+    if (credentialStatus) {
+      const attention = new Setting(contentEl).setName("Credentials need attention").setDesc(credentialStatus);
+      attention.addButton((button) => button.setButtonText("Retry migration").setDisabled(this.saving || this.testing)
+        .onClick(async () => {
+          button.setDisabled(true);
+          try {
+            await this.plugin.retryProviderCredentialMigration();
+            const current = this.plugin.getProviderSettings(this.provider.id);
+            if (!this.draft) return;
+            this.provider = copyProvider(current);
+            this.draft.apiKeySecretName = current.apiKeySecretName;
+            if (this.credentialAction === "keep") { this.clearCredential(); this.loadCredential(); }
+            this.render(this.plugin.getProviderCredentialStatus(current));
+          } catch { this.render("Unable to retry provider migration. Existing credentials were preserved.", false); }
+        }));
+      attention.addButton((button) => button.setButtonText("Clear key").setDisabled(this.saving || this.testing)
+        .onClick(() => { this.credentialInput = ""; this.credentialAction = "clear"; this.render(); }));
+    }
 
     const modelSetting = new Setting(contentEl).setName("Default model");
     const models = Array.isArray(this.draft.models) ? this.draft.models : [];
@@ -1727,8 +1829,14 @@ class ProviderSettingsModal extends Modal {
         button
           .setButtonText("Test connection")
           .onClick(async () => {
-            button.setDisabled(true);
-            const result = await this.plugin.testProviderDraftConnection(this.draft);
+            if (this.testing || this.saving) return;
+            this.testing = true;
+            this.setBusyControls(true);
+            let result;
+            try { result = await this.plugin.testProviderDraftConnection(this.credentialDraft()); }
+            catch { result = { ok: false, models: [], message: "Unable to connect to the provider. Check the endpoint, API key and account access." }; }
+            finally { this.testing = false; this.restoreBusyControls(); }
+            if (!this.draft) return;
             if (result.ok) {
               this.draft.models = result.models;
               this.draft.model = result.models.includes(this.draft.model)
@@ -1740,12 +1848,18 @@ class ProviderSettingsModal extends Modal {
           });
       });
 
-    const status = contentEl.createDiv({
-      cls: "codriver-setting-status",
-      text: statusText || "Test connection to load models for this provider."
-    });
-    if (statusOk !== null) {
-      status.addClass(statusOk ? "is-success" : "is-error");
+    if (statusText) {
+      const status = contentEl.createDiv({ cls: "codriver-setting-status", text: statusText });
+      if (statusOk !== null) status.addClass(statusOk ? "is-success" : "is-error");
+      status.setAttribute("role", statusOk === false ? "alert" : "status");
+    }
+    if (this.otherKeysPending) {
+      new Setting(contentEl).setDesc("Prepared changes stay in memory until all legacy keys are resolved. Cancel discards this change; restart discards all prepared changes.")
+        .addButton((button) => button.setButtonText("Keep prepared change").onClick(() => {
+          this.keepPreparedChange = true;
+          this.close();
+          this.onSaved?.();
+        }));
     }
 
     this.renderGenerationParameters(contentEl);
@@ -1758,13 +1872,14 @@ class ProviderSettingsModal extends Modal {
       .addButton((button) => {
         button
           .setButtonText("Cancel")
+          .setDisabled(this.saving === true)
           .onClick(() => this.close());
       })
       .addButton((button) => {
         button
           .setCta()
           .setButtonText("Save")
-          .setDisabled(this.saving === true)
+          .setDisabled(this.saving === true || this.testing === true)
           .onClick(() => this.saveDraft());
         this.saveButtons.push(button);
       });
@@ -1775,28 +1890,45 @@ class ProviderSettingsModal extends Modal {
   }
 
   async saveDraft() {
-    if (this.saving) return;
+    if (this.saving || this.testing) return;
     this.saving = true;
+    let failure = "";
+    this.setBusyControls();
     for (const button of this.saveButtons) button.setDisabled(true);
     try {
-      await this.plugin.saveProviderDraft(this.draft);
+      // Preserve draft identity across a failed commit so verified secrets are reused.
+      this.saveCredentialDraft ??= {};
+      Object.assign(this.saveCredentialDraft, this.credentialDraft());
+      await this.plugin.saveProviderDraft(this.saveCredentialDraft);
       this.close();
       this.onSaved?.();
-    } catch {
-      new Notice("Unable to save provider settings.");
+    } catch (error) {
+      const message = error instanceof ProviderCredentialError ? error.message : "Unable to save provider settings.";
+      failure = message;
+      this.otherKeysPending = error instanceof ProviderCredentialError && error.code === "other-pending";
+      new Notice(message);
     } finally {
       this.saving = false;
+      this.restoreBusyControls();
       for (const button of this.saveButtons) button.setDisabled(false);
+      if (this.draft) this.render(failure, failure ? false : null);
     }
   }
 
   changeProviderType(type) {
+    if (this.saving || this.testing) return;
+    this.clearCredential();
+    this.plugin.discardProviderCredentialDraft?.(this.saveCredentialDraft);
+    this.credentialError = "";
+    this.saveCredentialDraft = null;
+    this.otherKeysPending = false;
     const next = this.plugin.createProviderDraft(type);
     const existingId = this.provider?.id;
     this.draft = {
       ...next,
       id: existingId ?? next.id
     };
+    this.credentialAction = this.provider ? "clear" : "keep";
     this.render();
   }
 
@@ -1922,175 +2054,180 @@ class McpServerSettingsModal extends Modal {
     this.plugin = plugin;
     this.server = server ? copyMcpServer(server) : null;
     this.draft = server ? copyMcpServer(server) : this.plugin.createMcpServerDraft();
+    this.draft.authMode ??= this.draft.headers ? "custom-headers" : "none";
     this.onSaved = onSaved;
+    this.commandInput = formatMcpCommand(this.draft);
+    this.credentialInput = "";
+    this.savedCredentialInput = "";
+    this.credentialAction = "keep";
+    this.showInput = false;
+    this.saving = false;
   }
 
   onOpen() {
-    this.render();
-  }
-
-  render(statusText = "", statusOk = null) {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("codriver-provider-modal");
-
-    contentEl.createEl("h2", { text: this.server ? "Edit MCP server" : "Add MCP server" });
-    const stdioSupported = isStdioMcpSupported(this.plugin);
-    const stdioBlocked = this.draft.transport === MCP_STDIO_TRANSPORT && !stdioSupported;
-    const renderedTransport = stdioSupported
-      ? (this.draft.transport ?? MCP_STDIO_TRANSPORT)
-      : MCP_HTTP_TRANSPORT;
-
-    if (statusText) {
-      const status = contentEl.createDiv({
-        cls: "codriver-setting-status",
-        text: statusText
-      });
-      if (statusOk !== null) {
-        status.addClass(statusOk ? "is-success" : "is-error");
+    let message = "";
+    if (this.server?.transport === MCP_HTTP_TRANSPORT && ["bearer", "custom-headers"].includes(this.server.authMode) && this.server.authSecretName) {
+      try {
+        this.savedCredentialInput = this.plugin.getMcpCredentialService().readInputValue(this.server);
+        this.credentialInput = this.savedCredentialInput;
+      } catch (error) {
+        message = error instanceof McpCredentialError ? error.message : "MCP credentials are unavailable.";
       }
     }
+    this.render(message);
+  }
 
-    new Setting(contentEl)
-      .setName("Name")
-      .addText((text) => {
-        text
-          .setValue(this.draft.name ?? "")
-          .onChange((value) => {
-            this.draft.name = value;
-          });
-      });
+  onClose() {
+    this.credentialInput = "";
+    this.savedCredentialInput = "";
+    if (this.secretInputEl) this.secretInputEl.value = "";
+    this.secretInputEl = null;
+    this.commandInput = "";
+    this.server = null;
+    this.draft = null;
+    this.contentEl.empty();
+  }
 
-    const transportSetting = new Setting(contentEl)
-      .setName("Transport")
-      .addDropdown((dropdown) => {
-        if (stdioSupported) {
-          dropdown.addOption(MCP_STDIO_TRANSPORT, "stdio");
-        }
-        dropdown.addOption(MCP_HTTP_TRANSPORT, "http");
-        dropdown
-          .setValue(renderedTransport)
-          .onChange((value) => {
-            this.draft.transport = value;
-            this.render();
-          });
-      });
-    transportSetting.settingEl.addClass("codriver-mcp-transport-setting");
-    if (!stdioSupported) {
-      transportSetting.controlEl.createDiv({
-        cls: "codriver-setting-inline-note",
-        text: "Stdio is not supported on mobile devices."
-      });
+  render(statusText = "") {
+    if (!this.draft) return;
+    if (this.secretInputEl) this.secretInputEl.value = "";
+    this.secretInputEl = null;
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("codriver-provider-modal", "codriver-mcp-modal");
+    this.modalEl?.addClass("codriver-mcp-modal-shell");
+    contentEl.createEl("h2", { text: this.server ? "Edit MCP server" : "Add MCP server" });
+    const stdioSupported = isStdioMcpSupported(this.plugin);
+    const blocked = this.draft.transport === MCP_STDIO_TRANSPORT && !stdioSupported;
+    const status = contentEl.createDiv({ cls: "codriver-setting-status", text: statusText });
+    status.setAttribute("role", statusText ? "alert" : "status");
+    if (statusText) {
+      status.addClass("is-error");
+      contentEl.scrollTop = 0;
     }
-
-    if (renderedTransport === MCP_HTTP_TRANSPORT) {
-      new Setting(contentEl)
-        .setName("Endpoint")
-        .setDesc("HTTP MCP server endpoint.")
-        .addText((text) => {
-          text.inputEl.classList.add("codriver-endpoint-input");
-          text.inputEl.disabled = stdioBlocked;
-          text
-            .setPlaceholder("https://example.com/mcp")
-            .setValue(this.draft.endpoint ?? "")
-            .onChange((value) => {
-              this.draft.endpoint = value;
-            });
-        });
-
-      new Setting(contentEl)
-        .setName("Headers")
-        .setDesc("Optional HTTP headers, one Header-Name: value per line.")
-        .addTextArea((text) => {
-          text.inputEl.disabled = stdioBlocked;
-          text
-            .setPlaceholder("Authorization: Bearer ...")
-            .setValue(this.draft.headers ?? "")
-            .onChange((value) => {
-              this.draft.headers = value;
-            });
-        });
-    } else {
-      new Setting(contentEl)
-        .setName("Command")
-        .setDesc("Executable command used to start the MCP server.")
-        .addText((text) => {
-          text.inputEl.disabled = stdioBlocked;
-          text
-            .setPlaceholder("npx")
-            .setValue(this.draft.command ?? "")
-            .onChange((value) => {
-              this.draft.command = value;
-            });
-        });
-
-      new Setting(contentEl)
-        .setName("Arguments")
-        .setDesc("Optional command arguments. Keep one shell-style argument string for now.")
-        .addTextArea((text) => {
-          text.inputEl.disabled = stdioBlocked;
-          text
-            .setPlaceholder("-y @example/mcp-server")
-            .setValue(this.draft.args ?? "")
-            .onChange((value) => {
-              this.draft.args = value;
-            });
-        });
-
-      new Setting(contentEl)
-        .setName("Environment")
-        .setDesc("Optional environment variables, one KEY=value per line.")
-        .addTextArea((text) => {
-          text.inputEl.disabled = stdioBlocked;
-          text
-            .setPlaceholder("API_KEY=...")
-            .setValue(this.draft.env ?? "")
-            .onChange((value) => {
-              this.draft.env = value;
-            });
-        });
-    }
-
-    new Setting(contentEl)
-      .setName("Enabled")
-      .addToggle((toggle) => {
-        toggle
-          .setValue(this.draft.enabled !== false && !stdioBlocked)
-          .onChange((value) => {
-            this.draft.enabled = value;
-          });
-        toggle.setDisabled?.(stdioBlocked);
-      });
-
-    new Setting(contentEl)
-      .addButton((button) => {
-        button
-          .setButtonText("Cancel")
-          .onClick(() => this.close());
-      })
-      .addButton((button) => {
-        button
-          .setCta()
-          .setButtonText("Save")
+    if (blocked) contentEl.createDiv({ cls: "codriver-setting-status", text: getStdioMcpUnavailableMessage(this.plugin) });
+    const credentialStatus = this.server ? this.plugin.getMcpCredentialStatus?.(this.server) : "";
+    if (credentialStatus) {
+      new Setting(contentEl).setName("Credentials need attention").setDesc(credentialStatus)
+        .addButton((button) => button.setButtonText("Retry migration").setDisabled(this.saving)
           .onClick(async () => {
             button.setDisabled(true);
-            try {
-              await this.plugin.saveMcpServerDraft(this.draft);
-              this.close();
-              this.onSaved?.();
-            } catch (error) {
-              const detail = error instanceof Error ? error.message : "Unable to save MCP server.";
-              button.setDisabled(false);
-              this.render(detail, false);
-            }
-          });
-        button.setDisabled(stdioBlocked);
+            await this.plugin.retryMcpCredentialMigration(this.server.id);
+            this.server = copyMcpServer(this.plugin.getMcpServerSettings(this.server.id));
+            this.draft.authMode = this.server.authMode ?? this.draft.authMode;
+            this.draft.authSecretName = this.server.authSecretName;
+            this.draft.credentialSchemaVersion = this.server.credentialSchemaVersion;
+            if (this.server.authHeaderPolicy != null) this.draft.authHeaderPolicy = this.server.authHeaderPolicy;
+            else delete this.draft.authHeaderPolicy;
+            this.render(this.plugin.getMcpCredentialStatus(this.server));
+          }));
+    }
+
+    new Setting(contentEl).setName("Name").addText((text) => {
+      text.setValue(this.draft.name).setDisabled(blocked || this.saving).onChange((value) => { this.draft.name = value; });
+      text.inputEl.setAttribute("aria-label", "MCP server name");
+    });
+    new Setting(contentEl).setName("Transport").addDropdown((dropdown) => {
+      if (stdioSupported || this.draft.transport === MCP_STDIO_TRANSPORT) dropdown.addOption(MCP_STDIO_TRANSPORT, "stdio");
+      dropdown.addOption(MCP_HTTP_TRANSPORT, "HTTP").setValue(this.draft.transport)
+        .setDisabled(blocked || this.saving).onChange((value) => {
+          this.draft.transport = value;
+          this.credentialInput = "";
+          this.credentialAction = "keep";
+          this.render();
+        });
+      dropdown.selectEl?.setAttribute("aria-label", "MCP transport");
+    });
+    new Setting(contentEl).setName("Enabled").addToggle((toggle) => {
+      toggle.setValue(this.draft.enabled !== false).setDisabled(blocked || this.saving)
+        .onChange((value) => { this.draft.enabled = value; });
+    });
+    if (this.draft.transport === MCP_HTTP_TRANSPORT) {
+      new Setting(contentEl).setName("Endpoint").addText((text) => {
+        text.setValue(this.draft.endpoint ?? "").setPlaceholder("https://example.com/mcp")
+          .setDisabled(this.saving).onChange((value) => { this.draft.endpoint = value; });
+        text.inputEl.setAttribute("aria-label", "MCP HTTP endpoint");
       });
+      new Setting(contentEl).setName("Authentication").addDropdown((dropdown) => {
+        dropdown.addOption("none", "None").addOption("bearer", "Bearer")
+          .addOption("custom-headers", "Custom headers").setValue(this.draft.authMode)
+          .setDisabled(this.saving).onChange((value) => {
+            this.draft.authMode = value;
+            this.credentialInput = "";
+            this.credentialAction = value === "none" ? "clear" : "replace";
+            this.render();
+          });
+        dropdown.selectEl?.setAttribute("aria-label", "MCP authentication method");
+      });
+      if (this.draft.authMode === "bearer") {
+        const authentication = new Setting(contentEl).setName("Authorization: Bearer");
+        authentication.settingEl.addClass("codriver-mcp-bearer-row");
+        this.secretInputEl = renderSecretInput(authentication, {
+          value: this.credentialInput, visible: this.showInput, disabled: this.saving, placeholder: "Token only",
+          label: "MCP bearer token", visibilityLabel: "token",
+          onVisibilityChange: (visible) => { this.showInput = visible; },
+          onChange: (value) => {
+            this.credentialInput = value;
+            this.credentialAction = !value ? "clear" : value === this.savedCredentialInput && this.server?.authMode === "bearer" ? "keep" : "replace";
+          }
+        });
+      } else if (this.draft.authMode !== "none") {
+        new Setting(contentEl).setName("Headers").setDesc("Stored in Obsidian keychain").addTextArea((text) => {
+          text.setValue(this.credentialInput).setDisabled(this.saving).onChange((value) => {
+            this.credentialInput = value;
+            this.credentialAction = !value.trim() ? "clear" : value === this.savedCredentialInput && this.server?.authMode === "custom-headers" ? "keep" : "replace";
+          });
+          text.inputEl.setAttribute("aria-label", "MCP custom headers");
+          text.inputEl.setAttribute("autocomplete", "off");
+          text.inputEl.spellcheck = false;
+          this.secretInputEl = text.inputEl;
+          text.setPlaceholder("Authorization: Bearer ...\nX-Workspace: team-alpha");
+        });
+      }
+    } else {
+      new Setting(contentEl).setName("Command").setDesc("One program with arguments. Stored in plugin settings.")
+        .addTextArea((text) => {
+          text.setValue(this.commandInput).setPlaceholder('npx -y @example/mcp-server\n  --workspace "/home/user/Notes"')
+            .setDisabled(blocked || this.saving).onChange((value) => { this.commandInput = value; });
+          text.inputEl.setAttribute("aria-label", "MCP command and arguments");
+          text.inputEl.spellcheck = false;
+        });
+      new Setting(contentEl).setName("Environment").setDesc("One KEY=value per line. Stored in plugin settings.")
+        .addTextArea((text) => {
+          text.setValue(this.draft.env ?? "").setPlaceholder("WORKSPACE_ID=team-alpha")
+            .setDisabled(blocked || this.saving).onChange((value) => { this.draft.env = value; });
+          text.inputEl.setAttribute("aria-label", "MCP environment variables");
+          text.inputEl.spellcheck = false;
+        });
+    }
+    const footer = new Setting(contentEl);
+    footer.settingEl.addClass("codriver-mcp-modal-footer");
+    footer.addButton((button) => button.setButtonText("Cancel").setDisabled(this.saving).onClick(() => this.close()));
+    footer.addButton((button) => button.setButtonText(this.saving ? "Saving..." : "Save").setCta().setDisabled(blocked || this.saving).onClick(async () => {
+      if (this.saving) return;
+      try {
+        if (this.draft.transport === MCP_STDIO_TRANSPORT) Object.assign(this.draft, parseMcpCommand(this.commandInput, this.server));
+        const draft = this.draft;
+        draft.credentialInput = this.credentialInput;
+        draft.credentialAction = this.credentialAction;
+        this.saving = true;
+        this.render();
+        await this.plugin.saveMcpServerDraft(draft);
+        this.close();
+        this.onSaved?.();
+      } catch (error) {
+        this.saving = false;
+        const message = error instanceof McpCredentialError || error instanceof McpCommandError ? error.message : "Unable to save MCP server. Check the command and settings, then retry.";
+        this.render(message);
+        new Notice(message);
+      }
+    }));
   }
 }
-
 module.exports = {
   CoDriverSettingTab,
+  McpServerSettingsModal,
+  ProviderSettingsModal,
   NewCommandModal,
   NewSkillModal
 };
@@ -2106,11 +2243,16 @@ function copyMcpServer(server) {
 function createMcpServerSubtitle(server, runtimeBlocked = false) {
   const transport = server.transport || MCP_STDIO_TRANSPORT;
   const target = transport === MCP_HTTP_TRANSPORT
-    ? (server.endpoint || "No endpoint")
+    ? safeMcpEndpointLabel(server.endpoint)
     : (server.command || "No command");
   const toolCount = Array.isArray(server.tools) ? server.tools.length : 0;
   const suffix = runtimeBlocked ? " - unavailable" : "";
   return `${transport} - ${target} - ${toolCount} tool(s)${suffix}`;
+}
+
+function safeMcpEndpointLabel(endpoint) {
+  if (!endpoint) return "No endpoint";
+  try { return new URL(endpoint).host; } catch { return "Invalid endpoint"; }
 }
 
 function createBuiltInMcpServerSubtitle(server, enabled) {

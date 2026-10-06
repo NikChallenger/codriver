@@ -16,7 +16,7 @@ CoDriver puts your preferred language models in the right sidebar. Create, impro
 1. Open **Settings -> CoDriver Settings -> Providers**.
 2. Click **Add model** under **LLM providers**.
 3. Choose the **Provider type**, enter a name, and check the endpoint.
-4. Select or create an **API key** entry. Keys stay in Obsidian secret storage.
+4. Enter the **API key** directly. The field starts masked; use the eye button to show or hide it. Keys stay in Obsidian secret storage. Test connection uses the current input without saving it.
 5. Click **Test connection** to load available models.
 6. Choose the **Default model** and click **Save**.
 
@@ -40,16 +40,20 @@ CoDriver works with your vault through its built-in MCP server. Its configurable
 
 - **Attachments and audio:** Add supported files to the conversation and transcribe audio.
 - **Skills and commands:** Reuse instructions, local references, and prompt templates.
-- **MCP:** Connect external HTTP tools, or stdio tools on supported desktop runtimes.
+- **MCP:** Connect external HTTP tools, or stdio tools on supported desktop runtimes. HTTP supports None, Bearer token, or Custom headers authentication with one credential field stored in Obsidian secret storage (Obsidian 1.11.4 or later). The stored value is only the bearer token or custom header text; authentication metadata stays in plugin settings. Existing HTTP headers migrate automatically after verified storage writes; failed migrations preserve the original values and block the affected HTTP connection until retry or repair. Clearing credentials unlinks the reference without deleting shared secrets. Historical backups are not cleaned by migration.
+- **Stdio configuration:** Command contains one program with arguments, not a shell script. Command and Environment remain ordinary plugin settings in `data.json`, including any credentials entered there. Environment accepts one `KEY=value` per line.
 - **MCP limits:** Max tools warns before an oversized catalog is sent to the model; Continue sends all available tools for that request. Max calls warns before another automatic tool call. Continue for session skips further Max calls warnings for the current request. Output chars lets you review a large tool result before sending it to the model. Earlier eligible results remain available during the live session; Maximum context size reviews the combined request.
 - **Local sessions:** Keep chat history on your device without saving attachment contents, transcripts, or tool results in it.
 
 ## Safety and privacy
 
 - Active-note content is never injected automatically.
-- Provider keys use Obsidian secret storage.
+- Provider keys use Obsidian secret storage. Existing secret names remain unchanged; newly created entries use `codriver-provider-<unique-id>`. Saving an unchanged key keeps its reference; replacing it creates a verified new entry. Emptying the field and saving unlinks the key without deleting a shared secret. Cancel discards edits.
+- Old provider keys stored directly in settings migrate automatically after verified SecretStorage writes. If migration fails or credentials conflict, the original settings file is preserved and settings saves are blocked until retry or explicit repair in the provider form. No plaintext fallback is used. Historical backups are not cleaned by migration.
+- Provider and MCP server deletion confirmations offer **Remove secret: <name>**, checked by default when a secret is configured. Uncheck it to keep the secret. Cleanup uses the runtime deletion method when available, otherwise clears the saved value; an empty entry may remain in Keychain. Secrets referenced by another CoDriver connection are kept. Other plugins' references cannot be detected. Cancel preserves both the connection and secret. Cleanup failure after connection deletion offers a separate retry.
+- With several conflicting legacy keys, **Keep prepared change** lets you review the next provider before committing all repairs. Cancel discards the current prepared repair; restart discards all repairs held in memory.
 - Proposed edits are revalidated before application or rollback.
-- MCP arguments are validated locally against each tool's discovered schema without coercion; invalid calls are returned to the model and are never executed.
+- External MCP servers validate their tools' arguments against the discovered input schema. CoDriver preserves arguments without coercion and checks bounded JSON structure, request-bound catalogs, and tool permissions before dispatch. Built-in CoDriver Vault tools retain local schema validation and mutation review.
 - Diagnostics exclude note content, prompts, provider responses, tool data, transcripts, and secrets.
 
 Your selected provider still receives the context required for the current request. Review that provider's privacy and retention terms before sending sensitive material.

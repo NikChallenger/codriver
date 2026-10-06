@@ -1,21 +1,22 @@
 const { requestUrl } = require("obsidian");
 const { CODRIVER_PLUGIN_VERSION, MCP_PROTOCOL_VERSION } = require("../constants");
+const { McpCredentialService, parseHeaderLines } = require("./McpCredentials");
 const {
   createJsonRpcErrorDiagnostic,
   hashText,
   isPlainObject,
-  normalizeDiscoveredTool,
-  normalizeErrorMessage
+  normalizeDiscoveredTool
 } = require("./McpToolUtils");
 
 class McpHttpClient {
   constructor(server, options = {}) {
     this.endpoint = String(server?.endpoint ?? "").trim();
-    this.headers = parseHeaderLines(server?.headers);
+    this.headers = (options.credentialService ?? new McpCredentialService(null)).resolveHeaders(server);
     this.protocolVersion = MCP_PROTOCOL_VERSION;
     this.sessionId = "";
     this.nextId = 1;
     this.serverSummary = createServerSummary(server);
+    this.serverSummary.customHeaderNames = Object.keys(this.headers).sort();
     this.diagnostics = options.diagnostics ?? null;
   }
 
@@ -112,7 +113,7 @@ class McpHttpClient {
     }
 
     if (payload.error) {
-      throw new Error(payload.error.message || `MCP request failed: ${method}.`);
+      throw new Error(`MCP request failed: ${method}.`);
     }
 
     return payload;
@@ -149,9 +150,9 @@ class McpHttpClient {
         ...this.serverSummary,
         jsonRpcMethod: payload.method,
         requestId: payload.id ?? null,
-        error: normalizeErrorMessage(error)
+        error: "transport-error"
       });
-      throw error;
+      throw new Error("MCP HTTP transport failed. Check the endpoint and connection.");
     }
 
     await this.logDiagnostic("mcp.http.response.received", {
@@ -199,29 +200,6 @@ class McpHttpClient {
   }
 }
 
-function parseHeaderLines(value) {
-  const headers = {};
-  const lines = String(value ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  for (const line of lines) {
-    const separatorIndex = line.indexOf(":");
-    if (separatorIndex <= 0) {
-      continue;
-    }
-
-    const key = line.slice(0, separatorIndex).trim();
-    const headerValue = line.slice(separatorIndex + 1).trim();
-    if (key && headerValue) {
-      headers[key] = headerValue;
-    }
-  }
-
-  return headers;
-}
-
 function createServerSummary(server) {
   return {
     serverId: typeof server?.id === "string" ? server.id : "",
@@ -252,7 +230,7 @@ function summarizeEndpoint(endpoint) {
       hash: hashText(value),
       protocol: parsed.protocol.replace(/:$/, ""),
       host: parsed.host,
-      path: parsed.pathname,
+      path: "",
       hasQuery: Boolean(parsed.search)
     };
   } catch {

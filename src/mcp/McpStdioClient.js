@@ -1,11 +1,9 @@
 const { CODRIVER_PLUGIN_VERSION, MCP_PROTOCOL_VERSION } = require("../constants");
 const {
   createJsonRpcErrorDiagnostic,
-  createSafeErrorText,
   hashText,
   isPlainObject,
-  normalizeDiscoveredTool,
-  normalizeErrorMessage
+  normalizeDiscoveredTool
 } = require("./McpToolUtils");
 const {
   assertStdioMcpRuntimeSupported,
@@ -13,8 +11,6 @@ const {
 } = require("./McpRuntimeSupport");
 
 const DEFAULT_STDIO_REQUEST_TIMEOUT_MS = 30000;
-const MAX_STDERR_BUFFER_CHARS = 4096;
-const MAX_STDERR_DIAGNOSTIC_CHARS = 240;
 
 class McpStdioClient {
   constructor(server, options = {}) {
@@ -133,7 +129,7 @@ class McpStdioClient {
           ...this.serverSummary,
           jsonRpcMethod: method,
           requestId: id,
-          error: normalizeErrorMessage(error),
+          error: "timeout",
           ...this.drainStderrDiagnostic()
         });
         this.close();
@@ -145,7 +141,7 @@ class McpStdioClient {
         resolve: (payload) => {
           clearTimeout(timer);
           if (payload?.error) {
-            reject(new Error(payload.error.message || `MCP request failed: ${method}.`));
+            reject(new Error(`MCP request failed: ${method}.`));
             return;
           }
 
@@ -302,12 +298,10 @@ class McpStdioClient {
 
     this.stderrChunkCount += 1;
     this.stderrCharacterCount += text.length;
-    const boundedChunk = text.slice(-MAX_STDERR_BUFFER_CHARS);
-    this.stderrTail = `${this.stderrTail}${boundedChunk}`.slice(-MAX_STDERR_BUFFER_CHARS);
   }
 
   handleProcessFailure(error) {
-    const detail = normalizeErrorMessage(error);
+    const detail = "Unable to start the MCP process.";
     void this.logDiagnostic("mcp.stdio.process.failed", {
       ...this.serverSummary,
       error: detail,
@@ -341,11 +335,10 @@ class McpStdioClient {
   }
 
   drainStderrDiagnostic() {
-    const redactedTail = createSafeErrorText(this.stderrTail, MAX_STDERR_BUFFER_CHARS);
     const diagnostic = {
       stderrCharacterCount: this.stderrCharacterCount,
       stderrChunkCount: this.stderrChunkCount,
-      stderrText: redactedTail.slice(-MAX_STDERR_DIAGNOSTIC_CHARS)
+      stderrText: ""
     };
     this.clearStderrBuffer();
     return diagnostic;

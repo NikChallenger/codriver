@@ -42,15 +42,9 @@ const VALIDATION_KEYWORDS = new Set([
 ]);
 
 function validateMcpToolArguments(argumentsValue, inputSchema) {
-  const schemaLimits = inspectJsonValue(inputSchema, MAX_MCP_SCHEMA_CHARACTERS);
-  if (!schemaLimits.ok) {
-    return unsupportedSchemaFailure("$", "schema", schemaLimits.reason);
-  }
-  const argumentLimits = inspectJsonValue(argumentsValue, MAX_MCP_ARGUMENT_CHARACTERS);
-  if (!argumentLimits.ok) {
-    return argumentFailure("$", "limits", "bounded JSON object", argumentLimits.actualType);
-  }
-  if (!isPlainObject(inputSchema) || inputSchema.type !== "object") {
+  const envelopeFailure = validateExternalMcpToolArguments(argumentsValue, inputSchema);
+  if (!envelopeFailure.ok) return envelopeFailure;
+  if (inputSchema.type !== "object") {
     return unsupportedSchemaFailure("$", "type", "root schema must declare type object");
   }
 
@@ -59,12 +53,28 @@ function validateMcpToolArguments(argumentsValue, inputSchema) {
   if (schemaFailure) {
     return schemaFailure;
   }
+
+  const valueFailure = validateValue(argumentsValue, inputSchema, "$", { steps: 0 }, 0);
+  return valueFailure ?? { ok: true };
+}
+
+function validateExternalMcpToolArguments(argumentsValue, inputSchema) {
+  const schemaLimits = inspectJsonValue(inputSchema, MAX_MCP_SCHEMA_CHARACTERS);
+  if (!schemaLimits.ok) {
+    return unsupportedSchemaFailure("$", "schema", schemaLimits.reason);
+  }
+  const argumentLimits = inspectJsonValue(argumentsValue, MAX_MCP_ARGUMENT_CHARACTERS);
+  if (!argumentLimits.ok) {
+    return argumentFailure("$", "limits", "bounded JSON object", argumentLimits.actualType);
+  }
+  if (!isPlainObject(inputSchema)) {
+    return unsupportedSchemaFailure("$", "schema", "request-bound schema must be a JSON object");
+  }
   if (!isPlainObject(argumentsValue)) {
     return argumentFailure("$", "type", "object", getJsonType(argumentsValue));
   }
 
-  const valueFailure = validateValue(argumentsValue, inputSchema, "$", { steps: 0 }, 0);
-  return valueFailure ?? { ok: true };
+  return { ok: true };
 }
 
 function validateSupportedSchema(schema, schemaPath, budget, depth, root = false) {
@@ -386,5 +396,6 @@ function isPlainObject(value) {
 }
 
 module.exports = {
+  validateExternalMcpToolArguments,
   validateMcpToolArguments
 };

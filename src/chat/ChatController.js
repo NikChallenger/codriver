@@ -28,7 +28,7 @@ const {
   normalizeMaxTools,
   resolveSkillMcpRequirements
 } = require("../mcp/McpRequestCatalog");
-const { validateMcpToolArguments } = require("../mcp/McpArgumentValidator");
+const { validateExternalMcpToolArguments, validateMcpToolArguments } = require("../mcp/McpArgumentValidator");
 const {
   CODRIVER_ACTIVE_FILE_GET_PATH_TOOL_NAME,
   CODRIVER_INTERNAL_TRANSPORT,
@@ -5000,7 +5000,9 @@ class ChatController {
     }
     void this.logDiagnostic("mcp.tool_call.resolved", createMcpToolResolutionDiagnostic(candidate, resolved));
     const argumentSchema = cloneJsonValue(resolved.tool.inputSchema);
-    const argumentValidation = validateMcpToolArguments(resolved.candidate.arguments, argumentSchema);
+    const argumentValidation = resolved.server.id === CODRIVER_VAULT_SERVER_ID
+      ? validateMcpToolArguments(resolved.candidate.arguments, argumentSchema)
+      : validateExternalMcpToolArguments(resolved.candidate.arguments, argumentSchema);
     if (!argumentValidation.ok) {
       const failure = createMcpArgumentValidationFailure(argumentValidation.error);
       void this.logDiagnostic("mcp.tool_call.arguments.rejected", {
@@ -6202,7 +6204,9 @@ class ChatController {
       options.chainState.boundMcpCatalog = executionCatalog;
     }
 
-    const argumentValidation = validateMcpToolArguments(toolCall.arguments, toolCall.argumentSchema);
+    const argumentValidation = availability.server.id === CODRIVER_VAULT_SERVER_ID
+      ? validateMcpToolArguments(toolCall.arguments, toolCall.argumentSchema)
+      : validateExternalMcpToolArguments(toolCall.arguments, toolCall.argumentSchema);
     if (!argumentValidation.ok) {
       const failure = createMcpArgumentValidationFailure(argumentValidation.error);
       toolCall.status = "error";
@@ -6359,6 +6363,7 @@ class ChatController {
       } else if (server.transport === MCP_HTTP_TRANSPORT) {
         const { McpHttpClient } = require("../mcp/McpHttpClient");
         const client = new McpHttpClient(server, {
+          credentialService: this.runtimeSupport.mcpCredentialService,
           diagnostics: this.diagnostics
         });
         const toolResultPromise = client.callTool(toolCall.toolName, toolCall.arguments);

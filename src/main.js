@@ -1,4 +1,5 @@
 const { Notice, Platform, Plugin } = require("obsidian");
+const { ConnectionRemoval, ConnectionRemovalError } = require("./settings/ConnectionRemoval");
 const { ReleaseNotes } = require("./views/ReleaseNotes");
 const { normalizeReleaseNotesVersion } = require("./settings/ReleaseNotesSettings");
 const { ChatController, COMMAND_ACTION_SESSION_MODE } = require("./chat/ChatController");
@@ -12,6 +13,7 @@ const {
   REQUEST_CONTEXT_CHARS_STEP
 } = require("./settings/defaults");
 const { CoDriverSettingTab } = require("./settings/CoDriverSettingTab");
+const { ProviderCredentialError, ProviderCredentialService, validateKey } = require("./settings/ProviderCredentials");
 const {
   normalizeAudioTranscriptionSettings,
   resolveAudioTranscriptionSelection
@@ -63,6 +65,7 @@ const {
 } = require("./commands/CommandFolderLoader");
 const { DiagnosticLogger } = require("./diagnostics/DiagnosticLogger");
 const { McpHttpClient } = require("./mcp/McpHttpClient");
+const { McpCredentialError, McpCredentialService } = require("./mcp/McpCredentials");
 const { McpStdioClient } = require("./mcp/McpStdioClient");
 const {
   STDIO_MCP_UNAVAILABLE_MESSAGE,
@@ -85,8 +88,13 @@ function createPersistableSettings(settings) {
 
   for (const provider of persistable.providers ?? []) {
     delete provider.apiKey;
+    delete provider.credentialInput;
+    delete provider.credentialAction;
   }
 
+  persistable.mcpServers = (persistable.mcpServers ?? []).map((server, index) => {
+    return normalizeMcpServerSettings(server, index);
+  });
   return persistable;
 }
 
@@ -94,6 +102,12 @@ function hasPersistedApiKey(settings) {
   return Array.isArray(settings?.providers) && settings.providers.some(
     (provider) => Object.prototype.hasOwnProperty.call(provider ?? {}, "apiKey")
   );
+}
+
+function mcpConnectionFingerprint(server, ignoreEnabled = false) {
+  return JSON.stringify([server.name, server.transport, server.command, server.args, server.env, server.endpoint,
+    server.headers, server.credentialSchemaVersion, server.authMode, server.authSecretName, server.authHeaderPolicy, server.migrationSecretName,
+    ignoreEnabled ? null : server.enabled]);
 }
 
 function normalizeSettings(settings) {
@@ -308,6 +322,8 @@ function normalizeProviderSettings(provider, index = 0) {
   }
 
   delete normalizedProvider.apiKey;
+  delete normalizedProvider.credentialInput;
+  delete normalizedProvider.credentialAction;
 
   return normalizedProvider;
 }
@@ -510,7 +526,9 @@ function createMcpServerSettings(id = "") {
     args: "",
     env: "",
     endpoint: "",
-    headers: "",
+    credentialSchemaVersion: 1,
+    authMode: "none",
+    authSecretName: "",
     enabled: true,
     tools: []
   };
@@ -526,7 +544,6 @@ function normalizeMcpServerSettings(server, index = 0) {
     : defaults.name;
 
   return {
-    ...server,
     id,
     name,
     transport: normalizeMcpTransport(server?.transport),
@@ -534,7 +551,12 @@ function normalizeMcpServerSettings(server, index = 0) {
     args: typeof server?.args === "string" ? server.args.trim() : "",
     env: typeof server?.env === "string" ? server.env.trim() : "",
     endpoint: typeof server?.endpoint === "string" ? server.endpoint.trim() : "",
-    headers: typeof server?.headers === "string" ? server.headers.trim() : "",
+    ...(server?.headers != null ? { headers: server.headers } : {}),
+    ...(server?.credentialSchemaVersion != null ? { credentialSchemaVersion: server.credentialSchemaVersion } : {}),
+    ...(typeof server?.authMode === "string" ? { authMode: server.authMode } : {}),
+    ...(typeof server?.authSecretName === "string" ? { authSecretName: server.authSecretName } : {}),
+    ...(server?.authHeaderPolicy != null ? { authHeaderPolicy: server.authHeaderPolicy } : {}),
+    ...(typeof server?.migrationSecretName === "string" ? { migrationSecretName: server.migrationSecretName } : {}),
     enabled: server?.enabled !== false,
     tools: Array.isArray(server?.tools) ? server.tools.map(normalizeMcpToolSettings).filter(Boolean) : []
   };
@@ -701,6 +723,7 @@ class CoDriverPlugin extends Plugin {
 
   createChatRuntimeSupport(overrides = {}) {
     return {
+      mcpCredentialService: this.getMcpCredentialService(),
       getPlatform: () => Platform.isMobile ? "mobile" : "desktop",
       isStdioMcpSupported: () => this.isStdioMcpSupported(),
       getStdioMcpUnavailableMessage: () => this.getStdioMcpUnavailableMessage(),
@@ -784,6 +807,8 @@ class CoDriverPlugin extends Plugin {
   }
 
   async loadSettings() {
+    this.mcpCredentialService = new McpCredentialService(this.app?.secretStorage);
+    this.providerCredentialService = new ProviderCredentialService(this.app?.secretStorage);
     const savedSettings = await this.loadData();
     const needsMaxMcpToolsMigration = Boolean(savedSettings) && !Object.prototype.hasOwnProperty.call(
       savedSettings,
@@ -807,6 +832,17 @@ class CoDriverPlugin extends Plugin {
       ...(savedSettings ?? {})
     });
 
+    // Hold legacy material outside normalized settings. Never serialize it again.
+    this.pendingProviderKeys = (Array.isArray(savedSettings?.providers) ? savedSettings.providers : []).flatMap((provider, index) =>
+      Object.prototype.hasOwnProperty.call(provider ?? {}, "apiKey")
+        ? [{ id: this.settings.providers[index].id, raw: provider.apiKey }] : []);
+    this.providerMigrationOverrides = new Map();
+    this.providerCredentialErrors = new Map();
+    await this.retryProviderCredentialMigration();
+    if (this.pendingProviderKeys.length) new Notice("Provider key migration needs attention. Open provider settings to retry or repair. Existing credentials were preserved.");
+
+    await this.retryMcpCredentialMigration();
+
     if (
       (
         hasPersistedApiKey(savedSettings) ||
@@ -816,7 +852,8 @@ class CoDriverPlugin extends Plugin {
         needsSkillFolderPathMigration ||
         needsHiddenSkillFolderPathMigration
       ) &&
-      typeof this.saveData === "function"
+      typeof this.saveData === "function" &&
+      !this.pendingProviderKeys.length
     ) {
       await this.persistSettings();
     }
@@ -831,9 +868,161 @@ class CoDriverPlugin extends Plugin {
     this.refreshChatViews();
   }
 
+  getMcpCredentialService() {
+    this.mcpCredentialService ??= new McpCredentialService(this.app?.secretStorage);
+    return this.mcpCredentialService;
+  }
+
+  getProviderCredentialService() {
+    this.providerCredentialService ??= new ProviderCredentialService(this.app?.secretStorage);
+    return this.providerCredentialService;
+  }
+
+  discardProviderCredentialDraft(draft) {
+    if (!draft) return;
+    const staged = this.providerMigrationOverrides?.get(draft.id);
+    if (staged?.owner === draft) this.providerMigrationOverrides.delete(draft.id);
+    this.getProviderCredentialService().stagedDrafts.delete(draft);
+  }
+
+  assertProviderMigrationComplete() {
+    if (this.pendingProviderKeys?.length) throw new ProviderCredentialError("migration-pending");
+  }
+
+  getProviderCredentialStatus(provider) {
+    if (this.settings.providers.filter((entry) => entry.id === provider.id).length !== 1) {
+      return "Duplicate provider ID. Review the saved configuration before migration.";
+    }
+    const pending = this.pendingProviderKeys?.some((entry) => entry.id === provider.id);
+    if (pending && this.providerMigrationOverrides?.has(provider.id)) {
+      return "An API key change is prepared in memory. Resolve the remaining legacy keys and retry migration. Restart discards prepared changes.";
+    }
+    if (pending) return new ProviderCredentialError(this.providerCredentialErrors?.get(provider.id) || "migration-pending").message;
+    try { this.getProviderCredentialService().resolve(provider); return ""; }
+    catch (error) { return error instanceof ProviderCredentialError ? error.message : "Provider credentials are unavailable."; }
+  }
+
+  async retryProviderCredentialMigration() {
+    const write = async () => {
+      if (!this.pendingProviderKeys?.length) return [];
+      const candidates = new Map();
+      const results = [];
+      for (const entry of this.pendingProviderKeys) {
+        try {
+          const provider = this.getProviderSettings(entry.id);
+          if (!provider || this.settings.providers.filter((item) => item.id === entry.id).length !== 1) {
+            throw new ProviderCredentialError("needs-review");
+          }
+          const override = this.providerMigrationOverrides?.get(entry.id);
+          if (override && override.expected !== JSON.stringify(provider)) throw new ProviderCredentialError("needs-review");
+          if (override?.key && this.getProviderCredentialService().readReference(override.candidate.apiKeySecretName) !== override.key) {
+            throw new ProviderCredentialError("verification-failed");
+          }
+          candidates.set(entry.id, override?.candidate || this.getProviderCredentialService().migrate(provider, entry.raw));
+          results.push({ id: entry.id, ok: true });
+          this.providerCredentialErrors?.delete(entry.id);
+        } catch (error) {
+          const code = error instanceof ProviderCredentialError ? error.code : "save-failed";
+          this.providerCredentialErrors?.set(entry.id, code);
+          results.push({ id: entry.id, ok: false, code });
+        }
+      }
+      // Batch commit: never rewrite remaining plaintext into a partial snapshot.
+      if (results.some((result) => !result.ok)) return results;
+      const providers = this.settings.providers.map((provider) => candidates.get(provider.id) || provider);
+      const snapshot = normalizeSettings({ ...this.settings, providers });
+      try { await this.saveData(createPersistableSettings(snapshot)); }
+      catch {
+        for (const result of results) {
+          result.ok = false;
+          result.code = "save-failed";
+          this.providerCredentialErrors?.set(result.id, result.code);
+        }
+        return results;
+      }
+      this.settings = snapshot;
+      this.pendingProviderKeys = [];
+      this.providerMigrationOverrides?.clear();
+      this.providerCredentialErrors?.clear();
+      this.getProviderCredentialService().migrationNames.clear();
+      return results;
+    };
+    const pending = (this.settingsWritePromise ?? Promise.resolve()).then(write);
+    this.settingsWritePromise = pending.catch(() => {});
+    const results = await pending;
+    // Startup registers providers once, after diagnostics have been initialized.
+    if (results.length && this.chatController) {
+      this.registerProviders();
+      this.chatController.updateSettings(this.settings, this.providerRegistry);
+      this.refreshChatViews();
+    }
+    return results;
+  }
+
+  async commitMcpServerRecord(candidate, expected = null, preserveEnabled = false, verifyCredential = null) {
+    const write = async () => {
+      this.assertProviderMigrationComplete();
+      const current = this.getMcpServerSettings(candidate.id);
+      const matchingCount = this.settings.mcpServers.filter((server) => server.id === candidate.id).length;
+      if (expected ? matchingCount !== 1 : matchingCount !== 0) throw new McpCredentialError("save-failed");
+      if (expected && (!current || mcpConnectionFingerprint(current, preserveEnabled) !== mcpConnectionFingerprint(expected, preserveEnabled))) {
+        throw new McpCredentialError("save-failed");
+      }
+      const record = { ...candidate, tools: current?.tools ?? candidate.tools ?? [],
+        ...(preserveEnabled && current ? { enabled: current.enabled } : {}) };
+      const servers = this.settings.mcpServers.filter((server) => server.id !== record.id);
+      const index = this.settings.mcpServers.findIndex((server) => server.id === record.id);
+      servers.splice(index < 0 ? servers.length : index, 0, record);
+      const snapshot = { ...this.settings, mcpServers: servers };
+      verifyCredential?.();
+      await this.saveData(createPersistableSettings(snapshot));
+      const live = this.getMcpServerSettings(candidate.id);
+      if (expected && (!live || mcpConnectionFingerprint(live, preserveEnabled) !== mcpConnectionFingerprint(expected, preserveEnabled))) {
+        throw new McpCredentialError("save-failed");
+      }
+      const committed = { ...record, tools: live?.tools ?? record.tools,
+        ...(preserveEnabled && live ? { enabled: live.enabled } : {}) };
+      this.settings.mcpServers = live
+        ? this.settings.mcpServers.map((server) => server.id === committed.id ? committed : server)
+        : [...this.settings.mcpServers, committed];
+    };
+    const pending = (this.settingsWritePromise ?? Promise.resolve()).then(write);
+    this.settingsWritePromise = pending.catch(() => {});
+    try { await pending; } catch { throw new McpCredentialError("save-failed"); }
+  }
+
+  async retryMcpCredentialMigration(serverId = null) {
+    const service = this.getMcpCredentialService();
+    const results = [];
+    for (const original of [...this.settings.mcpServers]) {
+      if (serverId && original.id !== serverId) continue;
+      try {
+        let expected = { ...original };
+        await service.migrateServer(original, async (candidate, verifyCredential) => {
+          await this.commitMcpServerRecord(candidate, expected, true, verifyCredential);
+          expected = { ...this.getMcpServerSettings(original.id) };
+        });
+        results.push({ id: original.id, ok: true });
+      } catch (error) {
+        results.push({ id: original.id, ok: false, code: error instanceof McpCredentialError ? error.code : "save-failed" });
+      }
+    }
+    this.chatController?.updateSettings(this.settings, this.providerRegistry);
+    if (this.chatController) this.refreshChatViews();
+    return results;
+  }
+
+  getMcpCredentialStatus(server) {
+    if (this.settings.mcpServers.filter((entry) => entry.id === server.id).length !== 1) {
+      return "Duplicate MCP server ID. Review the saved configuration before migration.";
+    }
+    return this.getMcpCredentialService().getStatus(server);
+  }
+
   persistSettings(acknowledgedVersion = null) {
     // Serialize snapshots so another settings save cannot overwrite acknowledgement.
     const write = async () => {
+      this.assertProviderMigrationComplete();
       const snapshot = acknowledgedVersion === null ? this.settings
         : { ...this.settings, releaseNotesAcknowledgedVersion: acknowledgedVersion };
       await this.saveData(createPersistableSettings(snapshot));
@@ -934,45 +1123,83 @@ class CoDriverPlugin extends Plugin {
     const id = existing?.id ?? this.createUniqueProviderId(providerType);
     const wasSelected = this.settings.selectedProviderId === existing?.id;
     const hadEnabledProvider = this.settings.providers.some((provider) => provider.enabled !== false);
+    if (existing && this.settings.providers.filter((item) => item.id === id).length !== 1) {
+      throw new ProviderCredentialError("needs-review");
+    }
+    const expected = existing ? JSON.stringify(existing) : null;
+    const replacementKey = draft.credentialAction === "replace" ? validateKey(draft.credentialInput) : null;
+    const prepared = this.getProviderCredentialService().prepareDraft(draft, existing);
     const provider = normalizeProviderSettings({
-      ...draft,
+      ...prepared,
       id
     }, this.settings.providers.length);
 
-    if (existing) {
-      Object.assign(existing, provider);
-    } else {
-      this.settings.providers.push(provider);
+    if (this.pendingProviderKeys?.length) {
+      if (!existing || !this.pendingProviderKeys.some((entry) => entry.id === id) || !["replace", "clear"].includes(draft.credentialAction)) {
+        throw new ProviderCredentialError("migration-pending");
+      }
+      this.providerMigrationOverrides.set(id, { expected, candidate: provider, key: replacementKey, owner: draft });
+      const results = await this.retryProviderCredentialMigration();
+      if (this.pendingProviderKeys.length) {
+        throw new ProviderCredentialError(results.some((item) => !item.ok && item.id !== id) ? "other-pending" : "save-failed");
+      }
+      await this.refreshProviderSettings();
+      return this.getProviderSettings(id);
     }
 
-    if (wasSelected || (!existing && !hadEnabledProvider && provider.enabled !== false)) {
-      this.settings.selectedProviderId = provider.id;
-      this.settings.selectedModelId = provider.model || null;
-    }
-
-    await this.saveSettings();
+    const write = async () => {
+      this.assertProviderMigrationComplete();
+      const current = this.getProviderSettings(id);
+      if (expected === null ? Boolean(current) : !current || JSON.stringify(current) !== expected) {
+        throw new ProviderCredentialError("save-failed");
+      }
+      if (replacementKey && this.getProviderCredentialService().readReference(provider.apiKeySecretName) !== replacementKey) {
+        throw new ProviderCredentialError("verification-failed");
+      }
+      const providers = current ? this.settings.providers.map((item) => item.id === id ? provider : item)
+        : [...this.settings.providers, provider];
+      const snapshot = { ...this.settings, providers };
+      if (wasSelected || (!existing && !hadEnabledProvider && provider.enabled !== false)) {
+        snapshot.selectedProviderId = provider.id;
+        snapshot.selectedModelId = provider.model || null;
+      }
+      normalizeSettings(snapshot);
+      try { await this.saveData(createPersistableSettings(snapshot)); }
+      catch { throw new ProviderCredentialError("save-failed"); }
+      this.settings = snapshot;
+    };
+    const pending = (this.settingsWritePromise ?? Promise.resolve()).then(write);
+    this.settingsWritePromise = pending.catch(() => {});
+    await pending;
+    await this.refreshProviderSettings();
 
     return provider;
   }
 
+  async refreshProviderSettings() {
+    this.registerProviders();
+    this.chatController?.updateSettings(this.settings, this.providerRegistry);
+    await this.diagnosticLogger?.refresh();
+    this.refreshChatViews();
+  }
+
   async saveMcpServerDraft(draft) {
     const existing = this.getMcpServerSettings(draft?.id);
+    const expected = existing ? { ...existing } : null;
     const id = existing?.id ?? this.createUniqueMcpServerId();
     if (draft?.transport === MCP_STDIO_TRANSPORT && !this.isStdioMcpSupported()) {
       throw new Error(this.getStdioMcpUnavailableMessage());
     }
+    const credentialService = this.getMcpCredentialService();
+    const prepared = await credentialService.prepareDraft(draft, existing);
     const server = normalizeMcpServerSettings({
-      ...draft,
+      ...prepared,
       id
     }, this.settings.mcpServers.length);
 
-    if (existing) {
-      Object.assign(existing, server);
-    } else {
-      this.settings.mcpServers.push(server);
-    }
-
-    await this.saveSettings();
+    await this.commitMcpServerRecord(server, expected, false, () => credentialService.verifyDraft(draft, server));
+    this.chatController?.updateSettings(this.settings, this.providerRegistry);
+    if (this.chatController) this.refreshChatViews();
 
     return server;
   }
@@ -1318,7 +1545,37 @@ class CoDriverPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  async removeProvider(providerId) {
+  getConnectionRemoval() {
+    this.connectionRemoval ??= new ConnectionRemoval(this, async (snapshot) => {
+      const normalized = normalizeSettings(snapshot);
+      await this.saveData(createPersistableSettings(normalized));
+      return normalized;
+    });
+    return this.connectionRemoval;
+  }
+
+  prepareConnectionRemoval(kind, id) {
+    return this.getConnectionRemoval().prepare(kind, id);
+  }
+
+  forgetConnectionRemoval(review) {
+    this.connectionRemoval?.forget(review);
+  }
+
+  async applyConnectionRemoval(review, removeSecret, retry = false, signal = null) {
+    const result = await this.getConnectionRemoval().execute(review, removeSecret, retry, signal);
+    this.registerProviders();
+    this.chatController?.updateSettings(this.settings, this.providerRegistry);
+    await this.diagnosticLogger?.refresh();
+    this.refreshChatViews();
+    return result;
+  }
+
+  async removeProvider(providerId, options = null) {
+    if (options?.review) {
+      if (options.review.kind !== "provider" || options.review.id !== providerId) throw new ConnectionRemovalError("stale");
+      return this.applyConnectionRemoval(options.review, options.removeSecret === true, false, options.signal);
+    }
     const provider = this.getProviderSettings(providerId);
     if (!provider) {
       return;
@@ -1334,7 +1591,11 @@ class CoDriverPlugin extends Plugin {
     await this.saveSettings();
   }
 
-  async removeMcpServer(serverId) {
+  async removeMcpServer(serverId, options = null) {
+    if (options?.review) {
+      if (options.review.kind !== "MCP server" || options.review.id !== serverId) throw new ConnectionRemovalError("stale");
+      return this.applyConnectionRemoval(options.review, options.removeSecret === true, false, options.signal);
+    }
     const server = this.getMcpServerSettings(serverId);
     if (!server) {
       return;
@@ -1383,6 +1644,7 @@ class CoDriverPlugin extends Plugin {
         ? McpStdioClient
         : McpHttpClient;
       const client = new Client(server, {
+        credentialService: this.getMcpCredentialService(),
         diagnostics: this.diagnosticLogger
       });
       const discoveredTools = await client.discoverTools();
@@ -1523,7 +1785,17 @@ class CoDriverPlugin extends Plugin {
     }
 
     try {
-      const provider = this.createProvider(providerSettings);
+      const action = draft.credentialAction || "keep";
+      let storage;
+      if (action === "replace") {
+        const key = validateKey(draft.credentialInput);
+        providerSettings.apiKeySecretName = "codriver-provider-draft";
+        storage = { getSecret: () => key };
+      } else if (action === "clear") {
+        providerSettings.apiKeySecretName = "";
+        storage = { getSecret: () => null };
+      } else if (action !== "keep") throw new ProviderCredentialError("invalid-credential");
+      const provider = this.createProvider(providerSettings, storage);
       const result = await provider.testConnection();
       const modelText = `Model list endpoint responded with ${result.modelCount} model(s).`;
 
@@ -1533,10 +1805,9 @@ class CoDriverPlugin extends Plugin {
         models: result.models
       };
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "Unknown connection error.";
       return {
         ok: false,
-        message: `Unable to connect to the provider. ${detail}`,
+        message: error instanceof ProviderCredentialError ? error.message : "Unable to connect to the provider. Check the endpoint, API key and account access.",
         models: []
       };
     }
@@ -1572,24 +1843,33 @@ class CoDriverPlugin extends Plugin {
     }
   }
 
-  createProvider(providerSettings) {
+  createProvider(providerSettings, draftStorage = null) {
+    const pendingWithoutReference = this.pendingProviderKeys?.some((entry) => entry.id === providerSettings.id) && !providerSettings.apiKeySecretName;
+    const secretStorage = draftStorage || { getSecret: () => {
+      if (pendingWithoutReference) {
+        throw new ProviderCredentialError("migration-pending");
+      }
+      return this.getProviderCredentialService().resolve(providerSettings);
+    } };
+    // Ensure adapter no-key paths cannot silently bypass a pending legacy key.
+    if (!draftStorage && pendingWithoutReference) providerSettings = { ...providerSettings, apiKeySecretName: "codriver-provider-migration-pending" };
     if (providerSettings.type === ANTHROPIC_PROVIDER_TYPE) {
       return new AnthropicProvider(providerSettings, {
-        secretStorage: this.app.secretStorage,
+        secretStorage,
         diagnostics: this.diagnosticLogger
       });
     }
 
     if (providerSettings.type === GEMINI_PROVIDER_TYPE) {
       return new GeminiProvider(providerSettings, {
-        secretStorage: this.app.secretStorage,
+        secretStorage,
         diagnostics: this.diagnosticLogger
       });
     }
 
     if (providerSettings.type === OPENAI_PROVIDER_TYPE) {
       return new OpenAiCompatibleProvider(providerSettings, {
-        secretStorage: this.app.secretStorage,
+        secretStorage,
         diagnostics: this.diagnosticLogger
       });
     }

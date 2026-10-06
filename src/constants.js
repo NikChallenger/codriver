@@ -1,5 +1,5 @@
 const VIEW_TYPE_CODRIVER = "codriver-chat-view";
-const CODRIVER_PLUGIN_VERSION = "0.5.4";
+const CODRIVER_PLUGIN_VERSION = "0.5.5";
 const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:1234/v1";
 const DEFAULT_GEMINI_BASE_ENDPOINT = "https://generativelanguage.googleapis.com";
 const DEFAULT_GEMINI_API_VERSION = "v1beta";

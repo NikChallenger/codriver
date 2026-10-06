@@ -45,7 +45,7 @@ function createJsonRpcErrorDiagnostic(error) {
   return {
     hasError,
     errorCode: Number.isFinite(errorObject?.code) ? errorObject.code : null,
-    errorMessage: hasError ? createSafeErrorText(errorObject?.message ?? error) : "",
+    errorMessage: "",
     hasErrorData: Boolean(errorObject && Object.prototype.hasOwnProperty.call(errorObject, "data"))
   };
 }

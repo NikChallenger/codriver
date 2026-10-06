@@ -63,8 +63,11 @@ export function parseReleaseNotes(version, text) {
     throw new Error("Invalid bundled release notes identity, size, or encoding.");
   }
   const lines = text.trim().split("\n");
-  if (lines.shift() !== `# CoDriver ${version}`) {
-    throw new Error("Release notes heading must match the manifest version.");
+  // Historical notes keep their title; new bodies derive identity from metadata.
+  if (/^#\s/.test(lines[0])) {
+    if (lines.shift() !== `# CoDriver ${version}`) {
+      throw new Error("Release notes heading must match the manifest version.");
+    }
   }
   const blocks = [];
   let paragraph = [];
