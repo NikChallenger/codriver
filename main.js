@@ -27407,6 +27407,7 @@
             const input = label.createEl("input", { cls: "codriver-provider-visibility", attr: { type: "checkbox", title: choice.description, "aria-label": `${field.label} ${choice.caption}` } });
             input.checked = this.plugin.settings[choice.key] === true;
             input.disabled = !enabled || (choice.caption === "Auto" && this.plugin.settings.enableDirectObsidianApiAccess !== true);
+            if (input.disabled) label.addClass("is-disabled");
             label.createSpan({ text: choice.caption });
             input.addEventListener("change", async () => {
               this.plugin.settings[choice.key] = input.checked;
@@ -27453,6 +27454,7 @@
               inputs[key] = input;
               input.checked = key === "enabled" ? current.enabled !== false : !!version && current.allowAutomaticExecution === true && current.autoVersion === version;
               input.disabled = !active || (key === "allowAutomaticExecution" && (current.enabled === false || !version || version.length > 80));
+              if (input.disabled) label.addClass("is-disabled");
               label.createSpan({ text: caption });
               input.addEventListener("change", async () => {
                 // Bind the grant to the exact displayed, still-loaded plugin version.
