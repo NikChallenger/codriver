@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing public release tag, for example 0.5.1
+        description: Exact release version; resolve the merged review PR automatically
         required: true
         type: string
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: public-draft-${{ inputs.tag }}
@@ -21,28 +22,35 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
       id-token: write
       attestations: write
       artifact-metadata: write
     steps:
-      - name: Check out the exact public tag
+      - name: Check out the exact dispatched public main
         uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 22
           package-manager-cache: false
-      - name: Verify immutable release identity
+      - name: Verify reviewed merge identity
+        uses: actions/github-script@v8
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(node -p "require('./manifest.json').version")" = "$RELEASE_TAG"
-          git fetch origin main --depth=1
-          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+        with:
+          script: |
+            const { resolveReviewPullRequest, verifyReviewedTree, verifyPublicMetadata } = await import(`${process.env.GITHUB_WORKSPACE}/reviewed-public-release.mjs`);
+            const version = process.env.RELEASE_TAG;
+            const mainCommit = process.env.GITHUB_SHA;
+            const { data: main } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
+            if (main.object.sha !== mainCommit) throw new Error('Public main changed after dispatch.');
+            const review = await resolveReviewPullRequest(github, version, { merged: true, mainCommit });
+            verifyReviewedTree({ root: '.', version, reviewedCommit: review.reviewedCommit, candidateCommit: mainCommit, requireMerge: true });
+            verifyPublicMetadata('.', version);
       - name: Rebuild and verify the committed bundle
         run: |
           npm run build
@@ -74,14 +82,16 @@ jobs:
     permissions:
       actions: read
       contents: write
+      pull-requests: read
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.tag }}
     steps:
-      - name: Check out release notes from the exact tag
+      - name: Check out release notes from verified public main
         uses: actions/checkout@v6
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Download attested assets
         uses: actions/download-artifact@v4
@@ -92,6 +102,21 @@ jobs:
         with:
           node-version: 22
           package-manager-cache: false
+      - name: Revalidate and create or verify the public version tag
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { resolveReviewPullRequest, verifyReviewedTree, verifyPublicMetadata, ensurePublicReleaseTag } = await import(`${process.env.GITHUB_WORKSPACE}/reviewed-public-release.mjs`);
+            const version = process.env.RELEASE_TAG;
+            const mainCommit = process.env.GITHUB_SHA;
+            const review = await resolveReviewPullRequest(github, version, { merged: true, mainCommit });
+            verifyReviewedTree({ root: '.', version, reviewedCommit: review.reviewedCommit, candidateCommit: mainCommit, requireMerge: true });
+            verifyPublicMetadata('.', version);
+            const fs = await import('node:fs');
+            for (const asset of ['main.js', 'manifest.json', 'styles.css']) {
+              if (!fs.readFileSync(asset).equals(fs.readFileSync(`release-assets/${asset}`))) throw new Error('Transferred asset differs from reviewed commit.');
+            }
+            await ensurePublicReleaseTag({ github, version, mainCommit, reviewedCommit: review.reviewedCommit });
       - name: Create or verify the matching draft
         shell: bash
         run: |

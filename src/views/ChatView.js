@@ -1,9 +1,10 @@
-const { ItemView, Keymap, MarkdownRenderer, Notice, Platform, setIcon } = require("obsidian");
+const { ItemView, Keymap, Scope, MarkdownRenderer, Notice, Platform, setIcon, apiVersion } = require("obsidian");
 const { SessionHistoryPopover } = require("./SessionHistoryPopover");
 const { bindModelPicker } = require("./ModelPickerPopover");
 const { SessionLoadModal } = require("./SessionLoadModal");
 const { VIEW_TYPE_CODRIVER } = require("../constants");
 const { formatBytes } = require("../attachments/AttachmentExtractor");
+const { canvasDocumentsEqual } = require("../vault/CanvasDocument");
 const {
   captureThinkingShimmerSnapshot,
   compareThinkingShimmerSnapshots,
@@ -53,6 +54,8 @@ function initializeChatSurface(surface, chatController, diagnostics = null) {
   surface.focusCommandInputAfterRender = false;
   surface.draftSelectionStart = null;
   surface.draftSelectionEnd = null;
+  surface.voiceCaret = null;
+  surface.voiceViewClosed = false;
   surface.contextPickerOpen = false;
   surface.mcpServerPickerOpen = false;
   surface.requestInfoOpen = false;
@@ -96,6 +99,7 @@ class ChatView extends ItemView {
   }
 
   async onOpen() {
+    this.voiceViewClosed = false;
     this.chatController.setStateChangeHandler((change) => this.scheduleRender(change));
     this.chatController.handleActiveFileChange();
     this.registerEvent(this.app.workspace.on("file-open", () => {
@@ -116,13 +120,21 @@ class ChatView extends ItemView {
       this.render();
     }));
     this.registerDomEvent(document, "click", (event) => this.handleDocumentClick(event));
+    this.registerDomEvent(this.containerEl.ownerDocument ?? document, "keydown", (event) => {
+      if (event.key === "Escape" && this.chatController.isVoiceInputBusy()) {
+        event.preventDefault();
+        this.chatController.cancelVoiceInput();
+      }
+    });
     this.render();
   }
 
   async onClose() {
+    this.voiceViewClosed = true;
+    this.chatController.setStateChangeHandler(null);
+    this.chatController.cancelVoiceInput?.();
     this.modelPickerPopover?.close();
     this.closeSessionHistory();
-    this.chatController.setStateChangeHandler(null);
     this.clearAllMcpToolCallCollapseTimers();
     this.fileInputEl = null;
     this.messageInputEl = null;
@@ -139,6 +151,7 @@ class ChatView extends ItemView {
   }
 
   scheduleRender(change = null) {
+    if (this.voiceViewClosed) return Promise.resolve();
     const isProviderProgress = change?.type === "provider-progress" &&
       typeof change.messageId === "string" &&
       change.messageId;
@@ -214,9 +227,11 @@ class ChatView extends ItemView {
   }
 
   render() {
+    if (this.voiceViewClosed) return;
     this.modelPickerPopover?.close();
     this.closeSessionHistory();
     this.captureDraftMessage();
+    if (this.messageInputEl?.ownerDocument?.activeElement === this.messageInputEl) this.focusCommandInputAfterRender = true;
     const timelineScrollState = this.captureTimelineScrollState();
     const root = this.contentEl;
     this.clearReasoningScrollFrames();
@@ -236,6 +251,7 @@ class ChatView extends ItemView {
 
   captureDraftMessage() {
     if (this.messageInputEl) {
+      this.rememberVoiceCaret(this.messageInputEl);
       this.draftMessage = this.getComposerValue(this.messageInputEl);
       const selection = this.getComposerSelection(this.messageInputEl);
       this.draftSelectionStart = selection.start;
@@ -1467,7 +1483,7 @@ class ChatView extends ItemView {
   loadProposalNoteContent(notePath) {
     const vault = this.app.vault;
     const file = vault?.getAbstractFileByPath?.(notePath);
-    if (!file || file.extension !== "md") {
+    if (!file || !["md", "canvas"].includes(file.extension)) {
       this.proposalNoteContentCache.set(notePath, { status: "unavailable", content: null });
       return;
     }
@@ -2194,12 +2210,13 @@ class ChatView extends ItemView {
       const end = Number.isInteger(input?.selectionEnd) ? input.selectionEnd : start;
       return { start, end };
     }
-    const selection = typeof window !== "undefined" ? window.getSelection?.() : null;
+    const ownerDocument = input?.ownerDocument ?? (typeof document !== "undefined" ? document : null);
+    const selection = ownerDocument?.defaultView?.getSelection?.();
     if (!selection?.rangeCount || !input.contains?.(selection.anchorNode) || !input.contains?.(selection.focusNode)) {
       return { start: value.length, end: value.length };
     }
     const offsetFor = (node, offset) => {
-      const range = document.createRange();
+      const range = ownerDocument.createRange();
       range.selectNodeContents(input);
       range.setEnd(node, offset);
       return range.toString().length;
@@ -2214,11 +2231,11 @@ class ChatView extends ItemView {
       input.setSelectionRange?.(start, end);
       return;
     }
-    if (typeof document === "undefined" || typeof window === "undefined") return;
-    const selection = window.getSelection?.();
+    const ownerDocument = input?.ownerDocument ?? (typeof document !== "undefined" ? document : null);
+    const selection = ownerDocument?.defaultView?.getSelection?.();
     if (!selection) return;
     const textNodes = [];
-    const walker = document.createTreeWalker(input, 4);
+    const walker = ownerDocument.createTreeWalker(input, 4);
     for (let node = walker.nextNode(); node; node = walker.nextNode()) textNodes.push(node);
     const locate = (target) => {
       let consumed = 0;
@@ -2237,11 +2254,63 @@ class ChatView extends ItemView {
     };
     const from = locate(start);
     const to = locate(end);
-    const range = document.createRange();
+    const range = ownerDocument.createRange();
     range.setStart(from.node, from.offset);
     range.setEnd(to.node, to.offset);
     selection.removeAllRanges();
     selection.addRange(range);
+  }
+
+  rememberVoiceCaret(input, fromInputEvent = false) {
+    const ownerDocument = input?.ownerDocument;
+    if (!fromInputEvent && ownerDocument?.activeElement !== input) return;
+    const value = this.getComposerValue(input);
+    const selection = this.getComposerSelection(input);
+    this.voiceCaret = { value, start: selection.start, end: selection.end,
+      sessionId: this.chatController.getCurrentSessionId?.(), revision: this.chatController.voiceSessionRevision };
+  }
+
+  insertVoiceTranscript(result) {
+    if (!result || this.voiceViewClosed || !this.chatController.isVoiceInputResultCurrent(result)) return false;
+    const input = this.messageInputEl;
+    if (!input) return false;
+    const value = this.getComposerValue(input);
+    this.rememberVoiceCaret(input);
+    const caretIsCurrent = this.voiceCaret?.value === value &&
+      this.voiceCaret.sessionId === this.chatController.getCurrentSessionId?.() &&
+      this.voiceCaret.revision === this.chatController.voiceSessionRevision;
+    let offset = caretIsCurrent ? this.voiceCaret.start : null;
+    if (!Number.isInteger(offset) || offset < 0 || offset > value.length) offset = null;
+    const command = (this.chatController.getCommandChoices?.() ?? []).find((item) => item.id === this.draftCommandId);
+    const token = command ? findCommandTokenRange(value, command.name) : null;
+    if (offset !== null && token && offset > token.start && offset < token.end) offset = token.end;
+    const prefix = offset === null ? value : value.slice(0, offset);
+    const suffix = offset === null ? "" : value.slice(offset);
+    const separator = (offset === null || offset === token?.end) && prefix && !/\s$/.test(prefix) ? " " : "";
+    const trailingSeparator = offset === token?.start && suffix && !/^\s/.test(suffix) ? " " : "";
+    const next = `${prefix}${separator}${result.text}${trailingSeparator}${suffix}`;
+    this.setComposerValue(input, next);
+    this.draftMessage = next;
+    this.draftSelectionStart = prefix.length + separator.length + result.text.length;
+    this.draftSelectionEnd = this.draftSelectionStart;
+    input.focus();
+    this.setComposerSelection(input, this.draftSelectionStart, this.draftSelectionEnd);
+    this.rememberVoiceCaret(input, true);
+    this.focusCommandInputAfterRender = true;
+    this.commandMenuOpen = false;
+    // Voice text is plain draft text: do not activate commands or skill suggestions here.
+    this.render();
+    return true;
+  }
+
+  async toggleVoiceInput() {
+    if (this.chatController.voiceInput.state.phase === "recording") {
+      this.rememberVoiceCaret(this.messageInputEl);
+      const result = await this.chatController.stopVoiceInput();
+      this.insertVoiceTranscript(result);
+    } else {
+      await this.chatController.startVoiceInput();
+    }
   }
 
   handleAtomicCommandKeydown(event, input) {
@@ -2332,6 +2401,7 @@ class ChatView extends ItemView {
     let sendButton = null;
 
     const submitDraft = async () => {
+      if (this.chatController.isVoiceInputBusy?.()) return;
       const currentValue = this.getComposerValue(input);
       if (!this.chatController.canSendDraft(currentValue) && !this.draftCommandId) {
         return;
@@ -2366,15 +2436,24 @@ class ChatView extends ItemView {
     input.addEventListener("input", () => {
       const currentValue = this.getComposerValue(input);
       this.draftMessage = currentValue;
+      this.rememberVoiceCaret(input, true);
       this.syncDraftCommandFromInput(currentValue);
       this.renderSkillSuggestions(suggestions, input);
       this.updateCommandMenuFromInput(input);
       this.renderCommandSuggestions(suggestions, input);
       if (sendButton && !this.chatController.isSending()) {
-        sendButton.disabled = !this.chatController.canSendDraft(currentValue) && !this.draftCommandId;
+        sendButton.disabled = this.chatController.isVoiceInputBusy?.() || (!this.chatController.canSendDraft(currentValue) && !this.draftCommandId);
       }
     });
+    for (const eventName of ["select", "click", "keyup", "focus"]) {
+      input.addEventListener(eventName, () => this.rememberVoiceCaret(input, true));
+    }
     input.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && this.chatController.isVoiceInputBusy?.()) {
+        event.preventDefault();
+        this.chatController.cancelVoiceInput();
+        return;
+      }
       if (event.isComposing || event.keyCode === 229) return;
       if (this.handleSkillSuggestionKeydown(event, suggestions, input)) return;
       if (this.handleAtomicCommandKeydown(event, input)) return;
@@ -2395,6 +2474,7 @@ class ChatView extends ItemView {
       const start = Number.isInteger(this.draftSelectionStart) ? this.draftSelectionStart : currentValue.length;
       const end = Number.isInteger(this.draftSelectionEnd) ? this.draftSelectionEnd : start;
       this.setComposerSelection(input, start, end);
+      this.rememberVoiceCaret(input, true);
     }
 
     const actionRow = composer.createDiv({ cls: "codriver-composer-actions" });
@@ -2470,6 +2550,23 @@ class ChatView extends ItemView {
     historyButton.setAttribute("aria-haspopup", "dialog");
     historyButton.setAttribute("aria-expanded", "false");
 
+    const voiceConfiguration = this.chatController.getVoiceInputConfiguration?.();
+    const voiceState = this.chatController.voiceInput?.state ?? { phase: "idle", error: "" };
+    if (voiceConfiguration?.available) {
+      const recording = voiceState.phase === "recording";
+      const microphone = trailingActions.createEl("button", {
+        cls: "codriver-voice-button",
+        attr: { type: "button", "aria-label": recording ? "Stop recording and transcribe" : "Start voice input",
+          title: recording ? "Stop recording and transcribe" : `Record voice input: ${voiceConfiguration.destination}`,
+          "aria-pressed": String(recording) }
+      });
+      setIcon(microphone, recording ? "square" : "mic");
+      microphone.toggleClass("is-recording", recording);
+      microphone.disabled = this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
+      microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
+      microphone.addEventListener("click", () => { void this.toggleVoiceInput(); });
+    }
+
     sendButton = trailingActions.createEl("button", {
       cls: "codriver-send-button",
       attr: {
@@ -2480,7 +2577,7 @@ class ChatView extends ItemView {
     });
     setIcon(sendButton, this.chatController.isSending() ? "square" : "send");
     sendButton.toggleClass("is-stopping", this.chatController.isSending());
-    sendButton.disabled = !this.chatController.isSending() && !this.chatController.canSendDraft(this.getComposerValue(input)) && !this.draftCommandId;
+    sendButton.disabled = this.chatController.isVoiceInputBusy?.() || (!this.chatController.isSending() && !this.chatController.canSendDraft(this.getComposerValue(input)) && !this.draftCommandId);
     sendButton.addEventListener("click", () => {
       if (this.chatController.isSending()) {
         this.chatController.cancelActiveRequest();
@@ -2490,6 +2587,12 @@ class ChatView extends ItemView {
 
       void submitDraft();
     });
+    const voiceStatusText = voiceState.error || ({ starting: "Waiting for microphone...", recording: "Recording. Click Stop to transcribe. Escape to cancel.",
+      transcribing: "Transcribing... Escape to cancel." }[voiceState.phase] ?? "");
+    if (voiceStatusText) {
+      composer.createDiv({ cls: `codriver-voice-status${voiceState.error ? " codriver-voice-error" : ""}`, text: voiceStatusText,
+        attr: { role: "status", "aria-live": "polite", title: voiceStatusText } });
+    }
   }
 
   renderDraftAttachments(container) {
@@ -3282,7 +3385,7 @@ class ChatView extends ItemView {
           contentText: skill.source,
           onRemove: () => this.chatController.deactivateSkill(skill.id),
           removeClass: "codriver-active-skill-remove",
-          removeLabel: `Deactivate ${skill.name}`
+          removeLabel: skill.invocation === "model" ? `Remove ${skill.name} from this session` : `Deactivate ${skill.name}`
         });
       } else {
         chip.createSpan({ cls: "codriver-active-skill-source", text: skill.source });
@@ -3365,7 +3468,146 @@ function disposeChatTimelineRenderer(renderer) {
   renderer?.pendingProviderProgressMessageIds?.clear?.();
 }
 
+// The current TextFileView runtime has no public save barrier. Recognize its
+// idle-state contract explicitly and hold native saves/loads during file I/O.
+// Unknown runtimes and busy editors fail before any CoDriver write.
+function createCanvasWriteGuard(app, file, before) {
+  if (typeof app.workspace?.iterateAllLeaves !== "function") throw new Error("Canvas editor synchronization is unavailable.");
+  const views = [];
+  app.workspace.iterateAllLeaves((leaf) => {
+    const view = leaf.view;
+    if (view?.file?.path === file.path) views.push(view);
+  });
+  if (views.length > 8) throw new Error("Too many open Canvas views to synchronize safely.");
+  if (views.length && apiVersion !== "1.14.4") throw new Error("Open Canvas synchronization has not been validated for this Obsidian version. The file was not changed.");
+  if (views.length && (typeof Scope !== "function" || typeof app.keymap?.pushScope !== "function" || typeof app.keymap?.popScope !== "function")) {
+    throw new Error("Canvas keyboard protection is unavailable in this runtime.");
+  }
+  const documents = new Set();
+  for (const view of views) {
+    let live;
+    let rendered;
+    try { live = view.getViewData?.(); rendered = JSON.stringify(view.canvas?.getData?.()); }
+    catch { throw new Error("Canvas editor state could not be inspected safely."); }
+    if (view.file !== file || view.getViewType?.() !== "canvas" || view.dirty !== false || view.saving !== false ||
+      view.canvas?.dirty?.size !== 0 || view.canvas?.moved?.size !== 0 ||
+      view.containerEl?.inert === true || !Object.isExtensible(view) ||
+      typeof view.data !== "string" || typeof view.lastSavedData !== "string" ||
+      !["getViewData", "setViewData", "loadFileInternal"].every((key) => typeof view[key] === "function") ||
+      !canvasDocumentsEqual(before, view.data) || !canvasDocumentsEqual(before, view.lastSavedData) || !canvasDocumentsEqual(before, live) ||
+      !canvasDocumentsEqual(before, rendered)) {
+      throw new Error("Canvas editor has unsaved changes, is saving, or cannot be synchronized. Finish editing, wait for saving and prepare the patch again.");
+    }
+    if (typeof view.containerEl?.querySelector !== "function" || view.containerEl.querySelector('.canvas-node.is-editing, [contenteditable="true"].is-editing')) {
+      throw new Error("Finish editing the Canvas card or connection label, wait for saving and prepare the patch again.");
+    }
+    const document = view.containerEl?.ownerDocument;
+    if (!document?.body || !("inert" in document.body) || typeof document.addEventListener !== "function") {
+      throw new Error("Canvas interaction protection is unavailable in this runtime.");
+    }
+    for (const key of ["getViewData", "setViewData", "loadFileInternal"]) {
+      const descriptor = Object.getOwnPropertyDescriptor(view, key);
+      if (descriptor && !descriptor.configurable) throw new Error("Canvas editor methods cannot be synchronized in this runtime.");
+    }
+    for (const key of ["data", "lastSavedData"]) {
+      if (Object.getOwnPropertyDescriptor(view, key)?.writable !== true) throw new Error("Canvas save state cannot be synchronized in this runtime.");
+    }
+    documents.add(document);
+  }
+  const restores = [];
+  const captured = [];
+  const block = (event) => { event.preventDefault(); event.stopImmediatePropagation(); };
+  try {
+    if (views.length) {
+      const scope = new Scope();
+      scope.register(null, null, () => false);
+      app.keymap.pushScope(scope);
+      restores.push(() => app.keymap.popScope(scope));
+    }
+    for (const document of documents) {
+      const inert = document.body.inert;
+      const focused = document.activeElement;
+      document.body.inert = true;
+      document.addEventListener("keydown", block, true);
+      restores.push(() => {
+        document.body.inert = inert; document.removeEventListener("keydown", block, true);
+        if (!inert && focused?.isConnected && typeof focused.focus === "function" && document.activeElement === document.body) focused.focus();
+      });
+    }
+    for (const view of views) {
+      const get = view.getViewData;
+      const set = view.setViewData;
+      captured.push({ view, get, set, stagedContent: null, savedData: view.lastSavedData });
+      for (const [key, fn] of [
+        ["getViewData", () => view.lastSavedData],
+        ["setViewData", () => {}],
+        ["loadFileInternal", () => Promise.resolve()]
+      ]) {
+        const descriptor = Object.getOwnPropertyDescriptor(view, key);
+        Object.defineProperty(view, key, { configurable: true, writable: true, value: fn });
+        restores.push(() => { if (descriptor) Object.defineProperty(view, key, descriptor); else delete view[key]; });
+      }
+      // Recheck after installing the barrier, without invoking a save or reload.
+      if (view.dirty !== false || view.saving !== false || view.canvas.dirty.size !== 0 || view.canvas.moved.size !== 0 ||
+        !canvasDocumentsEqual(before, get.call(view)) || !canvasDocumentsEqual(before, JSON.stringify(view.canvas.getData()))) throw new Error("Canvas editor changed during preparation.");
+    }
+  } catch (error) {
+    for (const restore of restores.reverse()) restore();
+    throw error;
+  }
+  return {
+    stage(content) {
+      for (const entry of captured) {
+        entry.stagedContent = content;
+        try { entry.set.call(entry.view, content, false); }
+        catch { throw new Error("Canvas editor could not accept the proposed document. The write was blocked."); }
+        let serialized;
+        let rendered;
+        try { serialized = entry.get.call(entry.view); rendered = JSON.stringify(entry.view.canvas.getData()); }
+        catch { throw new Error("Canvas editor could not serialize the proposed document. The write was blocked."); }
+        if (!canvasDocumentsEqual(content, serialized) || !canvasDocumentsEqual(content, rendered)) throw new Error("Canvas editor did not preserve the proposed document. The write was blocked.");
+        entry.stagedSerialized = serialized;
+      }
+    },
+    finish(content) {
+      const failed = [];
+      try {
+        for (const { view, get, set, stagedContent, stagedSerialized, savedData } of captured) {
+          if (view.file === file) {
+            // Restore the reviewed source only when the atomic write failed.
+            if (stagedContent !== null && content !== stagedContent) {
+              try { set.call(view, content, false); }
+              catch { failed.push(view); }
+            }
+            view.data = content;
+            let serialized = content === stagedContent ? stagedSerialized : savedData;
+            if (!failed.includes(view)) {
+              try {
+                const current = get.call(view);
+                if (!canvasDocumentsEqual(content, current) || !canvasDocumentsEqual(content, JSON.stringify(view.canvas.getData()))) throw new Error("Canvas editor changed during the atomic write.");
+                serialized = current;
+              } catch { failed.push(view); }
+            }
+            view.lastSavedData = serialized;
+          }
+        }
+      } finally {
+        for (const restore of restores.reverse()) restore();
+        for (const view of failed) {
+          // Do not allow a broken editor buffer to autosave over the unchanged
+          // file. Recovery requires closing this view, not a hidden reload.
+          view.containerEl.inert = true;
+          view.getViewData = () => view.lastSavedData;
+          view.loadFileInternal = () => Promise.resolve();
+        }
+      }
+      if (failed.length) throw new Error("Canvas file was preserved, but its editor could not be restored. Close this Canvas tab and open it again before retrying.");
+    }
+  };
+}
+
 module.exports = {
+  createCanvasWriteGuard,
   ChatView,
   createChatTimelineRenderer,
   decodeModelOptionValue,
@@ -3404,6 +3646,7 @@ function getProposalTitle(proposal) {
   if (proposal.applicationState === "applying") return "Applying note update";
   if (proposal.applicationState === "unavailable" && proposal.status === "accepted") return "Application state unavailable";
   if (proposal.status === "pending") {
+    if (proposal.notePath?.toLowerCase().endsWith(".canvas")) return "Proposed Canvas update";
     if (proposal.kind === "frontmatter") {
       return "Proposed frontmatter update";
     }

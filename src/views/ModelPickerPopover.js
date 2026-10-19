@@ -28,18 +28,23 @@ class ModelPickerPopover {
     });
     this.button.setAttribute("aria-expanded", "true");
     this.button.setAttribute("aria-controls", `${listId}-dialog`);
-    this.list = this.element.createDiv({
+    const listOptions = {
       cls: "codriver-model-popover-list",
-      attr: { id: listId, role: "listbox", "aria-label": "Models" }
-    });
+      attr: { id: listId, role: "listbox", "aria-label": this.options.listLabel || "Models" }
+    };
+    if (!this.options.searchFirst) this.list = this.element.createDiv(listOptions);
     this.search = this.element.createEl("input", {
       cls: "codriver-model-popover-search",
       attr: {
-        type: "search", placeholder: "Search", "aria-label": "Search models",
+        type: "search", placeholder: this.options.searchPlaceholder || "Search", "aria-label": this.options.searchLabel || "Search models",
         role: "combobox", "aria-autocomplete": "list", "aria-expanded": "true",
         "aria-controls": listId
       }
     });
+    if (this.options.searchFirst) {
+      this.element.addClass("codriver-picker-search-first");
+      this.list = this.element.createDiv(listOptions);
+    }
     this.listen(this.search, "input", () => { this.activeValue = null; this.renderOptions(); });
     this.listen(this.element, "keydown", (event) => this.handleKeydown(event));
     for (const name of ["pointerdown", "focusin"]) {
@@ -71,7 +76,7 @@ class ModelPickerPopover {
     this.list.empty();
     this.search.removeAttribute("aria-activedescendant");
     if (!groups.length) {
-      this.list.createDiv({ cls: "codriver-model-popover-empty", text: "No matching models", attr: { role: "status" } });
+      this.list.createDiv({ cls: "codriver-model-popover-empty", text: this.options.emptyText || "No matching models", attr: { role: "status" } });
     }
     let activeOption = null;
     let index = 0;

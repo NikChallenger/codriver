@@ -1,4 +1,5 @@
 const CODRIVER_INTERNAL_TRANSPORT = "codriver";
+const CODRIVER_API_CALL_TOOL_NAME = "codriver_api_call";
 const CODRIVER_VAULT_SERVER_ID = "codriver-vault";
 const CODRIVER_VAULT_SERVER_NAME = "CoDriver Vault";
 const CODRIVER_ACTIVE_FILE_GET_PATH_TOOL_NAME = "codriver_active_file_get_path";
@@ -16,6 +17,8 @@ const CODRIVER_VAULT_READ_TARGET_TOOL_NAME = "codriver_vault_read_target";
 const CODRIVER_VAULT_SEARCH_TOOL_NAME = "codriver_vault_search";
 const CODRIVER_VAULT_SEARCH_STRUCTURED_TOOL_NAME = "codriver_vault_search_structured";
 const VAULT_AUDIO_AUTO_CONSENT_VERSION = 1;
+const TEXT_DOCUMENT_AUTO_CONSENT_VERSION = 1;
+const TEXT_DOCUMENT_MUTATION_TOOLS = Object.freeze([CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME, CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]);
 const CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME = "codriver_vault_transcribe_audio";
 const CODRIVER_VAULT_CONFIGURABLE_AUTO_TOOL_NAMES = Object.freeze([
   CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME,
@@ -35,7 +38,8 @@ const CODRIVER_VAULT_TOOL_NAMES = Object.freeze([
   CODRIVER_VAULT_SEARCH_STRUCTURED_TOOL_NAME,
   CODRIVER_VAULT_DOCUMENT_MAP_TOOL_NAME,
   CODRIVER_TAG_LIST_TOOL_NAME,
-  CODRIVER_OPEN_FILE_TOOL_NAME
+  CODRIVER_OPEN_FILE_TOOL_NAME,
+  CODRIVER_API_CALL_TOOL_NAME
 ]);
 const CODRIVER_VAULT_TOOL_ORDER = new Map(
   CODRIVER_VAULT_TOOL_NAMES.map((name, index) => [name, index])
@@ -52,6 +56,7 @@ function createCodriverVaultMcpServer(options = {}) {
     enabled: true,
     system: true,
     tools: [
+      createDirectApiTool(toolSettings, options.directApiSettings),
       {
         name: CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME,
         title: "Transcribe vault audio",
@@ -124,13 +129,13 @@ function createCodriverVaultMcpServer(options = {}) {
       {
         name: CODRIVER_VAULT_READ_TOOL_NAME,
         title: "Read vault note",
-        description: "Read full Markdown content for a vault-relative note path through CoDriver's Obsidian API. Prefer codriver_vault_get_document_map plus codriver_vault_read_target for named heading, section, block, or frontmatter requests; use this full read when broad note content is needed or narrower tools cannot answer. This is read-only and runs automatically for the built-in CoDriver Vault tool set.",
+        description: "Read saved Markdown text or Canvas JSON for a vault-relative path through CoDriver's Obsidian API. Prefer codriver_vault_get_document_map plus codriver_vault_read_target for named heading, section, block, or frontmatter requests; use this full read when broad note content is needed or narrower tools cannot answer. This is read-only and runs automatically for the built-in CoDriver Vault tool set.",
         inputSchema: {
           type: "object",
           properties: {
             path: {
               type: "string",
-              description: "Vault-relative Markdown note path to read."
+              description: "Exact vault-relative .md or .canvas path. Canvas reads do not read referenced notes or media."
             }
           },
           required: ["path"],
@@ -141,23 +146,24 @@ function createCodriverVaultMcpServer(options = {}) {
       {
         name: CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME,
         title: "Create note",
-        description: "Create a new Markdown note at an exact vault-relative path through CoDriver's Obsidian API. Missing parent folders are created. This tool never overwrites an existing file or folder. It requires approval unless the user has explicitly allowed this tool to run automatically.",
+        description: "Create a new Markdown note or validated JSON Canvas file at an exact vault-relative path through CoDriver's Obsidian API. Missing parent folders are created. This tool never overwrites an existing file or folder. It requires approval unless the user has explicitly allowed this tool to run automatically.",
         inputSchema: {
           type: "object",
           properties: {
             path: {
               type: "string",
-              description: "Exact vault-relative path for the new Markdown note, including the .md extension."
+              description: "Exact vault-relative path for a new .md note or .canvas file."
             },
             content: {
               type: "string",
-              description: "Exact initial Markdown content for the new note."
+              description: "Exact initial Markdown text or raw JSON Canvas with root nodes and edges arrays. Text cards use id, type text, x, y, width, height, text. No content.blocks wrapper. Escape quotes/newlines in JSON strings; do not escape backticks."
             }
           },
           required: ["path", "content"],
           additionalProperties: false
         },
-        allowAutomaticExecution: toolSettings[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.allowAutomaticExecution === true,
+        allowAutomaticExecution: toolSettings[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.allowAutomaticExecution === true &&
+          toolSettings[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.documentAutoConsentVersion === TEXT_DOCUMENT_AUTO_CONSENT_VERSION,
         automaticPermissionConfigurable: true,
         writesVault: true
       },
@@ -206,13 +212,13 @@ function createCodriverVaultMcpServer(options = {}) {
       {
         name: CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME,
         title: "Patch note",
-        description: "Prepare a reviewable patch for an existing Markdown note. By default, CoDriver applies the patch only after the user accepts its proposal card. If the user explicitly enables automatic application for this exact tool, CoDriver applies a newly prepared proposal through the same stale-safe validation path. Use text changes for exact body replacements or before/after objects for frontmatter changes.",
+        description: "Prepare a reviewable text patch for an existing Markdown or Canvas file; frontmatter is Markdown-only. Canvas JSON is validated, unchanged extension fields are preserved, and a busy editor blocks application without reload. By default, CoDriver applies the patch only after the user accepts its proposal card. If the user explicitly enables automatic application for this exact tool, CoDriver applies a newly prepared proposal through the same stale-safe validation path. Use text changes for exact body replacements or before/after objects for frontmatter changes.",
         inputSchema: {
           type: "object",
           properties: {
             path: {
               type: "string",
-              description: "Existing vault-relative Markdown note path using forward slashes."
+              description: "Exact existing vault-relative .md or .canvas path using forward slashes."
             },
             kind: {
               type: "string",
@@ -260,7 +266,8 @@ function createCodriverVaultMcpServer(options = {}) {
           additionalProperties: false
         },
         allowAutomaticExecution: true,
-        allowAutomaticProposalApplication: toolSettings[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.allowAutomaticExecution === true,
+        allowAutomaticProposalApplication: toolSettings[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.allowAutomaticExecution === true &&
+          toolSettings[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.documentAutoConsentVersion === TEXT_DOCUMENT_AUTO_CONSENT_VERSION,
         automaticPermissionConfigurable: true,
         automaticPermissionTarget: "proposal-application",
         writesVault: true
@@ -458,7 +465,38 @@ function createCodriverVaultMcpServer(options = {}) {
   };
 }
 
+function createDirectApiTool(toolSettings, settings = {}) {
+  const targets = [];
+  if (settings.obsidian === true) targets.push("obsidian");
+  if (settings.plugin === true) targets.push("plugin");
+  const permission = toolSettings[CODRIVER_API_CALL_TOOL_NAME];
+  return {
+    name: CODRIVER_API_CALL_TOOL_NAME,
+    title: "Direct API call",
+    description: "Call Obsidian or installed plugin API methods and return bounded data. Omit method to discover available methods; for target \"plugin\", also omit pluginId to list loaded plugins. Plugin method paths are relative to the plugin instance, e.g. pluginId \"dataview\", method \"api.query\". Pass positional JSON arguments in args; {\"$file\":\"path\"} references an existing vault file. Callbacks are unsupported.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: { type: "string", enum: targets.length ? targets : ["obsidian", "plugin"] },
+        pluginId: { type: "string", description: "Exact installed plugin ID for a plugin method call. Omit with method to discover loaded plugins." },
+        method: { type: "string", description: "Exact method path; omit to discover methods. Example: api.query for Dataview." },
+        args: { type: "array", items: {}, description: "Positional JSON arguments. Defaults to an empty array." }
+      },
+      required: ["target"],
+      additionalProperties: false
+    },
+    enabled: permission?.enabled !== false,
+    allowAutomaticExecution: false,
+    automaticPermissionConfigurable: false,
+    executionBinding: settings.binding || "",
+    apiTargetsAvailable: targets.length > 0
+  };
+}
+
 module.exports = {
+  CODRIVER_API_CALL_TOOL_NAME,
+  TEXT_DOCUMENT_AUTO_CONSENT_VERSION,
+  TEXT_DOCUMENT_MUTATION_TOOLS,
   VAULT_AUDIO_AUTO_CONSENT_VERSION,
   CODRIVER_ACTIVE_FILE_GET_PATH_TOOL_NAME,
   CODRIVER_INTERNAL_TRANSPORT,

@@ -1,4 +1,5 @@
 const { resolveVaultAudioPath } = require("./AudioPathResolver");
+const { MAX_CANVAS_CHARACTERS } = require("./CanvasDocument");
 
 class VaultReader {
   constructor(app) {
@@ -59,6 +60,20 @@ class VaultReader {
       label: file.path,
       reason: ""
     };
+  }
+
+  getActiveNoteContextInfo() {
+    const file = this.getActiveFile();
+    if (!file) return {
+      available: false, path: null, label: "No active Markdown note or Canvas",
+      reason: "No active Markdown note or Canvas is open."
+    };
+    const extension = String(file.extension ?? getFileExtension(file.path)).toLowerCase();
+    if (!["md", "canvas"].includes(extension)) return {
+      available: false, path: file.path, label: "Active file is not Markdown or Canvas",
+      reason: "The active file is not a Markdown note or Canvas."
+    };
+    return { available: true, path: file.path, label: file.path, reason: "" };
   }
 
   getActiveMarkdownContextLabel() {
@@ -134,6 +149,22 @@ class VaultReader {
       path: file.path,
       content
     };
+  }
+
+  async readTextDocumentPath(path) {
+    if (typeof path !== "string" || !path.toLowerCase().endsWith(".canvas")) return this.readMarkdownPath(path);
+    if (!path || path !== path.trim() || path.startsWith("/") || /[\\:\u0000-\u001f\u007f]/.test(path) ||
+      path.split("/").some((part) => !part || part === "." || part === "..")) {
+      throw new Error("Canvas read requires an exact vault-relative path.");
+    }
+    const file = this.vault.getAbstractFileByPath?.(path);
+    if (!file || file.path !== path || file.extension?.toLowerCase() !== "canvas") {
+      throw new Error("Canvas read requires an existing Canvas file at the exact path.");
+    }
+    if (file.stat?.size > MAX_CANVAS_CHARACTERS * 4) throw new Error("Canvas document exceeds the read size limit.");
+    const content = await this.vault.read(file);
+    if (typeof content !== "string" || content.length > MAX_CANVAS_CHARACTERS) throw new Error("Canvas document exceeds the read size limit.");
+    return { path: file.path, content };
   }
 
   async listVaultPath(path = "") {
@@ -1279,6 +1310,328 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const DIRECT_OBSIDIAN_METHODS = Object.freeze([
+  "workspace.getLastOpenFiles",
+  "workspace.getLeavesOfType",
+  "workspace.activeEditor.editor.getSelection",
+  "workspace.activeEditor.editor.getValue",
+  "workspace.activeEditor.editor.getCursor",
+  "fileManager.generateMarkdownLink"
+]);
+const DIRECT_API_BLOCKED_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+// This boundary controls CoDriver dispatch, not the authority of installed plugins.
+class DirectApiAccess {
+  constructor(app) {
+    this.app = app;
+    this.identities = new WeakMap();
+    this.nextIdentity = 1;
+    this.busy = false;
+  }
+
+  identity(object) {
+    if (!object || !["object", "function"].includes(typeof object)) return 0;
+    if (!this.identities.has(object)) this.identities.set(object, this.nextIdentity++);
+    return this.identities.get(object);
+  }
+
+  plugins() {
+    const registry = this.app.plugins?.plugins;
+    if (!registry || typeof registry !== "object") return [];
+    const ids = Object.keys(registry).sort();
+    if (ids.length > 1000) throw new Error("Installed plugin catalog exceeds the API limit.");
+    return ids.filter((id) => registry[id] && id !== "codriver").map((id) => ({ id, instance: registry[id] }));
+  }
+
+  binding(settings) {
+    return JSON.stringify([
+      settings.enableDirectObsidianApiAccess === true,
+      settings.allowAutomaticDirectObsidianApiAccess === true,
+      settings.enableDirectPluginApiAccess === true,
+      normalizeDirectPluginApiSettings(settings.directPluginApiSettings),
+      settings.enableDirectPluginApiAccess === true
+        ? this.plugins().map(({ id, instance }) => [id, this.identity(instance), this.identity(Object.getOwnPropertyDescriptor(instance, "api")?.value), String(instance.manifest?.version || "").slice(0, 80)])
+        : []
+    ]);
+  }
+
+  callBinding(input) {
+    try {
+      if (!input?.method) return "discovery";
+      const { receiver, method } = this.resolveMethod(input);
+      return JSON.stringify([this.identity(receiver), this.identity(method)]);
+    } catch { return "unavailable"; }
+  }
+
+  resolveMethod(input) {
+    const path = parseDirectMethodPath(input.method);
+    const plugin = input.target === "plugin" ? this.plugins().find((item) => item.id === input.pluginId)?.instance : null;
+    let receiver = input.target === "obsidian" ? this.app : plugin;
+    const blocked = new Set();
+    if (input.target === "plugin") {
+      if (!plugin) throw new Error("The requested plugin API is unavailable.");
+      // Block direct traversal into known host/other-plugin objects, not opaque plugin internals.
+      for (const key of ["vault", "workspace", "fileManager", "metadataCache", "plugins", "secretStorage", "commands"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(this.app, key);
+        if (descriptor && Object.hasOwn(descriptor, "value") && descriptor.value) blocked.add(descriptor.value);
+      }
+      blocked.add(this.app);
+      const registry = this.app.plugins?.plugins;
+      if (registry) {
+        blocked.add(registry);
+        for (const id of Object.keys(registry)) {
+          const instance = Object.getOwnPropertyDescriptor(registry, id)?.value;
+          if (!instance || instance === plugin) continue;
+          blocked.add(instance);
+          const api = Object.getOwnPropertyDescriptor(instance, "api")?.value;
+          if (api) blocked.add(api);
+        }
+      }
+    }
+    const check = (value) => {
+      if (blocked.has(value)) throw new Error("Direct API paths cannot traverse host objects or another plugin.");
+      return value;
+    };
+    check(receiver);
+    for (const key of path.slice(0, -1)) receiver = check(getDirectDataProperty(receiver, key));
+    const method = check(getDirectDataProperty(receiver, path[path.length - 1]));
+    if (typeof method !== "function") throw new Error("The requested API method is unavailable.");
+    return { receiver, method };
+  }
+
+  availabilityMessage(input, settings) {
+    if (input?.target !== "plugin") return "";
+    if (settings.enableDirectPluginApiAccess !== true) return "Direct Plugin API access is off in CoDriver Settings.";
+    if (!this.app.plugins?.plugins || typeof this.app.plugins.plugins !== "object") return "Plugin list is unavailable. Reload Obsidian and retry.";
+    if (!input.pluginId && !input.method) return "";
+    if (typeof input.pluginId !== "string" || !input.pluginId) return "Specify the plugin ID. Discover loaded plugins first.";
+    if (settings.directPluginApiSettings?.[input.pluginId]?.enabled === false) return "This plugin's API is disabled in CoDriver Settings > MCP > Plugins.";
+    if (!this.plugins().some(({ id }) => id === input.pluginId)) return "Plugin API unavailable: plugin is not loaded in Obsidian. Enable it in Community plugins and retry.";
+    return "";
+  }
+
+  allowsAutomatic(input, settings) {
+    if (input?.target === "obsidian") return settings.enableDirectObsidianApiAccess === true && settings.allowAutomaticDirectObsidianApiAccess === true;
+    if (input?.target !== "plugin") return false;
+    if (this.availabilityMessage(input, settings)) return false;
+    if (!input.pluginId && !input.method) return true;
+    const plugin = this.plugins().find(({ id }) => id === input.pluginId);
+    const permission = settings.directPluginApiSettings?.[input.pluginId];
+    const version = plugin?.instance.manifest?.version;
+    return typeof version === "string" && version.length > 0 && permission?.allowAutomaticExecution === true && permission.autoVersion === version;
+  }
+
+  async call(input, options) {
+    const check = () => {
+      if (options.signal?.aborted || !options.isCurrent()) throw new Error("API request authorization or target changed. Send a new request.");
+    };
+    check();
+    if (this.busy) throw new Error("A previous API call is still running. Wait for it to finish.");
+    if (!input || !["obsidian", "plugin"].includes(input.target)) throw new Error("Choose an available API target.");
+    if (input.target === "obsidian" && options.settings.enableDirectObsidianApiAccess !== true) throw new Error("Direct Obsidian API access is disabled.");
+    if (input.target === "plugin" && options.settings.enableDirectPluginApiAccess !== true) throw new Error("Direct Plugin API Access is disabled.");
+    const unavailable = this.availabilityMessage(input, options.settings);
+    if (unavailable) throw new Error(unavailable);
+    const args = input.args === undefined ? [] : input.args;
+    if (!Array.isArray(args) || args.length > 16) throw new Error("API args must be an array of at most 16 positional arguments.");
+    if (!input.method && args.length) throw new Error("Discovery does not accept positional arguments.");
+    let receiver = this.app;
+    if (input.target === "plugin") {
+      if (!input.pluginId && !input.method) {
+        return this.result(this.plugins().filter(({ id }) => options.settings.directPluginApiSettings?.[id]?.enabled !== false).map(({ id, instance }) => ({ id, name: instance.manifest?.name || id, version: instance.manifest?.version || "" })), options.limit);
+      }
+      if (typeof input.pluginId !== "string") throw new Error("Set an exact loaded pluginId.");
+      receiver = this.plugins().find((item) => item.id === input.pluginId)?.instance;
+      if (!receiver) throw new Error("The requested plugin API is unavailable.");
+    } else if (input.pluginId !== undefined) {
+      throw new Error("Obsidian API calls do not accept pluginId.");
+    }
+    if (input.method === undefined) {
+      const methods = input.target === "obsidian" ? DIRECT_OBSIDIAN_METHODS : discoverDirectMethods(receiver);
+      return this.result({ methods }, options.limit);
+    }
+    if (input.target === "obsidian" && !DIRECT_OBSIDIAN_METHODS.includes(input.method)) {
+      throw new Error("Use the specialized CoDriver tool for vault reads, searches, metadata, writes, moves, deletion and opening. Other direct Obsidian methods are unavailable.");
+    }
+    if (input.target === "obsidian") validateDirectObsidianArgs(input.method, args, options.settings);
+    const resolved = this.resolveMethod(input);
+    receiver = resolved.receiver;
+    const method = resolved.method;
+    const converted = args.map((arg) => convertDirectArgument(arg, this.app));
+    check();
+    this.busy = true;
+    try {
+      // No eval, detached function call or JavaScript callback reconstruction.
+      let value = await Reflect.apply(method, receiver, converted);
+      check();
+      if (input.target === "obsidian" && input.method === "workspace.getLeavesOfType") {
+        if (!Array.isArray(value) || value.length > 200) throw new Error("Open view result exceeds the API limit.");
+        value = value.map((leaf) => ({ id: leaf.id, type: args[0], path: leaf.view?.file?.path || "" }));
+      }
+      return this.result(value, options.limit);
+    } catch (error) {
+      // Native/plugin errors may contain arguments, source text or credentials.
+      if (options.signal?.aborted || !options.isCurrent()) throw new Error("API request stopped waiting. In-flight plugin work may have continued.");
+      throw new Error("API call failed or its result could not be serialized within the limits.");
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  result(value, limit = 60000) {
+    const budget = { nodes: 0, characters: 0, limit: Math.min(60000, Math.max(1000, limit)) };
+    const data = serializeDirectValue(value === undefined ? null : value, budget);
+    const text = JSON.stringify({ result: data });
+    if (text.length > budget.limit) throw new Error("API result exceeds the current output limit. Request a smaller result.");
+    return { content: [{ type: "text", text }], isError: false };
+  }
+}
+
+function parseDirectMethodPath(value) {
+  if (typeof value !== "string" || value.length > 240 || !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(value)) throw new Error("Use a dot-separated API method path.");
+  const path = value.split(".");
+  if (path.length > 8 || path.some((key) => DIRECT_API_BLOCKED_KEYS.has(key))) throw new Error("Prototype and constructor access is unavailable.");
+  return path;
+}
+
+function getDirectDataProperty(object, key) {
+  if (!object || !["object", "function"].includes(typeof object) || DIRECT_API_BLOCKED_KEYS.has(key)) throw new Error("The requested API path is unavailable.");
+  let current = object;
+  for (let depth = 0; current && current !== Object.prototype && current !== Function.prototype && depth < 8; depth++) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+    if (descriptor) {
+      if (!Object.hasOwn(descriptor, "value")) throw new Error("API accessor paths are unsupported. Use an explicit method.");
+      return descriptor.value;
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  throw new Error("The requested API path is unavailable.");
+}
+
+function discoverDirectMethods(object, prefix = "", depth = 0, methods = []) {
+  if (!object || depth > 2 || methods.length >= 100) return methods;
+  const seen = new Set();
+  let current = object;
+  for (let level = 0; current && current !== Object.prototype && level < 4; level++) {
+    for (const key of Object.getOwnPropertyNames(current)) {
+      if (seen.has(key) || DIRECT_API_BLOCKED_KEYS.has(key) || !/^[A-Za-z_$][\w$]*$/.test(key)) continue;
+      seen.add(key);
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (!descriptor || !Object.hasOwn(descriptor, "value")) continue;
+      const path = prefix + key;
+      if (typeof descriptor.value === "function") methods.push(path);
+      else if (depth === 0 && ["api", "templater"].includes(key)) discoverDirectMethods(descriptor.value, path + ".", depth + 1, methods);
+      if (methods.length >= 100) return methods;
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  return methods;
+}
+
+function convertDirectArgument(value, app, depth = 0) {
+  if (depth > 16) throw new Error("API argument nesting exceeds the limit.");
+  if (!value || typeof value !== "object") return value;
+  if (Object.hasOwn(value, "$file")) {
+    const path = value.$file;
+    if (Object.keys(value).length !== 1 || typeof path !== "string" || !path || path.startsWith("/") || /[\\:\u0000-\u001f]/.test(path) || path.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("Set an exact vault-relative $file path.");
+    const file = app.vault?.getAbstractFileByPath?.(path);
+    if (!file || file.path !== path || typeof file.extension !== "string") throw new Error("The exact vault file was not found.");
+    return file;
+  }
+  if (Array.isArray(value)) return value.map((entry) => convertDirectArgument(entry, app, depth + 1));
+  const result = {};
+  for (const key of Object.keys(value)) {
+    if (DIRECT_API_BLOCKED_KEYS.has(key)) throw new Error("Prototype keys are unavailable in API arguments.");
+    result[key] = convertDirectArgument(value[key], app, depth + 1);
+  }
+  return result;
+}
+
+function validateDirectObsidianArgs(method, args, settings) {
+  const cursor = method.endsWith(".getCursor");
+  if (method.includes("activeEditor") && !cursor && settings.codriverVaultToolSettings?.codriver_vault_read?.enabled === false) throw new Error("Read vault note is disabled; editor content access is unavailable.");
+  if (method === "workspace.getLeavesOfType") {
+    if (args.length !== 1 || typeof args[0] !== "string" || args[0].length > 80) throw new Error("Set one view type string.");
+  } else if (method === "fileManager.generateMarkdownLink") {
+    if (args.length < 2 || args.length > 4 || !args[0]?.$file || args.slice(1).some((arg) => typeof arg !== "string" || arg.length > 2000)) throw new Error("Set a $file, sourcePath and optional subpath and alias strings.");
+  } else if (cursor) {
+    if (args.length > 1 || (args.length && !["from", "to", "head", "anchor"].includes(args[0]))) throw new Error("Set an optional cursor side.");
+  } else if (args.length) throw new Error("This Obsidian method takes no arguments.");
+}
+
+function serializeDirectValue(value, budget, depth = 0, seen = new Set()) {
+  if (++budget.nodes > 4000 || depth > 12) throw new Error("API result structure exceeds the limit.");
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    budget.characters += value.length;
+    if (budget.characters > budget.limit) throw new Error("API result text exceeds the limit.");
+    return value;
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) throw new Error("API result contains an unsupported value or cycle.");
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > 1000) throw new Error("API result array exceeds the limit.");
+      return value.map((entry) => serializeDirectValue(entry, budget, depth + 1, seen));
+    }
+    // Dataview Link and Luxon values are projected without invoking toJSON/toString.
+    const proto = Object.getPrototypeOf(value);
+    const isPlain = proto === Object.prototype || proto === null;
+    const own = (key) => Object.getOwnPropertyDescriptor(value, key)?.value;
+    if (value instanceof Date) return { type: "date", timestamp: serializeDirectValue(Date.prototype.getTime.call(value), budget, depth + 1, seen) };
+    if (!isPlain && typeof own("successful") === "boolean" && Object.keys(value).every((key) => ["successful", "value", "error"].includes(key))) {
+      const successful = own("successful");
+      return { successful, [successful ? "value" : "error"]: serializeDirectValue(getDirectDataProperty(value, successful ? "value" : "error"), budget, depth + 1, seen) };
+    }
+    if (!isPlain && own("isLuxonDateTime") === true) {
+      return { type: "date", timestamp: serializeDirectValue(own("ts"), budget, depth + 1, seen) };
+    }
+    if (!isPlain && own("isLuxonDuration") === true && typeof own("values") === "object") {
+      return { type: "duration", values: serializeDirectValue(own("values"), budget, depth + 1, seen) };
+    }
+    if (!isPlain && Object.hasOwn(value, "path") && Object.hasOwn(value, "embed") && Object.hasOwn(value, "type")) {
+      const link = {};
+      for (const key of ["path", "type", "subpath", "display", "embed"]) {
+        const desc = Object.getOwnPropertyDescriptor(value, key);
+        if (desc && Object.hasOwn(desc, "value") && desc.value !== undefined) link[key] = serializeDirectValue(desc.value, budget, depth + 1, seen);
+      }
+      return { type: "link", link };
+    }
+    if (!isPlain) throw new Error("API result contains a non-data object.");
+    const output = Object.create(null);
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const key of Object.keys(descriptors)) {
+      const descriptor = descriptors[key];
+      if (!descriptor.enumerable) continue;
+      if (!Object.hasOwn(descriptor, "value") || DIRECT_API_BLOCKED_KEYS.has(key)) throw new Error("API result contains an accessor or prototype key.");
+      if (descriptor.value === undefined) continue;
+      budget.characters += key.length;
+      if (budget.characters > budget.limit) throw new Error("API result exceeds the limit.");
+      output[key] = serializeDirectValue(descriptor.value, budget, depth + 1, seen);
+    }
+    return output;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function normalizeDirectPluginApiSettings(value) {
+  const result = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  for (const id of Object.keys(value).sort().slice(0, 1000)) {
+    if (!id || id.length > 160 || /[\u0000-\u001f]/.test(id) || DIRECT_API_BLOCKED_KEYS.has(id)) continue;
+    const permission = value[id];
+    if (!permission || typeof permission !== "object" || Array.isArray(permission)) continue;
+    const version = typeof permission.autoVersion === "string" && permission.autoVersion.length <= 80 ? permission.autoVersion : "";
+    result[id] = { enabled: permission.enabled !== false, allowAutomaticExecution: permission.allowAutomaticExecution === true && !!version, autoVersion: version };
+  }
+  return result;
+}
+
 module.exports = {
+  normalizeDirectPluginApiSettings,
+  DirectApiAccess,
+  DIRECT_OBSIDIAN_METHODS,
   VaultReader
 };

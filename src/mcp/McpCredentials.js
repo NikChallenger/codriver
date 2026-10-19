@@ -83,6 +83,7 @@ class McpCredentialService {
   constructor(secretStorage, options = {}) {
     this.storage = secretStorage;
     this.stagedDrafts = new WeakMap();
+    this.oauthService = options.oauthService;
     this.access = new SecretStorageAccess(secretStorage, (code) => new McpCredentialError(code), "codriver-mcp-", options.createId);
   }
 
@@ -111,6 +112,7 @@ class McpCredentialService {
   }
 
   resolveCredential(server) {
+    if (server?.authMode === "oauth") throw new McpCredentialError("invalid-credential");
     const legacy = legacyHeaderText(server);
     if (endpointNeedsReview(server?.endpoint)) throw new McpCredentialError("needs-review");
     if (server?.credentialSchemaVersion !== CREDENTIAL_SCHEMA_VERSION) {
@@ -128,6 +130,7 @@ class McpCredentialService {
   }
 
   getStatus(server) {
+    if (server?.authMode === "oauth") return this.oauthService?.status(server) === "Connected" ? "" : "OAuth authorization is required. Connect in Settings.";
     if (server.transport !== "http") {
       try { return legacyHeaderText(server).trim() ? "Inactive HTTP credentials need migration. Retry in MCP settings." : ""; }
       catch { return "Inactive HTTP configuration needs review in MCP settings."; }
@@ -173,6 +176,7 @@ class McpCredentialService {
   }
 
   verifyDraft(draft, candidate) {
+    if (candidate.authMode === "oauth") { this.oauthService.verifyDraft(draft, candidate); return; }
     const staged = this.stagedDrafts.get(draft);
     if (draft.credentialAction === "replace" && candidate.authSecretName === staged?.name) {
       this.assertVerifiedValue(staged.name, staged.value);
@@ -181,6 +185,10 @@ class McpCredentialService {
   }
 
   async prepareDraft(draft, existing) {
+    if (draft.authMode === "oauth") {
+      if (!this.oauthService) throw new McpCredentialError("storage-unavailable");
+      return this.oauthService.prepareDraft(draft, existing);
+    }
     const candidate = { ...draft };
     const input = candidate.credentialInput;
     const action = candidate.credentialAction || "keep";

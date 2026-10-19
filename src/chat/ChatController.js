@@ -5,12 +5,14 @@ const {
   createSkillFromSource,
   MAX_TOTAL_SKILL_AUXILIARY_CHARACTERS
 } = require("../skills/SkillFileParser");
-const { VaultReader } = require("../vault/VaultReader");
+const { VaultReader, DirectApiAccess } = require("../vault/VaultReader");
 const { VaultWriter } = require("../vault/VaultWriter");
+const { CanvasValidationError } = require("../vault/CanvasDocument");
 const { parseModelResponseForMcpToolCalls } = require("./McpToolCallParser");
 const { createPendingPatchProposal } = require("./ChangeApproval");
 const { capturePatchWorkList } = require("./PatchWorkList");
 const { createCoreSystemPrompt } = require("./CorePrompt");
+const { getBuiltinSkill } = require("../skills/BuiltinSkills");
 const {
   GEMINI_PROVIDER_TYPE,
   MCP_HTTP_TRANSPORT,
@@ -31,6 +33,7 @@ const {
 const { validateExternalMcpToolArguments, validateMcpToolArguments } = require("../mcp/McpArgumentValidator");
 const {
   CODRIVER_ACTIVE_FILE_GET_PATH_TOOL_NAME,
+  CODRIVER_API_CALL_TOOL_NAME,
   CODRIVER_INTERNAL_TRANSPORT,
   CODRIVER_OPEN_FILE_TOOL_NAME,
   CODRIVER_TAG_LIST_TOOL_NAME,
@@ -47,6 +50,8 @@ const {
   CODRIVER_VAULT_SEARCH_STRUCTURED_TOOL_NAME,
   CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME,
   VAULT_AUDIO_AUTO_CONSENT_VERSION,
+  TEXT_DOCUMENT_AUTO_CONSENT_VERSION,
+  TEXT_DOCUMENT_MUTATION_TOOLS,
   CODRIVER_VAULT_SERVER_ID,
   CODRIVER_VAULT_SERVER_NAME,
   createCodriverVaultMcpServer
@@ -63,6 +68,7 @@ const {
 const {
   AudioTranscriptionError,
   AudioTranscriptionService,
+  VoiceInputSession,
   DEFAULT_MAX_AUDIO_FILES,
   DEFAULT_TRANSCRIPTION_TIMEOUT_MS
 } = require("../attachments/AudioTranscriptionService");
@@ -73,7 +79,9 @@ const {
   REQUEST_CONTEXT_CHARS_STEP
 } = require("../settings/defaults");
 const {
-  resolveAudioTranscriptionSelection
+  resolveAudioTranscriptionSelection,
+  normalizeVoiceInputSettings,
+  resolveVoiceInputSelection
 } = require("../settings/AudioTranscriptionSettings");
 const {
   createSessionTitle,
@@ -85,6 +93,7 @@ const COMMAND_CONTEXT = Symbol("command-context");
 const NORMAL_SESSION_MODE = "normal";
 const COMMAND_ACTION_SESSION_MODE = "command-action";
 const MAX_MODEL_ROUTED_SKILLS = 3;
+const MAX_SESSION_SKILL_EXCLUSIONS = 1000;
 const MAX_ATTACHMENT_COUNT = 8;
 const MAX_ATTACHMENT_CONTEXT_CHARS = 240000;
 const DEFAULT_MAX_MCP_TOOL_RESULT_CHARS = 60000;
@@ -138,11 +147,11 @@ const CODRIVER_VAULT_NATIVE_TOOL_DESCRIPTIONS = Object.freeze({
   [CODRIVER_ACTIVE_FILE_GET_PATH_TOOL_NAME]: "Return the vault-relative path of the file currently open in Obsidian without reading it.",
   [CODRIVER_VAULT_LIST_TOOL_NAME]: "List files and folders under a vault-relative directory path.",
   [CODRIVER_VAULT_MOVE_FILE_TOOL_NAME]: "Move or rename one exact existing vault file to an exact missing path, creating reviewed missing parent folders.",
-  [CODRIVER_VAULT_READ_TOOL_NAME]: "Read the full Markdown content of one exact vault-relative note path.",
-  [CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]: "Create one new Markdown note at an exact missing vault-relative path without overwriting.",
+  [CODRIVER_VAULT_READ_TOOL_NAME]: "Read saved Markdown text or Canvas JSON for one exact vault path without reading referenced files.",
+  [CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]: "Create a new Markdown note or JSON Canvas at an exact missing vault-relative path without overwriting. Canvas uses root nodes/edges arrays and cards with geometry, not content.blocks.",
   [CODRIVER_VAULT_DELETE_NOTE_TOOL_NAME]: "Move one exact existing Markdown note to the vault's local trash.",
   [CODRIVER_VAULT_APPEND_NOTE_TOOL_NAME]: "Append non-empty Markdown to the end of one exact existing note.",
-  [CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]: "Prepare a stale-safe reviewable body or frontmatter patch for one existing note.",
+  [CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]: "Prepare exact text changes for Markdown or validated Canvas; frontmatter is Markdown-only. Canvas requires a settled editor and is not reloaded.",
   [CODRIVER_VAULT_READ_TARGET_TOOL_NAME]: "Read one confirmed heading, block reference, or frontmatter field without reading the whole note.",
   [CODRIVER_VAULT_SEARCH_TOOL_NAME]: "Search Markdown notes by text and return exact paths with bounded excerpts.",
   [CODRIVER_VAULT_SEARCH_STRUCTURED_TOOL_NAME]: "Search notes with structured text, path, tag, frontmatter, date, sorting, and result-limit filters.",
@@ -174,11 +183,11 @@ function normalizeChatSessionId(value) {
   return /^[A-Za-z0-9._-]{1,160}$/.test(sessionId) ? sessionId : "";
 }
 
-function normalizeMarkdownVaultPath(value) {
+function normalizeActiveNoteVaultPath(value) {
   const path = normalizeVaultPath(value);
   if (
     !path ||
-    !path.toLowerCase().endsWith(".md") ||
+    !/\.(?:md|canvas)$/i.test(path) ||
     /[\u0000-\u001f]/.test(path) ||
     path.split("/").some((segment) => segment === "." || segment === "..")
   ) {
@@ -188,12 +197,22 @@ function normalizeMarkdownVaultPath(value) {
   return path;
 }
 
+function isCanvasDocumentPath(value) {
+  return typeof value === "string" && value.toLowerCase().endsWith(".canvas");
+}
+
+function normalizeSessionSkillExclusions(value) {
+  return [...new Set((Array.isArray(value) ? value : []).slice(0, MAX_SESSION_SKILL_EXCLUSIONS)
+    .filter((id) => typeof id === "string" && id.trim() && id.length <= 256 && !/[\u0000-\u001f\u007f]/.test(id))
+    .map((id) => id.trim()))];
+}
+
 function getVaultPathName(path) {
   return String(path || "").split("/").pop() || "";
 }
 
 function normalizeActiveNotePathContext(value) {
-  const path = normalizeMarkdownVaultPath(value?.path);
+  const path = normalizeActiveNoteVaultPath(value?.path);
   return {
     included: Boolean(path && value?.included !== false),
     path
@@ -392,7 +411,7 @@ function serializeMcpToolCallForDisplay(toolCall) {
     patchApplied: toolCall.patchApplied === true,
     requiresLiveChain: toolCall.requiresLiveChain === true,
     patchAppliedAutomatically: toolCall.patchAppliedAutomatically === true,
-    automaticPermissionReadonly: toolCall.automaticPermissionReadonly === true,
+    automaticPermissionReadonly: isDirectApiToolCall(toolCall) || toolCall.automaticPermissionReadonly === true,
     createNoteReview: serializeCreateNoteReview(toolCall.createNoteReview, false),
     moveFileReview: serializeFileMoveReview(toolCall.moveFileReview),
     audioTranscriptionReview: serializeAudioTranscriptionReview(toolCall.audioTranscriptionReview),
@@ -402,6 +421,14 @@ function serializeMcpToolCallForDisplay(toolCall) {
 }
 
 function serializeMcpToolCallForSession(toolCall) {
+  if (isDirectApiToolCall(toolCall)) {
+    return {
+      id: toolCall.id, serverId: toolCall.serverId, serverName: toolCall.serverName,
+      toolName: toolCall.toolName, toolTitle: toolCall.toolTitle,
+      arguments: {}, status: ["complete", "error"].includes(toolCall.status) ? toolCall.status : "cancelled", time: toolCall.time, createdAt: toolCall.createdAt,
+      error: toolCall.status === "complete" ? "" : "API request context is not stored. Send a new request.", requiresLiveChain: true, automaticPermissionReadonly: true
+    };
+  }
   const createNoteToolCall = isCodriverVaultCreateNoteToolCall(toolCall);
   const deleteNoteToolCall = isCodriverVaultDeleteNoteToolCall(toolCall);
   const patchNoteToolCall = isCodriverVaultPatchNoteToolCall(toolCall);
@@ -448,7 +475,7 @@ function serializeMcpToolCallForSession(toolCall) {
     patchApplied: toolCall.patchApplied === true,
     requiresLiveChain: toolCall.requiresLiveChain === true,
     patchAppliedAutomatically: toolCall.patchAppliedAutomatically === true,
-    automaticPermissionReadonly: toolCall.automaticPermissionReadonly === true,
+    automaticPermissionReadonly: isDirectApiToolCall(toolCall) || toolCall.automaticPermissionReadonly === true,
     createNoteReview: serializeCreateNoteReview(toolCall.createNoteReview, true),
     moveFileReview: serializeFileMoveReview(toolCall.moveFileReview),
     audioTranscriptionReview: serializeAudioTranscriptionReview(toolCall.audioTranscriptionReview),
@@ -1164,7 +1191,7 @@ function deserializeMcpToolCall(toolCall) {
     patchApplied: toolCall.patchApplied === true,
     requiresLiveChain: toolCall.requiresLiveChain === true,
     patchAppliedAutomatically: toolCall.patchAppliedAutomatically === true,
-    automaticPermissionReadonly: toolCall.automaticPermissionReadonly === true,
+    automaticPermissionReadonly: isDirectApiToolCall(toolCall) || toolCall.automaticPermissionReadonly === true,
     createNoteReview: serializeCreateNoteReview(toolCall.createNoteReview, true),
     moveFileReview: serializeFileMoveReview(toolCall.moveFileReview),
     audioTranscriptionReview: serializeAudioTranscriptionReview(toolCall.audioTranscriptionReview),
@@ -1273,8 +1300,13 @@ class ChatController {
     this.sessionStorage = sessionStorage;
     this.persistSettings = typeof persistSettings === "function" ? persistSettings : async () => {};
     this.vaultReader = new VaultReader(app);
+    this.directApiAccess = new DirectApiAccess(app);
     this.diagnostics = diagnostics;
-    this.vaultWriter = new VaultWriter(app.vault, app.fileManager, this.diagnostics);
+    this.vaultWriter = new VaultWriter(app.vault, app.fileManager, this.diagnostics,
+      (file, before) => {
+        if (typeof this.runtimeSupport.guardCanvasWrite !== "function") throw new Error("Canvas write synchronization is unavailable.");
+        return this.runtimeSupport.guardCanvasWrite(file, before);
+      });
     this.skillRegistry = new SkillRegistry();
     this.frontmatterSkillMatcher = new FrontmatterSkillMatcher();
     this.externalSkillIds = [];
@@ -1286,6 +1318,20 @@ class ChatController {
         getAdapter: (configuration) => this.createAudioTranscriptionAdapter(configuration),
         diagnostics: this.diagnostics
       });
+    this.voiceSessionRevision = 0;
+    this.voiceInput = new VoiceInputSession({
+      getConfiguration: () => this.getVoiceInputConfiguration(),
+      createCapture: this.runtimeSupport.createVoiceCapture,
+      transcribe: (request, configuration) => this.createAudioTranscriptionAdapter(configuration).transcribe({
+        ...request, fileName: "voice-input.wav", mimeType: "audio/wav"
+      }),
+      onChange: (state) => {
+        if (state.phase === "error") {
+          void this.logDiagnostic("voice.input.failed", { status: "error", message: state.error }).catch(() => {});
+        }
+        void this.notifyStateChanged({ type: "voice-input" });
+      }
+    });
     this.sending = false;
     this.activeRequest = null;
     this.messages = this.isCommandActionSession() ? [] : [createWelcomeMessage()];
@@ -1296,7 +1342,9 @@ class ChatController {
     this.attachments = [];
     this.draftAttachments = [];
     this.activeNoteContextSuppressed = false;
-    this.activeNoteContextPath = this.getCurrentActiveMarkdownPath();
+    this.automaticActiveNoteContextEnabled = this.settings.enableAutomaticActiveNoteContext !== false;
+    this.activeNoteContextOrigin = "automatic";
+    this.activeNoteContextPath = this.automaticActiveNoteContextEnabled ? this.getCurrentActiveNotePath() : "";
     this.requestInfo = createEmptyRequestInfo();
     this.requestInfoById = new Map();
     this.sessionRequestInfoByPath = new Map();
@@ -1306,6 +1354,7 @@ class ChatController {
     this.pendingMcpLimitActions = new Map();
     this.resolvingMcpLimitAction = false;
     this.lastRequestAutoSkillIds = [];
+    this.suppressedModelSkillIds = new Set();
     this.manualMcpServerIds = new Set(this.getDefaultManualMcpServerIds());
     this.skillMcpResolution = {
       ok: true,
@@ -1324,8 +1373,14 @@ class ChatController {
   }
 
   updateSettings(settings, providerRegistry) {
+    const wasAutomaticActiveNoteContextEnabled = this.automaticActiveNoteContextEnabled;
     this.settings = settings;
+    this.automaticActiveNoteContextEnabled = settings.enableAutomaticActiveNoteContext !== false;
+    if (wasAutomaticActiveNoteContextEnabled !== this.automaticActiveNoteContextEnabled) {
+      if (this.automaticActiveNoteContextEnabled) this.handleActiveFileChange();
+    }
     this.providerRegistry = providerRegistry;
+    this.voiceInput.revalidate();
     this.pruneManualMcpServerIds();
     this.applySkillAvailabilitySettings();
     this.loadCommands(this.commands);
@@ -1374,7 +1429,6 @@ class ChatController {
   }
 
   getAudioAttachmentProcessingConfiguration(selectionOverride = null) {
-    const platform = this.runtimeSupport.getPlatform?.() === "mobile" ? "mobile" : "desktop";
     const scopedSettings = selectionOverride && typeof selectionOverride === "object"
       ? {
           ...this.settings,
@@ -1386,6 +1440,11 @@ class ChatController {
         }
       : this.settings;
     const selection = resolveAudioTranscriptionSelection(scopedSettings);
+    return this.getTranscriptionConfiguration(selection);
+  }
+
+  getTranscriptionConfiguration(selection) {
+    const platform = this.runtimeSupport.getPlatform?.() === "mobile" ? "mobile" : "desktop";
     const providerId = selection.providerId;
     const provider = providerId ? this.providerRegistry.get(providerId) : null;
     const endpoint = typeof provider?.endpoint === "string" ? provider.endpoint : "";
@@ -1430,6 +1489,52 @@ class ChatController {
       throw new AudioTranscriptionError("transcription-not-configured", configuration.error);
     }
     return configuration.provider.createAudioTranscriptionAdapter();
+  }
+
+  getVoiceInputConfiguration() {
+    const voiceInput = normalizeVoiceInputSettings(this.settings.voiceInput);
+    const configuration = this.getTranscriptionConfiguration(resolveVoiceInputSelection(this.settings));
+    if (configuration.platform === "mobile") configuration.error = "Voice input is available only in the desktop app.";
+    const enabled = voiceInput.enabled;
+    const draftProvider = this.settings.providers?.find((provider) => provider.id === configuration.providerId);
+    const providerIsCurrent = (typeof draftProvider?.endpoint !== "string" || draftProvider.endpoint === configuration.endpoint) &&
+      (typeof draftProvider?.apiKeySecretName !== "string" || draftProvider.apiKeySecretName === configuration.authenticationPath);
+    let providerBinding = "";
+    let credentialsAvailable = true;
+    try { providerBinding = configuration.provider?.getContinuationBinding?.() ?? ""; }
+    catch { credentialsAvailable = false; }
+    const available = enabled && !configuration.error && !this.isCommandActionSession() && providerIsCurrent && credentialsAvailable;
+    return {
+      ...configuration,
+      enabled,
+      available,
+      timeoutMs: voiceInput.timeoutSeconds * 1000,
+      binding: JSON.stringify([this.currentSessionId, this.voiceSessionRevision, enabled,
+        configuration.providerId, configuration.model, configuration.endpoint, configuration.authenticationPath,
+        providerBinding, voiceInput.timeoutSeconds])
+    };
+  }
+
+  isVoiceInputBusy() {
+    return ["starting", "recording", "transcribing"].includes(this.voiceInput.state.phase);
+  }
+
+  isVoiceInputResultCurrent(result) {
+    const configuration = this.getVoiceInputConfiguration();
+    return configuration.available && result?.binding === configuration.binding && result.revision === this.voiceInput.resultRevision;
+  }
+
+  startVoiceInput() {
+    if (this.isSending() || this.isCommandActionSession()) return Promise.resolve(false);
+    return this.voiceInput.start();
+  }
+
+  stopVoiceInput() {
+    return this.voiceInput.stop();
+  }
+
+  cancelVoiceInput() {
+    this.voiceInput.cancel();
   }
 
   async selectProvider(providerId) {
@@ -2177,7 +2282,7 @@ class ChatController {
   }
 
   canSendDraft(content) {
-    if (this.sending || this.pendingContextBudgetOverrides.size > 0 || this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning || this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction || this.hasPendingDraftAttachments() || !this.getSelectedModelId()) {
+    if (this.isVoiceInputBusy() || this.sending || this.pendingContextBudgetOverrides.size > 0 || this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning || this.pendingMcpLimitActions.size > 0 || this.resolvingMcpLimitAction || this.hasPendingDraftAttachments() || !this.getSelectedModelId()) {
       return false;
     }
 
@@ -2491,6 +2596,7 @@ class ChatController {
   }
 
   async startNewSession(options = {}) {
+    this.cancelVoiceInput();
     if (this.sending || this.resolvingMaxToolsWarning || this.resolvingMcpLimitAction) {
       return {
         ok: false,
@@ -2512,10 +2618,12 @@ class ChatController {
     this.attachments = [];
     this.draftAttachments = [];
     this.activeNoteContextSuppressed = false;
-    this.activeNoteContextPath = this.getCurrentActiveMarkdownPath();
+    this.activeNoteContextOrigin = "automatic";
+    this.activeNoteContextPath = this.automaticActiveNoteContextEnabled ? this.getCurrentActiveNotePath() : "";
     this.requestInfo = createEmptyRequestInfo();
     this.requestInfoById.clear();
     this.lastRequestAutoSkillIds = [];
+    this.suppressedModelSkillIds.clear();
     this.manualMcpServerIds = new Set(this.getDefaultManualMcpServerIds());
     this.refreshSkillMcpAttachmentState();
     this.currentSessionPath = null;
@@ -2670,12 +2778,15 @@ class ChatController {
       mcpToolCalls: this.mcpToolCalls.map(serializeMcpToolCallForSession),
       attachments: this.attachments.map(serializeAttachment),
       activeNoteContextPath: this.activeNoteContextPath,
+      activeNoteContextOrigin: this.activeNoteContextOrigin,
       activeNoteContextSuppressed: this.activeNoteContextSuppressed === true,
+      suppressedModelSkillIds: normalizeSessionSkillExclusions([...this.suppressedModelSkillIds]),
       manualMcpServerIds: this.getManualMcpServerIds()
     };
   }
 
   restoreSessionSnapshot(snapshot, options = {}) {
+    this.cancelVoiceInput();
     this.pendingContextBudgetOverrides.clear();
     this.pendingMaxToolsWarnings.clear();
     this.resolvingMaxToolsWarning = false;
@@ -2707,7 +2818,10 @@ class ChatController {
       snapshot ?? {},
       "activeNoteContextSuppressed"
     );
-    this.activeNoteContextPath = normalizeMarkdownVaultPath(snapshot?.activeNoteContextPath);
+    this.activeNoteContextPath = normalizeActiveNoteVaultPath(snapshot?.activeNoteContextPath);
+    this.activeNoteContextOrigin = ["manual", "automatic"].includes(snapshot?.activeNoteContextOrigin)
+      ? snapshot.activeNoteContextOrigin
+      : "legacy";
     this.activeNoteContextSuppressed = hasStoredActiveNoteState
       ? snapshot.activeNoteContextSuppressed === true
       : !this.activeNoteContextPath;
@@ -2724,6 +2838,7 @@ class ChatController {
     }
 
     this.lastRequestAutoSkillIds = [];
+    this.suppressedModelSkillIds = new Set(normalizeSessionSkillExclusions(snapshot?.suppressedModelSkillIds));
     this.refreshSkillMcpAttachmentState();
   }
 
@@ -2743,6 +2858,8 @@ class ChatController {
   }
 
   setCurrentSessionId(sessionId) {
+    this.voiceSessionRevision += 1;
+    this.cancelVoiceInput();
     this.currentSessionId = normalizeChatSessionId(sessionId) || createId("session");
     this.syncDiagnosticSessionId();
   }
@@ -2817,7 +2934,7 @@ class ChatController {
 
   getVisibleActiveSkills() {
     if (this.isCommandActionSession()) return [];
-    return this.skillRegistry.listActive().filter((skill) => !skill.hidden);
+    return this.skillRegistry.listActive().filter((skill) => !skill.hidden && !this.isSkillSuppressedForSession(skill));
   }
 
   getSkillsForSettings() {
@@ -2833,7 +2950,9 @@ class ChatController {
         availabilityReason: skill.availabilityReason || "",
         metadataWarning: skill.metadataWarning || "",
         approximateTokens: Math.ceil(String(skill.systemPrompt || "").length / 4),
-        sourcePath: skill.sourcePath
+        sourcePath: skill.sourcePath,
+        builtin: Boolean(skill.builtinId || getBuiltinSkill(skill.id)),
+        builtinId: skill.builtinId || getBuiltinSkill(skill.id)?.id
       }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -2849,10 +2968,15 @@ class ChatController {
   }
 
   isSkillAvailableForRetainedRequest(skill) {
-    if (!skill || skill.enabled === false || skill.available === false) {
+    if (!skill || skill.enabled === false || skill.available === false || this.isSkillSuppressedForSession(skill)) {
       return false;
     }
     return skill.invocation !== "manual" || this.skillRegistry.isActive(skill.id);
+  }
+
+  isSkillSuppressedForSession(skill) {
+    return Boolean(skill && skill.invocation === "model" && !skill.hidden && !skill.required &&
+      this.suppressedModelSkillIds.has(skill.id));
   }
 
   getVisibleSkillContexts() {
@@ -2862,7 +2986,7 @@ class ChatController {
     const contexts = [];
 
     for (const skill of this.skillRegistry.listActive()) {
-      if (skill.hidden) {
+      if (skill.hidden || this.isSkillSuppressedForSession(skill)) {
         continue;
       }
 
@@ -2872,6 +2996,7 @@ class ChatController {
         id: skill.id,
         name: skill.name,
         source: "skill",
+        invocation: skill.invocation,
         removable: skill.invocation !== "always",
         dependencyError,
         dependencyMessage: dependencyError
@@ -2890,7 +3015,8 @@ class ChatController {
         id: skill.id,
         name: skill.name,
         source: "skill",
-        removable: false,
+        invocation: skill.invocation,
+        removable: true,
         dependencyError,
         dependencyMessage: dependencyError
           ? this.getMcpDependencyBlockedMessage({ errors: [dependencyError] })
@@ -2903,6 +3029,7 @@ class ChatController {
 
   getSkillActivationLabel(skillId) {
     if (this.isCommandActionSession()) return "";
+    if (this.isSkillSuppressedForSession(this.skillRegistry.get(skillId))) return "";
     if (this.skillRegistry.isActive(skillId)) {
       const skill = this.skillRegistry.get(skillId);
       return skill ? `skill ${skill.name}` : "skill";
@@ -2920,15 +3047,15 @@ class ChatController {
     return this.getContextState().label;
   }
 
-  getCurrentActiveMarkdownPath() {
-    const activeNote = this.vaultReader.getActiveMarkdownContextInfo();
-    return activeNote.available ? normalizeMarkdownVaultPath(activeNote.path) : "";
+  getCurrentActiveNotePath() {
+    const activeNote = this.vaultReader.getActiveNoteContextInfo();
+    return activeNote.available ? normalizeActiveNoteVaultPath(activeNote.path) : "";
   }
 
   getActiveNoteContextState() {
-    const activeNote = this.vaultReader.getActiveMarkdownContextInfo();
-    const currentPath = activeNote.available ? normalizeMarkdownVaultPath(activeNote.path) : "";
-    const selectedPath = normalizeMarkdownVaultPath(this.activeNoteContextPath);
+    const activeNote = this.vaultReader.getActiveNoteContextInfo();
+    const currentPath = activeNote.available ? normalizeActiveNoteVaultPath(activeNote.path) : "";
+    const selectedPath = this.getSelectedActiveNoteContextPath();
 
     return {
       available: Boolean(currentPath),
@@ -2945,7 +3072,8 @@ class ChatController {
     if (!this.isCommandActionSession()) return this.getActiveNoteContextState();
     if (command?.requiresActiveNote === true) {
       this.activeNoteContextSuppressed = false;
-      this.activeNoteContextPath = this.getCurrentActiveMarkdownPath();
+      this.activeNoteContextOrigin = "automatic";
+      this.activeNoteContextPath = this.automaticActiveNoteContextEnabled ? this.getCurrentActiveNotePath() : "";
     } else {
       this.activeNoteContextSuppressed = true;
       this.activeNoteContextPath = "";
@@ -2958,13 +3086,14 @@ class ChatController {
   }
 
   handleActiveFileChange() {
-    if (this.activeNoteContextSuppressed) {
+    if (this.activeNoteContextSuppressed || !this.automaticActiveNoteContextEnabled) {
       return this.getActiveNoteContextState();
     }
 
-    const nextPath = this.getCurrentActiveMarkdownPath();
+    const nextPath = this.getCurrentActiveNotePath();
     if (nextPath !== this.activeNoteContextPath) {
       this.activeNoteContextPath = nextPath;
+      this.activeNoteContextOrigin = "automatic";
       void this.persistCurrentSession();
     }
 
@@ -2972,19 +3101,19 @@ class ChatController {
   }
 
   handleVaultFileRename(file, oldPath) {
-    const sourcePath = normalizeMarkdownVaultPath(oldPath);
+    const sourcePath = normalizeActiveNoteVaultPath(oldPath);
     if (!sourcePath || sourcePath !== this.activeNoteContextPath) {
       return this.getActiveNoteContextState();
     }
 
-    const destinationPath = normalizeMarkdownVaultPath(file?.path);
+    const destinationPath = normalizeActiveNoteVaultPath(file?.path);
     this.activeNoteContextPath = destinationPath;
     void this.persistCurrentSession();
     return this.getActiveNoteContextState();
   }
 
   handleVaultFileDelete(file) {
-    const deletedPath = normalizeMarkdownVaultPath(file?.path);
+    const deletedPath = normalizeActiveNoteVaultPath(file?.path);
     if (deletedPath && deletedPath === this.activeNoteContextPath) {
       this.activeNoteContextPath = "";
       void this.persistCurrentSession();
@@ -2994,7 +3123,7 @@ class ChatController {
   }
 
   addActiveNoteContext() {
-    const path = this.getCurrentActiveMarkdownPath();
+    const path = this.getCurrentActiveNotePath();
     if (!path) {
       return {
         ok: false,
@@ -3004,6 +3133,7 @@ class ChatController {
 
     this.activeNoteContextSuppressed = false;
     this.activeNoteContextPath = path;
+    this.activeNoteContextOrigin = "manual";
     void this.persistCurrentSession();
     return {
       ok: true,
@@ -3021,11 +3151,19 @@ class ChatController {
   }
 
   getActiveNotePathContextForRequest() {
-    const path = normalizeMarkdownVaultPath(this.activeNoteContextPath);
+    const path = this.getSelectedActiveNoteContextPath();
     return {
       included: Boolean(path),
       path
     };
+  }
+
+  getSelectedActiveNoteContextPath() {
+    if (this.activeNoteContextSuppressed ||
+      (!this.automaticActiveNoteContextEnabled && this.activeNoteContextOrigin !== "manual")) {
+      return "";
+    }
+    return normalizeActiveNoteVaultPath(this.activeNoteContextPath);
   }
 
   getRequestContextSummary() {
@@ -3090,8 +3228,10 @@ class ChatController {
       };
     }
 
+    this.suppressedModelSkillIds.delete(skillId);
     this.skillRegistry.activate(skillId);
     this.refreshSkillMcpAttachmentState();
+    void this.persistCurrentSession();
     return {
       ok: true,
       changed: false,
@@ -3100,12 +3240,32 @@ class ChatController {
   }
 
   deactivateSkill(skillId) {
+    const skill = this.skillRegistry.get(skillId);
+    if (!skill || skill.hidden || skill.required || skill.invocation === "always") return;
     this.skillRegistry.deactivate(skillId);
+    if (skill.invocation === "model") {
+      this.suppressedModelSkillIds.add(skillId);
+      this.lastRequestAutoSkillIds = this.lastRequestAutoSkillIds.filter((id) => id !== skillId);
+      const states = new Set([
+        this.activeRequest?.mcpChainState,
+        ...this.mcpToolCalls.map((call) => this.mcpToolChainStates.get(call)),
+        ...[...this.pendingContextBudgetOverrides.values()].map((action) => action.chainState)
+      ]);
+      for (const state of states) {
+        if (state?.requestSkillIds?.includes(skillId)) {
+          this.stopPatchChain(state, "A request skill was removed from this session. Send a new request with the current context.");
+        }
+      }
+      if (this.activeRequest?.requestSkillIds?.includes(skillId)) this.cancelActiveRequest();
+      if (this.pendingRequestContinuation?.requestSkillIds?.includes(skillId)) this.pendingRequestContinuation = null;
+    }
     this.refreshSkillMcpAttachmentState();
+    void this.persistCurrentSession();
+    void this.notifyStateChanged();
   }
 
   isSkillActive(skillId) {
-    return this.skillRegistry.isActive(skillId);
+    return this.skillRegistry.isActive(skillId) && !this.isSkillSuppressedForSession(this.skillRegistry.get(skillId));
   }
 
   handleDraftInput(value) {
@@ -3142,7 +3302,10 @@ class ChatController {
     proposal.continuationError = "";
     const authorization = {
       status: "authorized",
-      source: "per-call-approval"
+      source: "per-call-approval",
+      ...(proposal.notePath?.toLowerCase().endsWith(".canvas") ? {
+        isCurrent: () => this.isCanvasToolAuthorizationCurrent(this.mcpToolCalls.find((call) => call.id === proposal.originToolCallId))
+      } : {})
     };
     proposal.applicationAuthorizationSource = authorization.source;
     void this.notifyStateChanged();
@@ -3175,7 +3338,7 @@ class ChatController {
     }
     await this.persistCurrentSession();
     await this.notifyStateChanged();
-    return { ok: true, applied: true, message: proposal.continuationError || "Note update applied." };
+    return { ok: true, applied: true, message: proposal.continuationError || proposal.canvasSynchronizationWarning || "Note update applied." };
   }
 
   getAudioCreateChainBlock(chainState, executingCall = null) {
@@ -3195,7 +3358,9 @@ class ChatController {
   }
 
   getPatchChainBlock(chainState) {
-    if (!chainState?.hasPatchReview) return null;
+    if (!chainState) return null;
+    if (chainState.stopped) return { ok: false, reason: "patch-chain-stopped", message: chainState.stopped };
+    if (!chainState.hasPatchReview) return null;
     if (chainState.stopped || chainState.sessionId !== this.currentSessionId || this.isRequestCancelled(chainState.activeRequest)) {
       return { ok: false, reason: "patch-chain-stopped", message: chainState.stopped || "The originating request stopped. Send a new request to continue." };
     }
@@ -3246,11 +3411,11 @@ class ChatController {
     this.clearProviderContinuationContext(chainState);
   }
 
-  finishPatchChainAfterManualAcceptance(chainState) {
+  finishPatchChainAfterManualAcceptance(chainState, stopMessage = "This dependent tool call was not executed because the request ended after manual patch acceptance. Send a new request for remaining work.") {
     if (!chainState) return;
     const state = this.ensureMcpToolChainState(chainState);
     const diagnostic = createMcpToolChainDiagnostic(state);
-    const message = "This dependent tool call was not executed because the request ended after manual patch acceptance. Send a new request for remaining work.";
+    const message = stopMessage;
     let cancelledToolCallCount = 0;
     state.stopped = message;
     state.pendingPatchIds.clear();
@@ -3384,6 +3549,10 @@ class ChatController {
     this.cancelProposalContinuation(proposalId);
 
     try {
+      if (proposal.notePath?.toLowerCase().endsWith(".canvas")) proposal.canvasRollbackAuthorization = {
+        status: "authorized", source: "per-call-approval", isCurrent: () => this.areCoDriverVaultToolsEnabled() &&
+          this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.enabled !== false
+      };
       await this.vaultWriter.rollbackApprovedChange(proposal);
       proposal.status = "rolled-back";
       proposal.applicationState = "rolled-back";
@@ -3391,7 +3560,7 @@ class ChatController {
       await this.persistCurrentSession();
       return {
         ok: true,
-        message: "Note update rolled back."
+        message: proposal.canvasSynchronizationWarning || "Note update rolled back."
       };
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown rollback error.";
@@ -3405,6 +3574,7 @@ class ChatController {
   }
 
   async sendMessage(content, options = {}) {
+    if (this.isVoiceInputBusy()) return { ok: false, reason: "voice-input-busy" };
     if (this.pendingMaxToolsWarnings.size > 0 || this.resolvingMaxToolsWarning) {
       return {
         ok: false,
@@ -4254,7 +4424,8 @@ class ChatController {
         Object.assign(existing, {
           status: toolCall.status, output: toolCall.output || "", error: toolCall.error || "",
           patchProposalId: toolCall.patchProposalId || "", patchApplied: toolCall.patchApplied === true,
-          patchAppliedAutomatically: toolCall.patchAppliedAutomatically === true
+          patchAppliedAutomatically: toolCall.patchAppliedAutomatically === true,
+          canvasPatchValidationFailed: toolCall.canvasPatchValidationFailed === true
         });
         return existing;
       }
@@ -4289,6 +4460,7 @@ class ChatController {
       patchApplied: toolCall.patchApplied === true,
       requiresLiveChain: toolCall.requiresLiveChain === true,
       patchAppliedAutomatically: toolCall.patchAppliedAutomatically === true,
+      canvasPatchValidationFailed: toolCall.canvasPatchValidationFailed === true,
       providerCallId: typeof toolCall.providerCallId === "string" ? toolCall.providerCallId : "",
       createdAt: toolCall.createdAt
     };
@@ -4387,7 +4559,7 @@ class ChatController {
     if (!toolCalls.some(isAutomaticMcpToolCallReady)) {
       const first = toolCalls[0];
       return first &&
-        toolCalls.some((toolCall) => toolCall.argumentValidationFailed === true) &&
+        toolCalls.some((toolCall) => toolCall.argumentValidationFailed === true || toolCall.canvasValidationFailed === true || toolCall.apiAvailabilityFailed === true) &&
         toolCalls.every((toolCall) => !isBlockingMcpToolGroupFollowUp(toolCall))
         ? this.continueAfterMcpToolGroupIfReady(first, {
             activeRequest: options.activeRequest,
@@ -4730,7 +4902,7 @@ class ChatController {
         "The previous response did not use a tool even though the user requested a change to an existing note.",
         "Do not show a proposed replacement, patch object, JSON draft, or completed-change claim as ordinary chat text.",
         "If the requested change is fully determined, call exactly one appropriate tool from the current catalog now.",
-        "For an existing-note body or frontmatter edit, use CoDriver Vault.codriver_vault_patch_note when it is available. This always prepares a proposal card. By default the user reviews it before application; an explicit exact-tool automatic permission may apply a newly prepared proposal through the same stale-safe path.",
+        "For existing Markdown body/frontmatter edits or Canvas JSON text edits, use CoDriver Vault.codriver_vault_patch_note when it is available. This always prepares a proposal card. By default the user reviews it before application; an explicit exact-tool automatic permission may apply a newly prepared proposal through the same stale-safe path.",
         "If exact current context is still missing, call exactly one appropriate read-only tool instead.",
         "If a user decision is required before any tool can be called, ask exactly one concise clarification question and do not include a draft change.",
         "Never invent a tool name and never emit a codriver-proposal block."
@@ -4991,6 +5163,7 @@ class ChatController {
         error: resolved.message,
         output: "",
         requestInfoId,
+        automaticPermissionReadonly: normalizedCandidate.toolName === CODRIVER_API_CALL_TOOL_NAME && ["", CODRIVER_VAULT_SERVER_ID, CODRIVER_VAULT_SERVER_NAME].includes(normalizedCandidate.serverId || ""),
         allowAutomaticExecution: false
       };
     }
@@ -5029,6 +5202,16 @@ class ChatController {
       };
     }
     let createNoteReview = null;
+    if (resolved.tool.name === CODRIVER_API_CALL_TOOL_NAME && resolved.server.id === CODRIVER_VAULT_SERVER_ID) {
+      const unavailable = this.directApiAccess.availabilityMessage(resolved.candidate.arguments, this.settings);
+      if (unavailable) return {
+        id: createId("mcp-tool"), serverId: resolved.server.id, serverName: resolved.server.name,
+        toolName: resolved.tool.name, toolTitle: resolved.tool.title || resolved.tool.name,
+        arguments: cloneJsonValue(resolved.candidate.arguments ?? {}), status: "error",
+        time: currentTimeLabel(), createdAt: now, error: unavailable, output: "", requestInfoId,
+        allowAutomaticExecution: false, automaticPermissionReadonly: true, apiAvailabilityFailed: true
+      };
+    }
     let deleteNoteReview = null;
     let moveFileReview = null;
     let audioTranscriptionReview = null;
@@ -5049,6 +5232,7 @@ class ChatController {
         };
       } catch (error) {
         const detail = error instanceof Error ? error.message : "Invalid create-note request.";
+        const canvasValidationFailed = error instanceof CanvasValidationError && resolved.candidate.arguments.path?.toLowerCase().endsWith(".canvas");
         return {
           id: createId("mcp-tool"),
           serverId: resolved.server.id,
@@ -5060,7 +5244,8 @@ class ChatController {
           time: currentTimeLabel(),
           createdAt: now,
           error: detail,
-          output: "",
+          output: canvasValidationFailed ? "Canvas creation was rejected before any vault mutation. Correct the Canvas JSON and submit a new Create note call. A corrected call still requires approval or this exact tool's Auto permission." : "",
+          ...(canvasValidationFailed ? { canvasValidationFailed: true } : {}),
           requestInfoId,
           allowAutomaticExecution: resolved.tool.allowAutomaticExecution === true,
           automaticPermissionReadonly: false,
@@ -5201,6 +5386,11 @@ class ChatController {
       patchAppliedAutomatically: false,
       automaticPermissionReadonly,
       argumentSchema,
+      ...(resolved.tool.name === CODRIVER_API_CALL_TOOL_NAME ? {
+        apiBinding: resolved.tool.executionBinding,
+        apiCallBinding: this.directApiAccess.callBinding(resolved.candidate.arguments),
+        apiArgumentSignature: hashText(JSON.stringify(resolved.candidate.arguments ?? {}))
+      } : {}),
       createNoteReview,
       moveFileReview,
       audioTranscriptionReview,
@@ -5209,6 +5399,9 @@ class ChatController {
   }
 
   getResolvedMcpToolAutomaticExecution(resolved) {
+    if (resolved?.server?.id === CODRIVER_VAULT_SERVER_ID && resolved?.tool?.name === CODRIVER_API_CALL_TOOL_NAME) {
+      return this.directApiAccess.allowsAutomatic(resolved.candidate.arguments, this.settings);
+    }
     if (isCodriverVaultPatchNoteTool(resolved?.server, resolved?.tool)) {
       return true;
     }
@@ -5323,12 +5516,14 @@ class ChatController {
     }
 
     const server = createCodriverVaultMcpServer({
-      toolSettings: this.settings.codriverVaultToolSettings
+      toolSettings: this.settings.codriverVaultToolSettings,
+      directApiSettings: this.getDirectApiSettings()
     });
     const audioConfiguration = this.getAudioAttachmentProcessingConfiguration();
     return server.tools
       .filter((tool) => (
         tool.enabled !== false &&
+        (tool.name !== CODRIVER_API_CALL_TOOL_NAME || tool.apiTargetsAvailable) &&
         (
           tool.name !== CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME ||
           !audioConfiguration.error
@@ -5338,6 +5533,14 @@ class ChatController {
         server,
         tool
       }));
+  }
+
+  getDirectApiSettings() {
+    return {
+      obsidian: this.settings.enableDirectObsidianApiAccess === true,
+      plugin: this.settings.enableDirectPluginApiAccess === true,
+      binding: this.directApiAccess.binding(this.settings)
+    };
   }
 
   areCoDriverVaultToolsEnabled() {
@@ -5381,6 +5584,9 @@ class ChatController {
     const tool = Array.isArray(server.tools)
       ? server.tools.find((item) => item?.name === toolName)
       : null;
+    if (toolName === CODRIVER_API_CALL_TOOL_NAME && !tool?.apiTargetsAvailable) {
+      return { ok: false, server, reason: "api-targets-disabled", message: "Both direct API targets are disabled." };
+    }
     if (!tool) {
       return {
         ok: false,
@@ -5991,6 +6197,7 @@ class ChatController {
       };
     }
 
+    if (isDirectApiToolCall(toolCall)) return { ok: false, message: "Manage API Auto in Settings > MCP > API access." };
     if (isCodriverVaultToolCall(toolCall) && !isCodriverVaultConfigurableMutationToolCall(toolCall)) {
       return {
         ok: false,
@@ -6004,6 +6211,7 @@ class ChatController {
       this.settings.codriverVaultToolSettings[toolCall.toolName] = {
         ...(this.settings.codriverVaultToolSettings[toolCall.toolName] ?? {}),
         allowAutomaticExecution: enabled,
+        ...(TEXT_DOCUMENT_MUTATION_TOOLS.includes(toolCall.toolName) ? { documentAutoConsentVersion: TEXT_DOCUMENT_AUTO_CONSENT_VERSION } : {}),
         ...(isCodriverVaultTranscribeAudioToolCall(toolCall)
           ? { autoConsentVersion: VAULT_AUDIO_AUTO_CONSENT_VERSION } : {})
       };
@@ -6204,6 +6412,31 @@ class ChatController {
       options.chainState.boundMcpCatalog = executionCatalog;
     }
 
+    if (isDirectApiToolCall(toolCall)) {
+      const unavailable = this.directApiAccess.availabilityMessage(toolCall.arguments, this.settings);
+      if (unavailable) {
+        toolCall.status = "error";
+        toolCall.error = unavailable;
+        toolCall.apiAvailabilityFailed = true;
+        await this.notifyStateChanged();
+        return { ok: false, message: unavailable };
+      }
+      const authorized = options.trigger === "user-approval" || (toolCall.allowAutomaticExecution === true && this.directApiAccess.allowsAutomatic(toolCall.arguments, this.settings));
+      if (!authorized) {
+        toolCall.status = "pending";
+        return { ok: false, message: "Approve this API call or enable its Auto permission." };
+      }
+      if (toolCall.apiBinding !== availability.tool.executionBinding || toolCall.apiCallBinding !== this.directApiAccess.callBinding(toolCall.arguments) || toolCall.apiArgumentSignature !== hashText(JSON.stringify(toolCall.arguments ?? {}))) {
+        toolCall.status = "error";
+        toolCall.error = "API target, plugin catalog or reviewed arguments changed. Send a new request.";
+        await this.notifyStateChanged();
+        return { ok: false, message: toolCall.error };
+      }
+      options.apiAuthorization = () => options.trigger === "user-approval" || (
+        this.directApiAccess.allowsAutomatic(toolCall.arguments, this.settings)
+      );
+    }
+
     const argumentValidation = availability.server.id === CODRIVER_VAULT_SERVER_ID
       ? validateMcpToolArguments(toolCall.arguments, toolCall.argumentSchema)
       : validateExternalMcpToolArguments(toolCall.arguments, toolCall.argumentSchema);
@@ -6237,6 +6470,7 @@ class ChatController {
       toolCall.patchProposalId = duplicateResult.patchProposalId || "";
       toolCall.patchApplied = duplicateResult.patchApplied === true;
       toolCall.patchAppliedAutomatically = duplicateResult.patchAppliedAutomatically === true;
+      toolCall.canvasPatchValidationFailed = duplicateResult.canvasPatchValidationFailed === true;
       toolCall.output = [
         "[Duplicate MCP tool call skipped. Reused a previous result from this MCP chain.]",
         "",
@@ -6352,6 +6586,7 @@ class ChatController {
           noteCreateAuthorization,
           noteDeleteAuthorization,
           fileMoveAuthorization,
+          apiAuthorization: options.apiAuthorization,
           chainState: options.chainState,
           signal: runtime.signal
         });
@@ -6364,6 +6599,8 @@ class ChatController {
         const { McpHttpClient } = require("../mcp/McpHttpClient");
         const client = new McpHttpClient(server, {
           credentialService: this.runtimeSupport.mcpCredentialService,
+          oauthService: this.runtimeSupport.mcpOAuthService,
+          signal: runtime.signal,
           diagnostics: this.diagnostics
         });
         const toolResultPromise = client.callTool(toolCall.toolName, toolCall.arguments);
@@ -6581,6 +6818,53 @@ class ChatController {
     const firstToolCall = completedToolCalls[0] ?? null;
     const parentRequest = options.activeRequest ?? null;
     const chainState = this.ensureMcpToolChainState(options.chainState ?? this.createMcpToolChainState());
+    if (completedToolCalls.some((call) => call.apiAvailabilityFailed === true)) {
+      if ((chainState.apiAvailabilityFeedbackCount ?? 0) >= 2) {
+        this.clearProviderContinuationContext(chainState);
+        chainState.stopped = "Plugin API is still unavailable. Review Plugins in CoDriver Settings and retry.";
+        this.messages.push(createLocalAssistantMessage(chainState.stopped));
+        await this.notifyStateChanged();
+        return { ok: false, reason: "api-availability-feedback-limit" };
+      }
+      chainState.apiAvailabilityFeedbackCount = (chainState.apiAvailabilityFeedbackCount ?? 0) + 1;
+    }
+    const failedCanvasPatch = completedToolCalls.some((call) => (
+      isCodriverVaultPatchNoteToolCall(call) && call.status === "error" &&
+      call.patchProposalPrepared !== true && call.patchApplied !== true &&
+      (call.canvasPatchValidationFailed === true || (call.argumentValidationFailed === true && (
+        isCanvasDocumentPath(call.arguments?.path) ||
+        ((!call.arguments?.path || typeof call.arguments.path !== "string") &&
+          isCanvasDocumentPath(chainState.activeNotePathContext?.path))
+      )))
+    ));
+    if (failedCanvasPatch) {
+      if (chainState.stopped || chainState.sessionId !== this.currentSessionId || this.isRequestCancelled(parentRequest ?? chainState.activeRequest)) {
+        this.clearProviderContinuationContext(chainState);
+        return { ok: false, reason: "canvas-patch-correction-cancelled" };
+      }
+      if ((chainState.canvasPatchRepairCount ?? 0) >= 2) {
+        this.clearProviderContinuationContext(chainState);
+        chainState.stopped = "Canvas patch validation still failed after two correction turns. The rejected patches did not change the file. Send a new request to retry.";
+        this.messages.push(createLocalAssistantMessage(chainState.stopped));
+        await this.notifyStateChanged();
+        return { ok: false, reason: "canvas-patch-correction-limit" };
+      }
+      chainState.canvasPatchRepairCount = (chainState.canvasPatchRepairCount ?? 0) + 1;
+    }
+    if (completedToolCalls.some((call) => call.canvasValidationFailed === true)) {
+      if (chainState.stopped || chainState.sessionId !== this.currentSessionId || this.isRequestCancelled(parentRequest ?? chainState.activeRequest)) {
+        this.clearProviderContinuationContext(chainState);
+        return { ok: false, reason: "canvas-correction-cancelled" };
+      }
+      if ((chainState.canvasValidationRepairCount ?? 0) >= 2) {
+        this.clearProviderContinuationContext(chainState);
+        chainState.stopped = "Canvas JSON remained invalid after two correction turns. The rejected calls did not create files. Send a new request to retry.";
+        this.messages.push(createLocalAssistantMessage(chainState.stopped));
+        await this.notifyStateChanged();
+        return { ok: false, reason: "canvas-correction-limit" };
+      }
+      chainState.canvasValidationRepairCount = (chainState.canvasValidationRepairCount ?? 0) + 1;
+    }
     if (!Array.isArray(chainState.requestSkillIds) && Array.isArray(firstToolCall?.requestSkillIds)) {
       chainState.requestSkillIds = [...firstToolCall.requestSkillIds];
     }
@@ -6937,6 +7221,7 @@ class ChatController {
 
   rememberRecentMcpToolResult(toolCall) {
     if (
+      isDirectApiToolCall(toolCall) ||
       isCodriverVaultTranscribeAudioToolCall(toolCall) ||
       !isCompletedMcpToolResult(toolCall) ||
       !this.isMcpToolContextAvailable(toolCall)
@@ -6983,6 +7268,9 @@ class ChatController {
 
   isProviderContinuationConfigurationCurrent(chainState, provider, model, nativeTools) {
     const state = this.ensureMcpToolChainState(chainState);
+    if (state.stopped || state.requestSkillIds?.some((id) => this.isSkillSuppressedForSession(this.skillRegistry.get(id)))) {
+      return false;
+    }
     const currentProvider = state.providerId
       ? this.providerRegistry.get(state.providerId)
       : provider;
@@ -7340,7 +7628,8 @@ class ChatController {
     }
 
     const server = createCodriverVaultMcpServer({
-      toolSettings: this.settings.codriverVaultToolSettings
+      toolSettings: this.settings.codriverVaultToolSettings,
+      directApiSettings: this.getDirectApiSettings()
     });
     const audioConfiguration = this.getAudioAttachmentProcessingConfiguration();
     if (audioConfiguration.error) {
@@ -7398,15 +7687,21 @@ class ChatController {
     if (options.trigger === "user-approval") {
       return {
         status: "authorized",
-        source: "per-call-approval"
+        source: "per-call-approval",
+        ...(toolCall.arguments?.path?.toLowerCase().endsWith(".canvas") ? { isCurrent: () => this.isCanvasToolAuthorizationCurrent(toolCall) } : {})
       };
     }
 
-    const automaticEnabled = this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.allowAutomaticExecution === true;
+    const isCurrent = () => this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.allowAutomaticExecution === true &&
+      this.areCoDriverVaultToolsEnabled() && this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.enabled !== false &&
+      this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_CREATE_NOTE_TOOL_NAME]?.documentAutoConsentVersion === TEXT_DOCUMENT_AUTO_CONSENT_VERSION &&
+      (!toolCall.arguments?.path?.toLowerCase().endsWith(".canvas") || this.isCanvasToolAuthorizationCurrent(toolCall));
+    const automaticEnabled = isCurrent();
     if (automaticEnabled && toolCall.allowAutomaticExecution === true) {
       return {
         status: "authorized",
-        source: "automatic-tool-permission"
+        source: "automatic-tool-permission",
+        isCurrent
       };
     }
 
@@ -7473,7 +7768,9 @@ class ChatController {
     const isCurrent = () => (
       this.areCoDriverVaultToolsEnabled() &&
       this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.enabled !== false &&
-      this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.allowAutomaticExecution === true
+      this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.allowAutomaticExecution === true &&
+      this.settings.codriverVaultToolSettings?.[CODRIVER_VAULT_PATCH_NOTE_TOOL_NAME]?.documentAutoConsentVersion === TEXT_DOCUMENT_AUTO_CONSENT_VERSION &&
+      (!toolCall.arguments?.path?.toLowerCase().endsWith(".canvas") || this.isCanvasToolAuthorizationCurrent(toolCall))
     );
     if (!isCurrent()) {
       return null;
@@ -7486,12 +7783,23 @@ class ChatController {
     };
   }
 
+  isCanvasToolAuthorizationCurrent(toolCall) {
+    if (!toolCall || !this.areCoDriverVaultToolsEnabled() || this.settings.codriverVaultToolSettings?.[toolCall.toolName]?.enabled === false) return false;
+    const state = this.mcpToolChainStates.get(toolCall);
+    return Boolean(state && state.sessionId === this.currentSessionId && !state.stopped &&
+      !this.isRequestCancelled(state.activeRequest) &&
+      catalogHasMcpTool(state.boundMcpCatalog, CODRIVER_VAULT_SERVER_ID, toolCall.toolName) &&
+      this.resolveMcpToolCall({ serverId: toolCall.serverId, toolName: toolCall.toolName, arguments: toolCall.arguments }, state.boundMcpCatalog).ok);
+  }
+
   async callFirstPartyMcpTool(toolCall, options = {}) {
     if (!this.areCoDriverVaultToolsEnabled()) {
       throw new Error(CODRIVER_VAULT_DISABLED_MESSAGE);
     }
 
     switch (toolCall.toolName) {
+      case CODRIVER_API_CALL_TOOL_NAME:
+        return this.callDirectApiTool(toolCall, options);
       case CODRIVER_ACTIVE_FILE_GET_PATH_TOOL_NAME:
         return this.callCodriverActiveFileGetPathTool();
       case CODRIVER_VAULT_APPEND_NOTE_TOOL_NAME:
@@ -7531,33 +7839,50 @@ class ChatController {
     }
   }
 
+  async callDirectApiTool(toolCall, options) {
+    const isCurrent = () => this.areCoDriverVaultToolsEnabled() &&
+      this.settings.codriverVaultToolSettings?.[CODRIVER_API_CALL_TOOL_NAME]?.enabled !== false &&
+      options.apiAuthorization?.() === true &&
+      toolCall.apiCallBinding === this.directApiAccess.callBinding(toolCall.arguments) &&
+      toolCall.apiBinding === this.directApiAccess.binding(this.settings);
+    try {
+      return await this.directApiAccess.call(toolCall.arguments, {
+        settings: this.settings,
+        signal: options.signal,
+        isCurrent,
+        limit: this.getMaxMcpToolResultChars()
+      });
+    } catch {
+      throw new Error("Direct API call failed. Check the method, arguments, target availability and output limits. Plugin work may have had effects before failure.");
+    } finally {
+      if (toolCall.arguments?.target === "plugin") {
+        this.invalidateRecentVaultWriteContext("", "opaque-plugin-api", options.chainState);
+      }
+    }
+  }
+
   async callCodriverVaultReadTool(toolCall) {
-    const path = normalizeVaultPath(toolCall.arguments?.path);
-    const note = await this.vaultReader.readMarkdownPath(path);
-    return {
-      content: [
-        {
-          type: "text",
-          text: [
-            "Vault note read through CoDriver's Obsidian API.",
-            `Path: ${note.path}`,
-            "",
-            "BEGIN VAULT NOTE CONTENT",
-            note.content,
-            "END VAULT NOTE CONTENT"
-          ].join("\n")
-        }
-      ],
-      structuredContent: {
-        path: note.path,
-        characterCount: note.content.length
-      },
+    const normalizedPath = normalizeVaultPath(toolCall.arguments?.path);
+    const path = normalizedPath.toLowerCase().endsWith(".canvas") ? toolCall.arguments?.path : normalizedPath;
+    const note = await this.vaultReader.readTextDocumentPath(path);
+    const canvas = note.path.toLowerCase().endsWith(".canvas");
+    const result = {
+      content: [{ type: "text", text: [
+        canvas ? "Saved Canvas JSON read through CoDriver's Obsidian API. Referenced notes and media were not read."
+          : "Vault note read through CoDriver's Obsidian API.",
+        `Path: ${note.path}`, "", "BEGIN VAULT NOTE CONTENT", note.content, "END VAULT NOTE CONTENT"
+      ].join("\n") }],
+      structuredContent: { path: note.path, characterCount: note.content.length },
       isError: false
     };
+    if (canvas && formatMcpToolResult(result).length > this.getMaxMcpToolResultChars()) {
+      throw new Error("Canvas content exceeds the current tool result limit. Increase Max tool result characters or use a smaller Canvas document.");
+    }
+    return result;
   }
 
   async callCodriverVaultCreateNoteTool(toolCall, authorization, chainState) {
-    const result = await this.vaultWriter.createNote(toolCall.arguments, authorization);
+    const result = await this.vaultWriter.createNote(toolCall.arguments, authorization, toolCall.createNoteReview);
     this.clearProviderContinuationContext(chainState);
     return createCodriverJsonToolResult(
       [
@@ -7622,9 +7947,23 @@ class ChatController {
   }
 
   async callCodriverVaultPatchNoteTool(toolCall, chainState) {
-    const candidate = createPendingPatchProposal(toolCall.arguments);
-    this.vaultWriter.getMarkdownFile(candidate.notePath);
-    if (candidate.kind === "text") await this.vaultWriter.validatePendingTextChange(candidate);
+    let candidate;
+    try {
+      candidate = createPendingPatchProposal(toolCall.arguments);
+    } catch (error) {
+      if (isCanvasDocumentPath(toolCall.arguments?.path)) toolCall.canvasPatchValidationFailed = true;
+      throw error;
+    }
+    if (candidate.notePath.toLowerCase().endsWith(".canvas")) this.vaultWriter.getCanvasFile(candidate.notePath);
+    else this.vaultWriter.getMarkdownFile(candidate.notePath);
+    if (candidate.kind === "text") {
+      try {
+        await this.vaultWriter.validatePendingTextChange(candidate);
+      } catch (error) {
+        if (error instanceof CanvasValidationError) toolCall.canvasPatchValidationFailed = true;
+        throw error;
+      }
+    }
     if (toolCall.status === "cancelled" || this.isRequestCancelled(chainState?.activeRequest)) {
       throw new McpToolCancelledError("MCP tool call cancelled.");
     }
@@ -7667,7 +8006,7 @@ class ChatController {
         proposal.error = error instanceof Error ? error.message : "Unable to apply the prepared note patch automatically.";
         return {
           ...createCodriverJsonToolResult(
-            "Automatic Patch note application was blocked. The note was not changed; review the proposal and resolve its validation error before accepting it manually.",
+            "Automatic Patch note application did not complete. Review the proposal error and current file state before retrying.",
             { proposalId: proposal.id, path: proposal.notePath, kind: proposal.kind,
               proposalStatus: proposal.status, created: true, applied: false, appliedAutomatically: false,
               code: "automatic_patch_application_blocked" }
@@ -7678,6 +8017,7 @@ class ChatController {
       this.completePatchApplication(proposal, state);
       toolCall.patchApplied = true;
       toolCall.patchAppliedAutomatically = true;
+      if (proposal.canvasSynchronizationWarning) this.finishPatchChainAfterManualAcceptance(state, proposal.canvasSynchronizationWarning);
       await this.persistCurrentSession();
       return createAppliedPatchToolResult(proposal);
     }
@@ -8065,6 +8405,7 @@ class ChatController {
       contextMessageLength = null,
       commandContextCharacters = 0
     } = options;
+    if (activeRequest && Array.isArray(requestSkills)) activeRequest.requestSkillIds = requestSkills.map((skill) => skill.id);
     if (mcpChainState && !this.isProviderContinuationConfigurationCurrent(mcpChainState, provider, model, nativeTools)) {
       const message = PROVIDER_CONTINUATION_SETTINGS_CHANGED_MESSAGE;
       this.clearProviderContinuationContext(mcpChainState);
@@ -8411,7 +8752,7 @@ class ChatController {
     }
 
     for (const skill of requestSkills) {
-      if (skill.enabled === false || skill.available === false) {
+      if (skill.enabled === false || skill.available === false || this.isSkillSuppressedForSession(skill)) {
         continue;
       }
       if (typeof skill.systemPrompt === "string" && skill.systemPrompt.trim().length > 0) {
@@ -8429,6 +8770,7 @@ class ChatController {
         skill.enabled !== false &&
         skill.available !== false &&
         skill.invocation === "model" &&
+        !this.isSkillSuppressedForSession(skill) &&
         !skill.hidden &&
         !skill.required
       ))
@@ -8488,7 +8830,7 @@ class ChatController {
   }
 
   createActiveNotePathContextMessage(activeNotePathContext) {
-    const path = normalizeMarkdownVaultPath(activeNotePathContext?.path);
+    const path = normalizeActiveNoteVaultPath(activeNotePathContext?.path);
     return {
       role: "user",
       content: [
@@ -8635,7 +8977,7 @@ class ChatController {
     const skillIds = new Set();
 
     const addSkill = (skill) => {
-      if (!skill || skill.enabled === false || skill.available === false || skillIds.has(skill.id)) {
+      if (!skill || skill.enabled === false || skill.available === false || this.isSkillSuppressedForSession(skill) || skillIds.has(skill.id)) {
         return;
       }
 
@@ -8667,6 +9009,7 @@ class ChatController {
         skill.enabled === false ||
         skill.available === false ||
         skill.invocation !== "model" ||
+        this.isSkillSuppressedForSession(skill) ||
         skillIds.has(skill.id)
       ) {
         return;
@@ -8703,7 +9046,7 @@ class ChatController {
       this.skillRegistry.list().filter((skill) => (
         skill.enabled !== false &&
         skill.available !== false &&
-        skill.invocation === "model"
+        skill.invocation === "model" && !this.isSkillSuppressedForSession(skill)
       )),
       metadata
     );
@@ -8715,6 +9058,7 @@ class ChatController {
       skill.enabled !== false &&
       skill.available !== false &&
       skill.invocation === "model" &&
+      !this.isSkillSuppressedForSession(skill) &&
       !skill.hidden &&
       !skill.required
     ));
@@ -8933,7 +9277,7 @@ class ChatController {
 
     for (const skillName of skillNames) {
       const skill = candidateByName.get(normalizeSkillRouteName(skillName));
-      if (!skill || resolvedIds.has(skill.id)) {
+      if (!skill || this.isSkillSuppressedForSession(skill) || resolvedIds.has(skill.id)) {
         continue;
       }
 
@@ -9010,6 +9354,7 @@ class ChatController {
         skill.hidden = false;
         skill.required = false;
         skill.source = "user";
+        skill.builtinId = getBuiltinSkill(source.builtinId)?.id || getBuiltinSkill(skill.id)?.id;
         skill.enabled = this.isSkillEnabled(skill.id);
         this.skillRegistry.register(skill);
         if (activeExternalSkillIds.has(skill.id)) {
@@ -9767,6 +10112,10 @@ function isCodriverVaultConfigurableMutationToolCall(toolCall) {
     isCodriverVaultTranscribeAudioToolCall(toolCall);
 }
 
+function isDirectApiToolCall(toolCall) {
+  return isCodriverVaultToolCall(toolCall) && toolCall.toolName === CODRIVER_API_CALL_TOOL_NAME;
+}
+
 function serializeAudioTranscriptionReview(value) {
   if (!isPlainObject(value)) {
     return null;
@@ -10473,6 +10822,7 @@ function sanitizeNativeToolNamePart(value) {
 
 function createMcpNativeToolDescription(server, tool) {
   if (server.id === CODRIVER_VAULT_SERVER_ID) {
+    if (tool.name === CODRIVER_API_CALL_TOOL_NAME) return tool.description;
     return CODRIVER_VAULT_NATIVE_TOOL_DESCRIPTIONS[tool.name] || tool.title || tool.name;
   }
 
@@ -10510,6 +10860,7 @@ function formatFirstPartyMcpToolCatalogEntry(server, tool, nativeFunctionName = 
   return [
     `- toolName: ${server.name}.${tool.name}`,
     nativeFunctionName ? `  nativeFunctionName: ${nativeFunctionName}` : "",
+    tool.name === CODRIVER_API_CALL_TOOL_NAME ? `  description: ${singleLine(tool.description)}` : "",
     `  arguments: ${formatCompactMcpInputSchemaSummary(tool.inputSchema)}`
   ].filter(Boolean).join("\n");
 }

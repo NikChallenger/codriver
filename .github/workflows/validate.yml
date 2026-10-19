@@ -6,9 +6,11 @@ on:
       - main
       - "review/**"
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: public-validate-${{ github.workflow }}-${{ github.ref }}
@@ -16,18 +18,51 @@ concurrency:
 
 jobs:
   validate:
+    name: Reviewed public release
     if: github.repository == 'NikChallenger/codriver'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 22
           package-manager-cache: false
+      - name: Verify exact review PR tree
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = await import('node:fs');
+            const { resolveReviewPullRequest, verifyReviewedTree, verifyPublicMetadata } = await import(`${process.env.GITHUB_WORKSPACE}/reviewed-public-release.mjs`);
+            const version = JSON.parse(fs.readFileSync('manifest.json')).version;
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: context.payload.pull_request.number });
+            const review = await resolveReviewPullRequest(github, version);
+            if (review.number !== pr.number) throw new Error('Unexpected release PR.');
+            if (pr.head.sha !== context.payload.pull_request.head.sha || pr.base.sha !== context.payload.pull_request.base.sha) throw new Error('PR changed during validation.');
+            verifyReviewedTree({ root: '.', version, reviewedCommit: review.reviewedCommit, candidateCommit: process.env.GITHUB_SHA, requireMerge: true });
+            verifyPublicMetadata('.', version);
+      - name: Verify bounded pushed snapshot
+        if: github.event_name == 'push'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = await import('node:fs');
+            const { resolveReviewPullRequest, verifyReviewedTree } = await import(`${process.env.GITHUB_WORKSPACE}/reviewed-public-release.mjs`);
+            const version = JSON.parse(fs.readFileSync('manifest.json')).version;
+            let reviewedCommit = process.env.GITHUB_SHA;
+            if (process.env.GITHUB_REF === 'refs/heads/main') {
+              const review = await resolveReviewPullRequest(github, version, { merged: true, mainCommit: process.env.GITHUB_SHA });
+              reviewedCommit = review.reviewedCommit;
+            } else if (process.env.GITHUB_REF !== `refs/heads/review/${version}`) throw new Error('Unexpected review branch version.');
+            verifyReviewedTree({ root: '.', version, reviewedCommit, candidateCommit: process.env.GITHUB_SHA,
+              requireMerge: process.env.GITHUB_REF === 'refs/heads/main' });
       - name: Validate public metadata
         run: >-
-          node -e "const p=require('./package.json'),m=require('./manifest.json'),v=require('./versions.json');
-          if(p.version!==m.version||p.description!==m.description||v[m.version]!==m.minAppVersion||m.description.includes('Obsidian'))process.exit(1)"
+          node --input-type=module -e "import { verifyPublicMetadata } from './reviewed-public-release.mjs';
+          import fs from 'node:fs'; verifyPublicMetadata('.', JSON.parse(fs.readFileSync('manifest.json')).version)"
       - name: Rebuild the plugin
         run: npm run build
       - name: Require an exact reproducible bundle

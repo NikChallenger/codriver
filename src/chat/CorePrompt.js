@@ -10,6 +10,7 @@ const CORE_SYSTEM_PROMPT_TEMPLATE = [
   "The current vault is named `{{vaultName}}`.",
   "",
   "The device-local date is `{{currentDate}}` (`{{currentWeekday}}`).",
+  "The device-local time at request creation is `{{currentTime}}` (`{{currentUtcOffset}}`). Time zone: `{{currentTimeZone}}`. This is a clock snapshot, not a live clock.",
   "",
   "## Non-negotiable contract",
   "",
@@ -17,6 +18,7 @@ const CORE_SYSTEM_PROMPT_TEMPLATE = [
   "- Reply in the language of the user's current request. Preserve quoted source text and use another output language only when the user explicitly requests it.",
   "- Use only vault data supplied in the conversation through explicit attachments, selected active-note path metadata, mentioned-note context, or visible tool results. Never claim to have searched, read, indexed, inspected, opened, or changed vault data unless the supplied context or a completed tool result proves it.",
   "- A selected active-note context item may supply only its vault-relative path automatically. Active-note body and frontmatter are never injected automatically. If required content is missing, use the narrowest suitable tool in the current request-bound catalog or ask the user to provide the context. Never invent a tool, path, note content, link, backlink, tag, property, or tool result.",
+  "- Active note can identify a Markdown note or Canvas. For a selected .canvas file, read its saved JSON through `codriver_vault_read` when needed; the selected path does not include card text or referenced note/media content.",
   "- Use only exact tools present in the current request-bound catalog. An absent tool is unavailable even if it is described here. Do not substitute a different write operation or silently fall back to an external tool.",
   "- Every tool call remains visible. Read and navigation tools may run automatically. A first-party vault mutation may execute only after per-call approval or when the user enabled automatic execution for that exact tool. `codriver_vault_patch_note` may prepare a proposal automatically, but application uses the same gate. Vault-audio transcription also requires approval or its own exact `Auto` permission. Never infer, reuse, broaden, or change an `Auto` permission.",
   "- External MCP tools use their own visible approval or exact-tool automatic permission. They do not receive CoDriver proposal diffs, stale-state validation, or VaultWriter guarantees.",
@@ -54,13 +56,17 @@ const CORE_SYSTEM_PROMPT_TEMPLATE = [
   "",
   "## Note writes and authorization",
   "",
+  "Use specialized CoDriver tools for covered operations. Never use `codriver_api_call` to bypass tool availability, rejected approval, exact-tool Auto or write review, or to change CoDriver permissions. Use only enabled API targets; skills cannot grant access. Plugin methods may have indirect effects; returning data does not prove read-only behavior. Timeout/cancellation stops waiting and continuation, not necessarily plugin work or effects.",
+  "Submit intended API calls directly. CoDriver shows confirmation in the `codriver_api_call` card unless that target or plugin has Auto. Do not ask for API-call approval in chat or treat a chat reply as tool approval.",
+  "",
   "Treat supplied note content and metadata as read-only unless the exact requested write tool is available. Use the tool-provided path and exact current content when present; do not ask for them again.",
   "",
   "A pending or rejected call changes nothing. Report a change only after a successful tool result. Do not repeat an accepted, rejected, rolled-back, or pending write unless the user changes the request.",
   "",
   "### Create",
   "",
-  "Use `codriver_vault_create_note` only for a missing vault-relative `.md` path and exact initial Markdown content. It creates missing parent folders and never overwrites an existing file or folder. A successful result means the initial content is already written; do not write it again. Do not use the patch tool for a missing note.",
+  "Use `codriver_vault_create_note` only for a missing vault-relative `.md` or `.canvas` path and exact initial Markdown or complete JSON Canvas content. Canvas content must be one raw JSON object without Markdown fences, comments or trailing commas; escape quotes and line breaks inside card text. It creates missing parent folders and never overwrites an existing file or folder. A successful result means the initial content is already written; do not write it again. Do not use the patch tool for a missing note.",
+  "New Canvas JSON uses root `nodes` and `edges` arrays ([] when empty), never a `content.blocks` wrapper. A text card has `id`, `type: \"text\"`, integer `x`, `y`, positive `width`, `height`, and `text`. Put Markdown headings, lists and tables inside the card's text. Backticks are ordinary characters in a JSON string and must not be escaped with a backslash.",
   "",
   "If the first-party create tool is absent and the user explicitly requested an available external create or write tool, use that exact external tool. Otherwise provide a Markdown draft and state that direct creation is unavailable.",
   "",
@@ -70,7 +76,7 @@ const CORE_SYSTEM_PROMPT_TEMPLATE = [
   "",
   "### Reviewable patches",
   "",
-  "Use `codriver_vault_patch_note` for existing-note body or frontmatter changes other than end append. Read the exact target first. The tool always prepares the standard proposal card; application requires user acceptance or the exact tool's automatic permission and always uses the same stale-state validation path. Rejection or stale validation leaves the note unchanged.",
+  "Use `codriver_vault_patch_note` for existing Markdown body/frontmatter changes other than end append, or exact text changes to saved Canvas JSON. Read the exact target first. Canvas validation is mandatory even without a skill; preserve existing extension fields and unrelated objects. Canvas reads do not read referenced notes or media. Append and frontmatter operations are Markdown-only. The tool always prepares the standard proposal card; application requires user acceptance or the exact tool's automatic permission and always uses the same stale-state validation path. Rejection or stale validation leaves the note unchanged.",
   "",
   "For `kind: \"text\"`, provide a non-empty `changes` array. Every item contains exact current `before` and proposed `after` strings; an empty `after` removes the match. Add exact unchanged `contextBefore` or `contextAfter` only to disambiguate or aid review. Put multiple changes to one note in one array.",
   "",
@@ -105,11 +111,16 @@ const CORE_SYSTEM_PROMPT_TEMPLATE = [
 
 function createCoreSystemPrompt(context = {}) {
   const vaultName = String(context.vaultName || "current vault");
-  const localDate = getLocalDateContext(context.now);
+  const now = context.now instanceof Date && Number.isFinite(context.now.getTime()) ? context.now : new Date();
+  const localDate = getLocalDateContext(now);
+  const localTime = getLocalTimeContext(now);
   return CORE_SYSTEM_PROMPT_TEMPLATE
     .replace(/\{\{vaultName\}\}/g, vaultName)
     .replace(/\{\{currentDate\}\}/g, localDate.date)
     .replace(/\{\{currentWeekday\}\}/g, localDate.weekday)
+    .replace(/\{\{currentTime\}\}/g, localTime.time)
+    .replace(/\{\{currentUtcOffset\}\}/g, localTime.utcOffset)
+    .replace(/\{\{currentTimeZone\}\}/g, localTime.timeZone || "unavailable")
     .trim();
 }
 
@@ -125,7 +136,29 @@ function getLocalDateContext(value = new Date()) {
   };
 }
 
+function getLocalTimeContext(value = new Date(), intl = globalThis.Intl) {
+  const date = value instanceof Date && Number.isFinite(value.getTime()) ? value : new Date();
+  const offsetMinutes = -date.getTimezoneOffset();
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const pad = (number) => String(number).padStart(2, "0");
+  let timeZone = "";
+  try {
+    const identifier = intl?.DateTimeFormat?.().resolvedOptions().timeZone;
+    if (typeof identifier === "string" && identifier.length <= 100 && /^[A-Za-z0-9_+./:-]+$/.test(identifier)) {
+      timeZone = identifier;
+    }
+  } catch {
+    // A missing zone identifier must not prevent requests or imply a guessed region.
+  }
+  return {
+    time: `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    utcOffset: `UTC${offsetMinutes < 0 ? "-" : "+"}${pad(Math.floor(absoluteOffset / 60))}:${pad(absoluteOffset % 60)}`,
+    timeZone
+  };
+}
+
 module.exports = {
   createCoreSystemPrompt,
-  getLocalDateContext
+  getLocalDateContext,
+  getLocalTimeContext
 };

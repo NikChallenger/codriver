@@ -149,6 +149,7 @@ class OpenAiCompatibleClient {
     }
 
     const firstChoice = Array.isArray(data?.choices) ? data.choices[0] : null;
+    await this.rejectGenerationError(firstChoice?.finish_reason, model, response.status);
     const message = firstChoice?.message ?? {};
     const content = normalizeOpenAiMessageContent(message.content);
     const toolCalls = normalizeOpenAiToolCalls(message.tool_calls, nativeTools);
@@ -248,15 +249,9 @@ class OpenAiCompatibleClient {
       await applyOpenAiStreamChunk(state, data, nativeTools, onProgress);
     });
 
-    if (!state.done) {
-      throw new Error("The provider returned an incomplete Chat Completions event stream.");
-    }
     const rawToolCalls = [...state.toolCalls.entries()]
       .sort(([left], [right]) => left - right)
       .map(([, toolCall]) => toolCall);
-    const toolCalls = normalizeOpenAiToolCalls(rawToolCalls, nativeTools);
-    const assistantMessage = createStreamingOpenAiAssistantMessage(state, rawToolCalls);
-    const providerContext = createOpenAiProviderContext(body.messages, assistantMessage, rawToolCalls, toolCalls);
     const metadataSource = {
       ...state.metadata,
       ...(state.usage ? { usage: state.usage } : {})
@@ -278,6 +273,13 @@ class OpenAiCompatibleClient {
       }
     });
 
+    await this.rejectGenerationError(state.finishReason, model, response.status);
+    if (!state.done) {
+      throw new Error("The provider returned an incomplete Chat Completions event stream.");
+    }
+    const toolCalls = normalizeOpenAiToolCalls(rawToolCalls, nativeTools);
+    const assistantMessage = createStreamingOpenAiAssistantMessage(state, rawToolCalls);
+    const providerContext = createOpenAiProviderContext(body.messages, assistantMessage, rawToolCalls, toolCalls);
     return {
       content: state.content,
       toolCalls,
@@ -288,6 +290,18 @@ class OpenAiCompatibleClient {
       } : {}),
       ...(metadata ? { metadata } : {})
     };
+  }
+
+  async rejectGenerationError(finishReason, model, httpStatus) {
+    if (finishReason !== "error") return;
+    await this.logDiagnostic("provider.openai.chat.response.failed", {
+      status: "failed",
+      reason: "generation-error",
+      endpoint: summarizeEndpoint(this.baseUrl),
+      model,
+      response: { status: httpStatus, finishReason: "error" }
+    });
+    throw new Error("The provider reported a generation error (finish_reason: error). Please retry the request.");
   }
 
   async logDiagnostic(event, detail) {
@@ -420,7 +434,7 @@ async function applyOpenAiStreamChunk(state, data, nativeTools, onProgress) {
       });
     }
     accumulateOpenAiToolCallDeltas(state.toolCalls, delta.tool_calls, choiceIndex, nativeTools);
-    if (typeof choice?.finish_reason === "string" && choice.finish_reason) {
+    if (typeof choice?.finish_reason === "string" && choice.finish_reason && state.finishReason !== "error") {
       state.finishReason = choice.finish_reason;
     }
   }

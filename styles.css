@@ -154,6 +154,10 @@
   width: 100%;
 }
 
+.codriver-settings-navigation-page > .codriver-active-note-context-setting {
+  margin-top: var(--size-4-3);
+}
+
 .codriver-settings-navigation-page > .codriver-session-history-setting {
   margin-top: var(--size-4-3);
   margin-bottom: 0;
@@ -163,6 +167,64 @@
 .codriver-settings-navigation-page > .codriver-session-history-setting + .codriver-diagnostic-logging-setting {
   margin-top: var(--size-4-3);
   padding-top: var(--size-4-2);
+}
+
+.codriver-settings-feedback-links {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-3);
+  justify-content: flex-end;
+  margin-top: var(--size-4-3);
+  padding-inline: var(--size-4-2);
+}
+
+.codriver-settings-feedback-links a.codriver-settings-feedback-link {
+  align-items: center;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-size: var(--font-ui-smaller);
+  gap: var(--size-2-2);
+  min-height: 28px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.codriver-settings-feedback-links a.codriver-settings-feedback-link:hover {
+  color: var(--text-accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.codriver-settings-feedback-link:focus-visible {
+  outline: 2px solid var(--background-modifier-border-focus);
+  outline-offset: 3px;
+}
+
+.codriver-settings-feedback-link .svg-icon {
+  height: 14px;
+  width: 14px;
+}
+
+.codriver-settings-feedback-link .codriver-settings-feedback-external .svg-icon {
+  height: 11px;
+  width: 11px;
+}
+
+.codriver-settings-feedback-divider {
+  background: var(--background-modifier-border);
+  height: 12px;
+  width: 1px;
+}
+
+.is-mobile .codriver-settings-feedback-links a.codriver-settings-feedback-link {
+  min-height: 44px;
+}
+
+@media (pointer: coarse) {
+  .codriver-settings-feedback-links a.codriver-settings-feedback-link {
+    min-height: 44px;
+  }
 }
 
 .codriver-settings-child-titlebar {
@@ -319,7 +381,9 @@
 }
 
 .codriver-audio-transcription-select {
-  min-width: 160px;
+  flex: 1 1 160px;
+  min-width: 0;
+  max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
   width: min(320px, 100%);
@@ -327,6 +391,130 @@
 
 .codriver-audio-transcription-setting.is-invalid .codriver-audio-transcription-select {
   border-color: var(--text-error);
+}
+
+.codriver-audio-settings-group {
+  background: var(--background-secondary);
+  border-radius: var(--setting-items-radius, 12px);
+  padding: 6px 8px;
+}
+
+.codriver-settings-navigation-page .codriver-audio-settings-group .setting-item {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  margin: 0;
+  padding: 8px 0;
+}
+
+.codriver-voice-input-setting .setting-item-control {
+  align-items: center;
+  display: inline-flex;
+  flex: 1 1 auto;
+  gap: 8px;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.codriver-voice-input-setting .checkbox-container {
+  flex-shrink: 0;
+}
+
+.codriver-voice-input-disclosure {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  color: var(--text-normal);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  gap: 6px;
+  padding: 0;
+}
+
+.codriver-voice-input-disclosure:focus-visible {
+  border-radius: 2px;
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 3px;
+}
+
+.codriver-voice-input-chevron {
+  align-items: center;
+  display: inline-flex;
+}
+
+.codriver-voice-input-chevron svg {
+  color: var(--text-muted);
+  height: 14px;
+  width: 14px;
+}
+
+.codriver-voice-input-disclosure[aria-expanded="true"] .codriver-voice-input-chevron {
+  transform: rotate(90deg);
+}
+
+.codriver-voice-input-options {
+  padding-left: 20px;
+}
+
+.codriver-voice-input-options[hidden] {
+  display: none;
+}
+
+.codriver-voice-input-timeout {
+  width: 70px;
+}
+
+.codriver-voice-input-setting.is-invalid .codriver-audio-transcription-select {
+  border-color: var(--text-error);
+}
+
+.is-mobile .codriver-voice-input-setting {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.is-mobile .codriver-voice-input-setting .setting-item-control {
+  width: 100%;
+}
+
+.codriver-voice-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-top: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.codriver-voice-error {
+  color: var(--text-error);
+}
+
+.codriver-voice-button {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 32px;
+  justify-content: center;
+  padding: 0;
+  width: 32px;
+}
+
+.codriver-voice-button svg {
+  height: 18px;
+  width: 18px;
+}
+
+.codriver-voice-button.is-recording {
+  color: var(--text-error);
+}
+
+.codriver-voice-button:disabled {
+  opacity: 0.45;
 }
 
 .codriver-mcp-tool-limits-setting .setting-item-control {
@@ -346,6 +534,126 @@
   grid-template-rows: repeat(2, auto);
   max-width: 440px;
   width: 100%;
+}
+
+.codriver-direct-api-setting {
+  align-items: stretch;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.codriver-direct-api-controls {
+  display: grid;
+  gap: 10px;
+  max-width: 520px;
+  width: 100%;
+}
+
+.codriver-direct-api-heading {
+  display: block;
+  margin-right: 0;
+}
+
+.codriver-direct-api-heading .setting-item-name,
+.codriver-direct-api-status {
+  display: inline;
+}
+
+.codriver-direct-api-heading-badge {
+  margin-inline-start: 8px;
+}
+
+.codriver-direct-api-status {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.codriver-direct-api-fields {
+  display: grid;
+  gap: 10px;
+}
+
+.codriver-direct-api-field {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-height: 32px;
+}
+
+.codriver-direct-api-field > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.codriver-direct-api-field > .codriver-mcp-tool-controls {
+  display: grid;
+  flex-shrink: 0;
+  font-size: var(--font-ui-smaller);
+  grid-template-columns: max-content minmax(5em, max-content);
+}
+
+.codriver-direct-api-field .codriver-mcp-tool-permission {
+  white-space: nowrap;
+}
+
+.codriver-direct-api-controls .codriver-mcp-tool-permission.is-disabled {
+  opacity: 0.5;
+}
+
+.is-mobile .codriver-direct-api-field,
+.is-mobile .codriver-api-plugins .codriver-mcp-tool-row {
+  align-items: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.is-mobile .codriver-direct-api-controls .codriver-mcp-tool-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+}
+
+.is-mobile .codriver-direct-api-controls .codriver-mcp-tool-permission {
+  min-height: 44px;
+  min-width: 0;
+  white-space: normal;
+}
+
+.codriver-api-plugins .codriver-mcp-tool-heading {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 480px) {
+  .codriver-direct-api-field,
+  .codriver-api-plugins .codriver-mcp-tool-row {
+    align-items: stretch;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .codriver-direct-api-controls .codriver-mcp-tool-controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+}
+
+.codriver-api-experimental-badge {
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: var(--color-yellow);
+  font-size: var(--font-ui-smaller);
+  padding: 1px 5px;
+}
+
+@media (pointer: coarse) {
+  .codriver-direct-api-controls .codriver-mcp-tool-permission { min-height: 44px; }
 }
 
 .codriver-skills-setting,
@@ -769,8 +1077,20 @@
   justify-self: end;
 }
 
-.codriver-skill-edit-button {
+.codriver-skill-edit-button,
+.codriver-skill-reset-button {
   margin: 0;
+}
+
+.codriver-skill-actions { gap: 4px; }
+
+.codriver-skill-builtin-label {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  padding: 0 5px;
+  white-space: nowrap;
 }
 
 .codriver-new-skill-actions .setting-item-info {
@@ -853,6 +1173,10 @@
 .codriver-endpoint-input {
   max-width: 100%;
   width: 22.4rem;
+}
+
+.codriver-endpoint-input[readonly] {
+  color: var(--text-muted);
 }
 
 .codriver-provider-modal {
@@ -955,7 +1279,8 @@
   width: 0;
 }
 
-.codriver-mcp-modal .codriver-mcp-bearer-row .setting-item-control button {
+.codriver-mcp-modal .codriver-mcp-bearer-row .setting-item-control button,
+.codriver-mcp-modal .codriver-oauth-client-secret .setting-item-control button {
   flex: 0 0 36px;
   width: 36px;
   min-width: 36px;
@@ -968,11 +1293,39 @@
   overflow-wrap: anywhere;
 }
 
+.codriver-mcp-modal .codriver-oauth-connection .setting-item-info {
+  display: none;
+}
+
+.codriver-mcp-modal .codriver-oauth-connection .setting-item-control {
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+}
+
+.codriver-mcp-modal .codriver-oauth-registration .setting-item-control {
+  flex-wrap: nowrap;
+}
+
+.codriver-mcp-modal .codriver-oauth-registration select {
+  flex: 1 1 0;
+  width: 0;
+}
+
+.codriver-mcp-modal .codriver-oauth-registration button {
+  flex-shrink: 0;
+}
+
+.codriver-mcp-modal button.mod-warning {
+  background-color: var(--text-error);
+  color: var(--text-on-accent);
+}
+
+.codriver-mcp-modal button.mod-warning:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
 .codriver-mcp-modal .codriver-mcp-modal-footer {
   display: block;
-  position: sticky;
-  bottom: 0;
-  background: var(--background-primary);
 }
 
 @media (max-width: 480px) {
@@ -1356,6 +1709,7 @@
   -webkit-user-select: text;
   user-select: text;
 }
+
 
 .codriver-chat-message-answer {
   min-width: 0;
@@ -1852,6 +2206,43 @@
   white-space: nowrap;
 }
 
+.codriver-provider-preset-setting .codriver-model-select-trigger,
+.codriver-provider-model-id-setting input {
+  width: 22.4rem;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.codriver-provider-modal.codriver-openai-provider-modal .codriver-provider-model-id-setting[hidden] {
+  display: none;
+}
+
+.codriver-openai-provider-modal .codriver-provider-model-setting .setting-item-control {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.is-mobile .codriver-openai-provider-modal .codriver-provider-preset-setting,
+.is-mobile .codriver-openai-provider-modal .codriver-provider-endpoint-setting,
+.is-mobile .codriver-openai-provider-modal .codriver-provider-model-id-setting,
+.is-mobile .codriver-openai-provider-modal .codriver-provider-model-setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+@media (max-width: 600px) {
+  .codriver-openai-provider-modal .codriver-provider-preset-setting,
+  .codriver-openai-provider-modal .codriver-provider-endpoint-setting,
+  .codriver-openai-provider-modal .codriver-provider-model-id-setting,
+  .codriver-openai-provider-modal .codriver-provider-model-setting {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+}
+
 .codriver-model-popover {
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
@@ -1911,6 +2302,11 @@
   margin-top: 6px;
   min-width: 0;
   width: 100%;
+}
+
+.codriver-picker-search-first .codriver-model-popover-search {
+  margin-top: 0;
+  margin-bottom: 6px;
 }
 
 .codriver-model-picker-button:focus-visible,

@@ -1,6 +1,9 @@
 const { McpCredentialError } = require("../mcp/McpCredentials");
+const { DirectApiAccess, normalizeDirectPluginApiSettings } = require("../vault/VaultReader");
+const { McpOAuthError } = require("../mcp/McpOAuthProtocol");
 const { ProviderCredentialError } = require("./ProviderCredentials");
 const { renderSecretInput } = require("./SecretInput");
+const { OPENAI_COMPATIBLE_PRESETS, getOpenAiCompatibleEndpointError, getOpenAiCompatiblePresetUpdate } = require("./defaults");
 const { McpCommandError, formatMcpCommand, parseMcpCommand } = require("./McpServerForm");
 const { Modal, Notice, Platform, PluginSettingTab, Setting, setIcon } = require("obsidian");
 const {
@@ -13,6 +16,8 @@ const {
 } = require("../constants");
 const {
   CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME,
+  CODRIVER_API_CALL_TOOL_NAME,
+  TEXT_DOCUMENT_MUTATION_TOOLS,
   createCodriverVaultMcpServer
 } = require("../mcp/CodriverVaultMcpServer");
 const {
@@ -21,6 +26,8 @@ const {
   encodeAudioTranscriptionSelection,
   getAudioTranscriptionModelChoices,
   normalizeAudioTranscriptionSettings,
+  normalizeVoiceInputSettings,
+  resolveVoiceInputSelection,
   resolveAudioTranscriptionSelection
 } = require("./AudioTranscriptionSettings");
 const {
@@ -118,6 +125,7 @@ class CoDriverSettingTab extends PluginSettingTab {
     this.openProviderModelIds = new Set();
     this.providerModelQueries = new Map();
     this.openMcpToolServerIds = new Set();
+    this.directApiPluginsOpen = false;
     this.skillListOpen = false;
     this.commandListOpen = false;
     this.discoveringMcpServerIds = new Set();
@@ -238,9 +246,58 @@ class CoDriverSettingTab extends PluginSettingTab {
       }
     }
 
+    this.renderActiveNoteContextSettings(containerEl);
     this.renderSessionHistorySettings(containerEl);
     this.renderDiagnosticLoggingSettings(containerEl);
+    this.renderFeedbackLinks(containerEl);
     return returnFocusTarget;
+  }
+
+  renderFeedbackLinks(containerEl) {
+    const footer = containerEl.createEl("footer", {
+      cls: "codriver-settings-feedback-links",
+      attr: { "aria-label": "CoDriver feedback links" }
+    });
+    const links = [
+      {
+        label: "Feedback",
+        url: "https://tally.so/r/yXZZBx",
+        icon: "message-square",
+        description: "Feedback via Tally (opens externally)"
+      },
+      {
+        label: "GitHub Issues",
+        url: "https://github.com/NikChallenger/codriver/issues",
+        icon: "github",
+        description: "GitHub Issues (public; sign in to post; opens externally)"
+      }
+    ];
+    for (const [index, definition] of links.entries()) {
+      if (index > 0) {
+        footer.createSpan({
+          cls: "codriver-settings-feedback-divider",
+          attr: { "aria-hidden": "true" }
+        });
+      }
+      const link = footer.createEl("a", {
+        cls: "codriver-settings-feedback-link",
+        attr: {
+          href: definition.url,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          title: definition.description,
+          "aria-label": definition.description
+        }
+      });
+      const icon = link.createSpan({ attr: { "aria-hidden": "true" } });
+      setIcon(icon, definition.icon);
+      link.createSpan({ text: definition.label });
+      const external = link.createSpan({
+        cls: "codriver-settings-feedback-external",
+        attr: { "aria-hidden": "true" }
+      });
+      setIcon(external, "external-link");
+    }
   }
 
   renderSettingsChildPage(containerEl, definition) {
@@ -336,6 +393,127 @@ class CoDriverSettingTab extends PluginSettingTab {
     }
 
     this.renderMcpToolLimitSettings(containerEl);
+    this.renderDirectApiAccessSettings(containerEl);
+  }
+
+  renderDirectApiAccessSettings(containerEl) {
+    const setting = new Setting(containerEl).setName("API access:");
+    setting.settingEl.addClass("codriver-direct-api-setting");
+    setting.infoEl.addClass("codriver-direct-api-heading");
+    // Match MCP rows: checkbox inputs must not inherit the mobile Setting toggle layout.
+    setting.controlEl.remove();
+    const group = setting.settingEl.createDiv({ cls: "codriver-direct-api-controls" });
+    const permission = this.plugin.settings.codriverVaultToolSettings?.[CODRIVER_API_CALL_TOOL_NAME];
+    const status = setting.infoEl.createDiv({ cls: "codriver-direct-api-status", attr: { role: "status", "aria-live": "polite" } });
+    const fields = group.createDiv({ cls: "codriver-direct-api-fields" });
+    const enabled = this.plugin.settings.enableCoDriverVaultTools !== false && permission?.enabled !== false;
+    const targets = [];
+    if (this.plugin.settings.enableDirectObsidianApiAccess === true) targets.push("Obsidian");
+    if (this.plugin.settings.enableDirectPluginApiAccess === true) targets.push("Plugin");
+    status.textContent = " " + (!enabled ? "Tool disabled" : !targets.length ? "Both API targets are off"
+      : `${targets.join(" + ")} API access`);
+    setting.infoEl.createSpan({ cls: "codriver-api-experimental-badge codriver-direct-api-heading-badge", text: "Experimental" });
+    for (const field of [
+      { key: "enableDirectObsidianApiAccess", label: "Direct Obsidian API access", description: "Allow calls to additional Obsidian APIs. Existing specialized tools retain their own availability and permissions." },
+      { key: "enableDirectPluginApiAccess", label: "Direct Plugin API access", description: "Allow calls to enabled third-party plugin APIs. Each plugin has its own Enabled and Auto permissions. Plugin methods can change files or use the network with the plugin's permissions; CoDriver proposal review does not cover their indirect effects." }
+    ]) {
+      const row = fields.createDiv({ cls: "codriver-direct-api-field" });
+      row.createSpan({ text: field.label, attr: { title: field.description } });
+      const controls = row.createDiv({ cls: "codriver-mcp-tool-controls" });
+      const choices = [{ key: field.key, caption: "Enabled", description: field.description }];
+      if (field.key === "enableDirectObsidianApiAccess") choices.push({ key: "allowAutomaticDirectObsidianApiAccess", caption: "Auto", description: "Allow these additional Obsidian API methods without confirmation." });
+      for (const choice of choices) {
+        const label = controls.createEl("label", { cls: "codriver-mcp-tool-permission" });
+        const input = label.createEl("input", { cls: "codriver-provider-visibility", attr: { type: "checkbox", title: choice.description, "aria-label": `${field.label} ${choice.caption}` } });
+        input.checked = this.plugin.settings[choice.key] === true;
+        input.disabled = !enabled || (choice.caption === "Auto" && this.plugin.settings.enableDirectObsidianApiAccess !== true);
+        if (input.disabled) label.addClass("is-disabled");
+        label.createSpan({ text: choice.caption });
+        input.addEventListener("change", async () => {
+          this.plugin.settings[choice.key] = input.checked;
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      }
+    }
+    this.renderDirectApiPlugins(fields, enabled);
+  }
+
+  renderDirectApiPlugins(container, toolEnabled) {
+    const details = container.createEl("details", { cls: "codriver-mcp-tool-details codriver-api-plugins" });
+    details.open = this.directApiPluginsOpen === true;
+    details.createEl("summary", { cls: "codriver-mcp-tool-summary", text: "Plugins" });
+    const list = details.createDiv({ cls: "codriver-mcp-tool-list" });
+    const refresh = () => {
+      list.empty();
+      const app = this.app ?? this.plugin.app ?? {};
+      if (!app.plugins?.plugins || typeof app.plugins.plugins !== "object") {
+        list.createDiv({ text: "Plugin list unavailable." });
+        return;
+      }
+      const access = new DirectApiAccess(app);
+      let plugins;
+      try { plugins = access.plugins(); } catch {
+        list.createDiv({ text: "Plugin list unavailable. Reopen Plugins to retry." });
+        return;
+      }
+      if (!plugins.length) list.createDiv({ text: "No loaded plugins." });
+      for (const { id, instance } of plugins) {
+        const row = list.createDiv({ cls: "codriver-mcp-tool-row" });
+        const heading = row.createDiv({ cls: "codriver-mcp-tool-heading" });
+        heading.createSpan({ cls: "codriver-mcp-tool-name", text: String(instance.manifest?.name || id).slice(0, 160) });
+        const version = typeof instance.manifest?.version === "string" ? instance.manifest.version : "";
+        heading.createSpan({ cls: "codriver-mcp-tool-protocol-name", text: version.slice(0, 80) });
+        const current = this.plugin.settings.directPluginApiSettings?.[id] ?? { enabled: true };
+        const controls = row.createDiv({ cls: "codriver-mcp-tool-controls" });
+        const active = toolEnabled && this.plugin.settings.enableDirectPluginApiAccess === true;
+        const inputs = {};
+        for (const [key, caption] of [["enabled", "Enabled"], ["allowAutomaticExecution", "Auto"]]) {
+          const label = controls.createEl("label", { cls: "codriver-mcp-tool-permission" });
+          const input = label.createEl("input", { cls: "codriver-provider-visibility", attr: { type: "checkbox", "aria-label": `${caption} plugin ${id}` } });
+          inputs[key] = input;
+          input.checked = key === "enabled" ? current.enabled !== false : !!version && current.allowAutomaticExecution === true && current.autoVersion === version;
+          input.disabled = !active || (key === "allowAutomaticExecution" && (current.enabled === false || !version || version.length > 80));
+          if (input.disabled) label.addClass("is-disabled");
+          label.createSpan({ text: caption });
+          input.addEventListener("change", async () => {
+            // Bind the grant to the exact displayed, still-loaded plugin version.
+            const loaded = access.plugins().find((plugin) => plugin.id === id)?.instance;
+            if (loaded !== instance || loaded?.manifest?.version !== version) { refresh(); return; }
+            const permissions = normalizeDirectPluginApiSettings(this.plugin.settings.directPluginApiSettings);
+            permissions[id] = {
+              enabled: inputs.enabled.checked,
+              allowAutomaticExecution: inputs.allowAutomaticExecution.checked,
+              autoVersion: version
+            };
+            this.plugin.settings.directPluginApiSettings = normalizeDirectPluginApiSettings(permissions);
+            await this.plugin.saveSettings();
+            this.directApiPluginsOpen = true;
+            this.display();
+          });
+        }
+      }
+    };
+    details.addEventListener("toggle", () => {
+      this.directApiPluginsOpen = details.open;
+      if (details.open) refresh();
+    });
+    if (details.open) refresh();
+  }
+
+  renderActiveNoteContextSettings(containerEl) {
+    const setting = new Setting(containerEl);
+    setting.settingEl.addClass("codriver-active-note-context-setting");
+    setting
+      .setName("Automatically include active note path to the chat context")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.enableAutomaticActiveNoteContext !== false)
+          .onChange(async (value) => {
+            this.plugin.settings.enableAutomaticActiveNoteContext = value;
+            await this.plugin.saveSettings();
+          });
+      });
   }
 
   renderSessionHistorySettings(containerEl) {
@@ -769,6 +947,7 @@ class CoDriverSettingTab extends PluginSettingTab {
           "aria-label": `Invocation: ${skill.invocation}`
         }
       });
+      if (skill.builtin) identity.createSpan({ cls: "codriver-skill-builtin-label", text: "Built-in" });
       if (skill.metadataWarning) {
         invocation.createSpan({
           cls: "codriver-skill-warning",
@@ -789,6 +968,18 @@ class CoDriverSettingTab extends PluginSettingTab {
         }
       }, "codriver-skill-edit-button");
       editButton.disabled = !skill.sourcePath;
+      if (skill.builtin) {
+        const resetButton = createIconButton(actions, "rotate-ccw", `Restore default ${skill.name} skill`, async () => {
+          resetButton.disabled = true;
+          try {
+            const review = await this.plugin.prepareBuiltinSkillReset(skill.builtinId, skill.sourcePath);
+            new BuiltinSkillResetModal(this.app, this.plugin, review, () => this.display()).open();
+          } catch {
+            new Notice("Unable to prepare skill reset. Reload skills and try again.");
+          } finally { resetButton.disabled = false; }
+        }, "codriver-skill-reset-button");
+        resetButton.disabled = !skill.sourcePath;
+      }
     }
   }
 
@@ -799,6 +990,7 @@ class CoDriverSettingTab extends PluginSettingTab {
   }
 
   renderAudioTranscriptionSettings(container) {
+    container = container.createDiv({ cls: "codriver-audio-settings-group" });
     const current = normalizeAudioTranscriptionSettings(this.plugin.settings.audioTranscription);
     const choices = getAudioTranscriptionModelChoices(this.plugin.settings);
     const selectedValue = encodeAudioTranscriptionSelection(current.providerId, current.modelId);
@@ -833,7 +1025,7 @@ class CoDriverSettingTab extends PluginSettingTab {
 
             if (choices.length === 0) {
               toggle.setValue(false);
-              new Notice(result.message);
+              new Notice("Select an OpenAI compatible provider and mode in CoDriver settings");
               return;
             }
 
@@ -844,10 +1036,11 @@ class CoDriverSettingTab extends PluginSettingTab {
         toggle.toggleEl?.setAttribute("aria-label", "Enable audio transcription");
       });
     setting.settingEl.classList.add("codriver-audio-transcription-setting");
+    setting.nameEl.setAttribute("title", AUDIO_TRANSCRIPTION_TOOLTIP);
 
     const select = setting.controlEl.createEl("button", {
       cls: "codriver-audio-transcription-select codriver-model-select-trigger",
-      text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId : `Unavailable: ${current.providerId} / ${current.modelId}`) : "Select model",
+      text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId : `Unavailable: ${current.modelId}`) : "Select model",
       attr: {
         type: "button",
         "aria-label": "Select audio transcription model",
@@ -888,6 +1081,103 @@ class CoDriverSettingTab extends PluginSettingTab {
     if (this.pendingAudioTranscriptionEnable) {
       setTimeout(() => select.focus(), 0);
     }
+    this.renderVoiceInputSettings(container, choices);
+  }
+
+  renderVoiceInputSettings(container, choices = getAudioTranscriptionModelChoices(this.plugin.settings)) {
+    if (Platform.isMobile) return;
+    const current = normalizeVoiceInputSettings(this.plugin.settings.voiceInput);
+    const selectedValue = encodeAudioTranscriptionSelection(current.providerId, current.modelId);
+    const groups = choices.map((provider) => ({ label: provider.providerName,
+      models: provider.models.map((model) => ({ model, label: model, value: encodeAudioTranscriptionSelection(provider.providerId, model) })) }));
+    const availableValues = new Set(groups.flatMap((group) => group.models.map((model) => model.value)));
+    const resolution = resolveVoiceInputSelection(this.plugin.settings);
+    const setting = new Setting(container).setName("Voice input");
+    setting.settingEl.addClass("codriver-voice-input-setting");
+    setting.nameEl.empty();
+    const disclosure = setting.nameEl.createSpan({
+      cls: "codriver-voice-input-disclosure",
+      attr: { role: "button", tabindex: "0", "aria-expanded": String(this.voiceInputExpanded === true), "aria-controls": "codriver-voice-input-options" }
+    });
+    setIcon(disclosure.createSpan({ cls: "codriver-voice-input-chevron" }), "chevron-right");
+    disclosure.createSpan({ text: "Voice input" });
+    setting.addToggle((toggle) => {
+      toggle.setValue(current.enabled || this.pendingVoiceInputEnable === true).setDisabled(Platform.isMobile)
+        .onChange(async (enabled) => {
+          if (!enabled) {
+            this.pendingVoiceInputEnable = false;
+            if (current.enabled) await this.plugin.updateVoiceInputSettings({ enabled: false });
+          } else {
+            const result = await this.plugin.updateVoiceInputSettings({ enabled: true });
+            if (result.ok) this.pendingVoiceInputEnable = false;
+            else if (choices.length) this.pendingVoiceInputEnable = true;
+            else { toggle.setValue(false); new Notice(result.message); }
+          }
+          this.display();
+        });
+      toggle.toggleEl.setAttribute("aria-label", "Enable voice input");
+      toggle.toggleEl.setAttribute("title", Platform.isMobile ? "Voice input is available only in the desktop app." : "Enable microphone input for chat.");
+    });
+    const select = setting.controlEl.createEl("button", {
+      cls: "codriver-audio-transcription-select codriver-model-select-trigger",
+      text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId
+        : `Unavailable: ${current.modelId}`) : "Select model",
+      attr: { type: "button", "aria-label": "Select voice input provider and model", title: "Uses this provider and model only for microphone input." }
+    });
+    select.disabled = Platform.isMobile || (!current.enabled && !this.pendingVoiceInputEnable);
+    if (current.providerId && current.modelId && !availableValues.has(selectedValue)) {
+      groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
+    }
+    bindModelPicker(this, select, {
+      label: "Select voice input provider and model", groups, selectedValue,
+      onChoose: async (value) => {
+        const selection = decodeAudioTranscriptionSelection(value);
+        if (!selection.providerId || !selection.modelId) return;
+        const result = await this.plugin.updateVoiceInputSettings({ enabled: current.enabled || this.pendingVoiceInputEnable === true, ...selection });
+        if (!result.ok) { new Notice(result.message); return; }
+        this.pendingVoiceInputEnable = false;
+        this.display();
+      }
+    });
+    if (current.enabled && !resolution.ok) {
+      setting.settingEl.addClass("is-invalid");
+      select.setAttribute("aria-invalid", "true");
+      select.title = resolution.message;
+    }
+    const options = container.createDiv({ cls: "codriver-voice-input-options", attr: { id: "codriver-voice-input-options" } });
+    options.hidden = this.voiceInputExpanded !== true;
+    const toggleOptions = () => {
+      this.voiceInputExpanded = !this.voiceInputExpanded;
+      options.hidden = !this.voiceInputExpanded;
+      disclosure.setAttribute("aria-expanded", String(this.voiceInputExpanded));
+    };
+    disclosure.addEventListener("click", toggleOptions);
+    disclosure.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        toggleOptions();
+      }
+    });
+    const timeout = new Setting(options).setName("Timeout");
+    timeout.settingEl.setAttribute("title", "Maximum wait for voice input after stop");
+    const input = timeout.controlEl.createEl("input", {
+      cls: "codriver-voice-input-timeout",
+      attr: { type: "number", min: "5", max: "300", step: "1", "aria-label": "Voice input timeout in seconds" }
+    });
+    input.value = String(current.timeoutSeconds);
+    input.disabled = Platform.isMobile || (!current.enabled && !this.pendingVoiceInputEnable);
+    timeout.controlEl.createSpan({ text: "seconds" });
+    input.addEventListener("change", async () => {
+      const seconds = Number(input.value);
+      if (!Number.isInteger(seconds) || seconds < 5 || seconds > 300) {
+        input.value = String(current.timeoutSeconds);
+        new Notice("Enter a whole number from 5 to 300 seconds.");
+        return;
+      }
+      const result = await this.plugin.updateVoiceInputSettings({ timeoutSeconds: seconds });
+      if (!result.ok) { input.value = String(current.timeoutSeconds); new Notice(result.message); }
+      else current.timeoutSeconds = seconds;
+    });
   }
 
   renderProviderCard(container, provider) {
@@ -1130,19 +1420,26 @@ class CoDriverSettingTab extends PluginSettingTab {
     }
 
     if (credentialStatus) {
-      new Setting(group).setName("Credentials need attention").setDesc(credentialStatus)
-        .addButton((button) => button.setButtonText("Retry migration").onClick(async () => {
+      const attention = new Setting(group).setName(server.authMode === "oauth" ? "OAuth connection" : "Credentials need attention").setDesc(credentialStatus);
+      if (server.authMode === "oauth") {
+        attention.addButton((button) => button.setButtonText("Open Settings").onClick(() => {
+          new McpServerSettingsModal(this.app, this.plugin, server, () => this.display()).open();
+        }));
+      } else {
+        attention.addButton((button) => button.setButtonText("Retry migration").onClick(async () => {
           button.setDisabled(true);
           await this.plugin.retryMcpCredentialMigration(server.id);
           this.display();
         }));
+      }
     }
     this.renderMcpToolRows(group, server, { disabled: runtimeBlocked });
   }
 
   renderBuiltInMcpServerRow(container) {
     const server = createCodriverVaultMcpServer({
-      toolSettings: this.plugin.settings.codriverVaultToolSettings
+      toolSettings: this.plugin.settings.codriverVaultToolSettings,
+      directApiSettings: { obsidian: this.plugin.settings.enableDirectObsidianApiAccess === true, plugin: this.plugin.settings.enableDirectPluginApiAccess === true }
     });
     const enabledValue = this.plugin.settings.enableCoDriverVaultTools !== false;
     server.enabled = enabledValue;
@@ -1207,7 +1504,10 @@ class CoDriverSettingTab extends PluginSettingTab {
   }
 
   renderMcpToolRows(container, server, options = {}) {
-    const tools = Array.isArray(server.tools) ? server.tools : [];
+    const tools = Array.isArray(server.tools) ? [...server.tools] : [];
+    if (server.id === "codriver-vault") {
+      tools.sort((a, b) => Number(b.name === CODRIVER_API_CALL_TOOL_NAME) - Number(a.name === CODRIVER_API_CALL_TOOL_NAME));
+    }
     if (tools.length === 0) {
       return;
     }
@@ -1280,7 +1580,12 @@ class CoDriverSettingTab extends PluginSettingTab {
           }
         });
       }
-      const description = typeof tool.description === "string" ? tool.description.trim() : "";
+      if (server.id === "codriver-vault" && tool.name === CODRIVER_API_CALL_TOOL_NAME) {
+        heading.createSpan({ cls: "codriver-api-experimental-badge", text: "Experimental" });
+      }
+      const description = server.id === "codriver-vault" && tool.name === CODRIVER_API_CALL_TOOL_NAME
+        ? "Direct access to additional Obsidian and installed plugin APIs."
+        : typeof tool.description === "string" ? tool.description.trim() : "";
       if (description) {
         identity.createDiv({
           cls: "codriver-mcp-tool-description",
@@ -1321,6 +1626,8 @@ class CoDriverSettingTab extends PluginSettingTab {
           title: options.disabled ? "Server unavailable in this runtime"
             : tool.name === CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME
               ? "Allow sending exact vault audio paths to the selected transcription provider and model without confirmation"
+              : TEXT_DOCUMENT_MUTATION_TOOLS.includes(tool.name)
+                ? "Allow this tool to write Markdown and validated Canvas files without confirmation"
               : "Allow without confirmation",
           "aria-label": `Allow ${tool.name} without confirmation`
         }
@@ -1422,6 +1729,39 @@ class NewCommandModal extends Modal {
     try { await this.plugin.openCommandFile(path, true); }
     catch (error) { new Notice(error instanceof Error ? error.message : "Unable to open the command file."); }
   }
+}
+
+class BuiltinSkillResetModal extends Modal {
+  constructor(app, plugin, review, onReset) {
+    super(app);
+    this.plugin = plugin;
+    this.review = review;
+    this.onReset = onReset;
+    this.isOpen = false;
+    this.resetting = false;
+  }
+
+  onOpen() {
+    this.isOpen = true;
+    this.contentEl.createEl("h2", { text: "Restore default skill?" });
+    this.contentEl.createEl("p", { text: "Your edits to this skill will be replaced." });
+    const actions = new Setting(this.contentEl);
+    actions.addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()));
+    actions.addButton((button) => button.setButtonText("Restore").setCta().onClick(async () => {
+      if (!this.isOpen || this.resetting) return;
+      this.resetting = true;
+      button.setDisabled(true);
+      try {
+        await this.plugin.resetBuiltinSkill(this.review, () => this.isOpen);
+        this.onReset?.();
+        this.close();
+      } catch {
+        if (this.isOpen) new Notice("Unable to restore defaults. Save the skill editor, reload skills and confirm again.");
+      } finally { this.resetting = false; button.setDisabled(false); }
+    }));
+  }
+
+  onClose() { this.isOpen = false; this.review = null; this.contentEl.empty(); }
 }
 
 class NewSkillModal extends Modal {
@@ -1631,6 +1971,10 @@ class ProviderSettingsModal extends Modal {
     this.plugin = plugin;
     this.provider = provider ? copyProvider(provider) : null;
     this.draft = provider ? copyProvider(provider) : this.plugin.createProviderDraft(OPENAI_PROVIDER_TYPE);
+    if (!provider && this.draft.type === OPENAI_PROVIDER_TYPE) this.draft.endpoint = "";
+    this.providerPresetId = "custom";
+    this.manualModelEntered = false;
+    this.modelCatalogUnavailable = false;
     this.onSaved = onSaved;
     this.credentialInput = "";
     this.savedKeyInput = "";
@@ -1659,6 +2003,7 @@ class ProviderSettingsModal extends Modal {
     if (this.saveCredentialDraft) this.saveCredentialDraft.credentialInput = "";
     this.saveCredentialDraft = null;
     this.busyControls = null;
+    this.providerPresetButton = null;
     this.provider = null;
     this.draft = null;
     this.contentEl.empty();
@@ -1721,6 +2066,8 @@ class ProviderSettingsModal extends Modal {
     contentEl.addClass("codriver-provider-modal");
 
     this.saveButtons = [];
+    this.providerPresetButton = null;
+    contentEl.toggleClass("codriver-openai-provider-modal", this.draft.type === OPENAI_PROVIDER_TYPE);
     const header = contentEl.createDiv({ cls: "codriver-provider-modal-header" });
     header.createEl("h2", { text: this.provider ? "Edit model" : "Add model" });
     this.renderActions(header, true);
@@ -1739,6 +2086,8 @@ class ProviderSettingsModal extends Modal {
           });
       });
 
+    if (this.draft.type === OPENAI_PROVIDER_TYPE) this.renderProviderPreset(contentEl);
+
     new Setting(contentEl)
       .setName("Name")
       .addText((text) => {
@@ -1754,13 +2103,18 @@ class ProviderSettingsModal extends Modal {
       .addText((text) => {
         text.inputEl.classList.add("codriver-endpoint-input");
         text.inputEl.disabled = this.draft.type === ANTHROPIC_PROVIDER_TYPE;
+        text.inputEl.readOnly = this.draft.type === OPENAI_PROVIDER_TYPE && this.providerPresetId !== "custom";
         text
           .setValue(this.draft.endpoint ?? "")
           .onChange((value) => {
+            if (this.draft.type === OPENAI_PROVIDER_TYPE && this.providerPresetId !== "custom") return;
             this.draft.endpoint = value.trim();
           });
       });
     endpointSetting.settingEl.classList.add("codriver-provider-endpoint-setting");
+    if (this.draft.type === OPENAI_PROVIDER_TYPE && this.providerPresetId === "alibaba") {
+      endpointSetting.setDesc("Choose Custom to enter your regional workspace base URL from the Alibaba Cloud console.");
+    }
 
     if (this.draft.type === GEMINI_PROVIDER_TYPE) {
       new Setting(contentEl)
@@ -1806,8 +2160,10 @@ class ProviderSettingsModal extends Modal {
     }
 
     const modelSetting = new Setting(contentEl).setName("Default model");
-    const models = Array.isArray(this.draft.models) ? this.draft.models : [];
+    modelSetting.settingEl.classList.add("codriver-provider-model-setting");
+    const models = this.getDraftModels();
     const selectedValue = models.includes(this.draft.model) ? this.draft.model : models[0] ?? "";
+    let modelIdInput = null;
     const modelButton = modelSetting.controlEl.createEl("button", {
       cls: "codriver-model-select-trigger",
       text: selectedValue || "Load models first",
@@ -1819,6 +2175,11 @@ class ProviderSettingsModal extends Modal {
       groups: [{ label: "", models: models.map((model) => ({ model, label: model, value: model })) }],
       onChoose: (value) => {
         this.draft.model = value;
+        if (this.draft.type === OPENAI_PROVIDER_TYPE && !this.draft.models?.includes(value)) {
+          this.draft.models = [...(this.draft.models || []), value];
+        }
+        this.manualModelEntered = false;
+        if (modelIdInput) modelIdInput.value = value;
         modelButton.textContent = value;
         modelButton.title = value;
         pickerOptions.selectedValue = value;
@@ -1827,9 +2188,10 @@ class ProviderSettingsModal extends Modal {
     bindModelPicker(this, modelButton, pickerOptions);
     modelSetting.addButton((button) => {
         button
-          .setButtonText("Test connection")
+          .setButtonText(this.draft.type === OPENAI_PROVIDER_TYPE ? "Load models" : "Test connection")
           .onClick(async () => {
             if (this.testing || this.saving) return;
+            if (!this.validateProviderEndpoint()) return;
             this.testing = true;
             this.setBusyControls(true);
             let result;
@@ -1837,16 +2199,47 @@ class ProviderSettingsModal extends Modal {
             catch { result = { ok: false, models: [], message: "Unable to connect to the provider. Check the endpoint, API key and account access." }; }
             finally { this.testing = false; this.restoreBusyControls(); }
             if (!this.draft) return;
+            this.modelCatalogUnavailable = !result.ok || !result.models?.length;
             if (result.ok) {
               this.draft.models = result.models;
-              this.draft.model = result.models.includes(this.draft.model)
+              if (this.manualModelEntered && this.draft.model.trim()) {
+                this.draft.models = this.getDraftModels();
+              }
+              this.draft.model = this.draft.models.includes(this.draft.model)
                 ? this.draft.model
-                : result.models[0] ?? "";
+                : this.draft.models[0] ?? "";
             }
             button.setDisabled(false);
-            this.render(result.message, result.ok);
+            const message = this.draft.type === OPENAI_PROVIDER_TYPE
+              ? result.ok ? result.models.length ? "Model list loaded. Chat compatibility depends on the selected model."
+                : "No models returned. You can enter a model ID manually."
+                : `${result.message} You can enter a model ID manually.`
+              : result.message;
+            this.render(message, result.ok);
           });
       });
+
+    if (this.draft.type === OPENAI_PROVIDER_TYPE) {
+      const manualSetting = new Setting(contentEl).setName("Model ID").addText((text) => {
+        modelIdInput = text.inputEl;
+        modelIdInput.setAttribute("aria-label", "Model ID");
+        modelIdInput.setAttribute("placeholder", "Optional");
+        modelIdInput.spellcheck = false;
+        text.setValue(this.draft.model || "").onChange((value) => {
+          this.draft.model = value.trim();
+          this.manualModelEntered = Boolean(this.draft.model);
+          this.modelPickerPopover?.close();
+          const currentModels = this.getDraftModels();
+          modelButton.textContent = this.draft.model || (currentModels.length ? "Choose loaded model" : "Load models first");
+          modelButton.title = modelButton.textContent;
+          modelButton.disabled = currentModels.length === 0;
+          pickerOptions.selectedValue = this.draft.model;
+          pickerOptions.groups = [{ label: "", models: currentModels.map((model) => ({ model, label: model, value: model })) }];
+        });
+      });
+      manualSetting.settingEl.classList.add("codriver-provider-model-id-setting");
+      manualSetting.settingEl.hidden = !this.shouldShowManualModelId();
+    }
 
     if (statusText) {
       const status = contentEl.createDiv({ cls: "codriver-setting-status", text: statusText });
@@ -1891,6 +2284,8 @@ class ProviderSettingsModal extends Modal {
 
   async saveDraft() {
     if (this.saving || this.testing) return;
+    if (!this.validateProviderEndpoint()) return;
+    if (this.draft.type === OPENAI_PROVIDER_TYPE && this.manualModelEntered) this.draft.models = this.getDraftModels();
     this.saving = true;
     let failure = "";
     this.setBusyControls();
@@ -1923,6 +2318,10 @@ class ProviderSettingsModal extends Modal {
     this.saveCredentialDraft = null;
     this.otherKeysPending = false;
     const next = this.plugin.createProviderDraft(type);
+    if (type === OPENAI_PROVIDER_TYPE) next.endpoint = "";
+    this.providerPresetId = "custom";
+    this.manualModelEntered = false;
+    this.modelCatalogUnavailable = false;
     const existingId = this.provider?.id;
     this.draft = {
       ...next,
@@ -1930,6 +2329,73 @@ class ProviderSettingsModal extends Modal {
     };
     this.credentialAction = this.provider ? "clear" : "keep";
     this.render();
+  }
+
+  renderProviderPreset(contentEl) {
+    const setting = new Setting(contentEl).setName("Preset");
+    setting.settingEl.classList.add("codriver-provider-preset-setting");
+    const selected = OPENAI_COMPATIBLE_PRESETS.find((preset) => preset.id === this.providerPresetId)
+      || OPENAI_COMPATIBLE_PRESETS[0];
+    const button = setting.controlEl.createEl("button", {
+      cls: "codriver-model-select-trigger",
+      text: selected.name,
+      attr: { type: "button", "aria-label": "Select provider preset", title: selected.name }
+    });
+    this.providerPresetButton = button;
+    bindModelPicker(this, button, {
+      label: "Select provider preset", listLabel: "Provider presets", searchLabel: "Search provider presets",
+      searchFirst: true,
+      searchPlaceholder: "Search providers...", emptyText: "No matching providers", selectedValue: selected.id,
+      groups: [{ label: "", models: OPENAI_COMPATIBLE_PRESETS.map((preset) => ({
+        model: `${preset.name} ${preset.aliases}`, label: preset.name, value: preset.id
+      })) }],
+      onChoose: (id) => this.applyProviderPreset(id)
+    });
+  }
+
+  applyProviderPreset(id) {
+    if (!this.draft || this.draft.type !== OPENAI_PROVIDER_TYPE || this.saving || this.testing) return;
+    const proposal = getOpenAiCompatiblePresetUpdate(this.draft, id);
+    if (!proposal) return;
+    const hadValues = Boolean(this.credentialInput || this.draft.apiKeySecretName || this.draft.model
+      || this.draft.models?.length || this.draft.temperature || this.draft.topP || this.draft.topK || this.draft.reasoningEffort);
+    if (proposal.endpointChanged) {
+      this.plugin.discardProviderCredentialDraft?.(this.saveCredentialDraft);
+      if (this.saveCredentialDraft) this.saveCredentialDraft.credentialInput = "";
+      this.saveCredentialDraft = null;
+      this.otherKeysPending = false;
+      this.clearCredential();
+      this.credentialAction = "clear";
+      this.credentialError = "";
+      this.manualModelEntered = false;
+      this.modelCatalogUnavailable = false;
+    }
+    Object.assign(this.draft, proposal.update);
+    this.providerPresetId = id;
+    this.render(proposal.endpointChanged && hadValues ? "Endpoint changed. Draft key, models and parameters cleared." : "");
+    this.providerPresetButton?.focus();
+  }
+
+  getDraftModels() {
+    const models = Array.isArray(this.draft.models) ? this.draft.models : [];
+    if (this.draft.type === OPENAI_PROVIDER_TYPE && this.manualModelEntered && this.draft.model
+      && !models.includes(this.draft.model)) return [...models, this.draft.model];
+    return models;
+  }
+
+  shouldShowManualModelId() {
+    if (this.draft.type !== OPENAI_PROVIDER_TYPE) return false;
+    if (this.modelCatalogUnavailable) return true;
+    // Catalog support is unverified or incompatible with the current adapter for these templates.
+    return ["custom", "together", "fireworks", "deepinfra", "zai", "nvidia", "alibaba"].includes(this.providerPresetId);
+  }
+
+  validateProviderEndpoint() {
+    if (this.draft.type !== OPENAI_PROVIDER_TYPE) return true;
+    const message = getOpenAiCompatibleEndpointError(this.draft.endpoint);
+    if (!message) return true;
+    this.render(message, false);
+    return false;
   }
 
   renderGenerationParameters(contentEl) {
@@ -2062,10 +2528,17 @@ class McpServerSettingsModal extends Modal {
     this.credentialAction = "keep";
     this.showInput = false;
     this.saving = false;
+    this.oauthBusy = false;
   }
 
   onOpen() {
     let message = "";
+    if (this.server?.authMode === "oauth" && !Platform.isMobile) {
+      try {
+        this.savedCredentialInput = this.plugin.getMcpOAuthService().read(this.server)?.clientSecret || "";
+        this.credentialInput = this.savedCredentialInput;
+      } catch (error) { message = error instanceof McpOAuthError ? error.message : "OAuth credentials are unavailable."; }
+    }
     if (this.server?.transport === MCP_HTTP_TRANSPORT && ["bearer", "custom-headers"].includes(this.server.authMode) && this.server.authSecretName) {
       try {
         this.savedCredentialInput = this.plugin.getMcpCredentialService().readInputValue(this.server);
@@ -2078,6 +2551,9 @@ class McpServerSettingsModal extends Modal {
   }
 
   onClose() {
+    if (this.oauthBusy && this.server) this.plugin.getMcpOAuthService().cancel(this.server.id);
+    this.oauthReviewModal?.close();
+    this.oauthReviewModal = null;
     this.credentialInput = "";
     this.savedCredentialInput = "";
     if (this.secretInputEl) this.secretInputEl.value = "";
@@ -2090,6 +2566,7 @@ class McpServerSettingsModal extends Modal {
 
   render(statusText = "") {
     if (!this.draft) return;
+    this.oauthConnectButton = null;
     if (this.secretInputEl) this.secretInputEl.value = "";
     this.secretInputEl = null;
     const { contentEl } = this;
@@ -2098,16 +2575,18 @@ class McpServerSettingsModal extends Modal {
     this.modalEl?.addClass("codriver-mcp-modal-shell");
     contentEl.createEl("h2", { text: this.server ? "Edit MCP server" : "Add MCP server" });
     const stdioSupported = isStdioMcpSupported(this.plugin);
-    const blocked = this.draft.transport === MCP_STDIO_TRANSPORT && !stdioSupported;
+    const mobileOAuth = Platform.isMobile && this.draft.authMode === "oauth";
+    const blocked = (this.draft.transport === MCP_STDIO_TRANSPORT && !stdioSupported) || mobileOAuth;
+    const oauthLocked = this.oauthFieldsLocked();
     const status = contentEl.createDiv({ cls: "codriver-setting-status", text: statusText });
     status.setAttribute("role", statusText ? "alert" : "status");
     if (statusText) {
       status.addClass("is-error");
       contentEl.scrollTop = 0;
     }
-    if (blocked) contentEl.createDiv({ cls: "codriver-setting-status", text: getStdioMcpUnavailableMessage(this.plugin) });
+    if (blocked) contentEl.createDiv({ cls: "codriver-setting-status", text: mobileOAuth ? "This OAuth connection is available on desktop only." : getStdioMcpUnavailableMessage(this.plugin) });
     const credentialStatus = this.server ? this.plugin.getMcpCredentialStatus?.(this.server) : "";
-    if (credentialStatus) {
+    if (credentialStatus && this.server.authMode !== "oauth") {
       new Setting(contentEl).setName("Credentials need attention").setDesc(credentialStatus)
         .addButton((button) => button.setButtonText("Retry migration").setDisabled(this.saving)
           .onClick(async () => {
@@ -2124,13 +2603,13 @@ class McpServerSettingsModal extends Modal {
     }
 
     new Setting(contentEl).setName("Name").addText((text) => {
-      text.setValue(this.draft.name).setDisabled(blocked || this.saving).onChange((value) => { this.draft.name = value; });
+      text.setValue(this.draft.name).setDisabled(blocked || this.saving || this.oauthBusy).onChange((value) => { this.draft.name = value; this.updateOAuthControls(); });
       text.inputEl.setAttribute("aria-label", "MCP server name");
     });
     new Setting(contentEl).setName("Transport").addDropdown((dropdown) => {
       if (stdioSupported || this.draft.transport === MCP_STDIO_TRANSPORT) dropdown.addOption(MCP_STDIO_TRANSPORT, "stdio");
       dropdown.addOption(MCP_HTTP_TRANSPORT, "HTTP").setValue(this.draft.transport)
-        .setDisabled(blocked || this.saving).onChange((value) => {
+        .setDisabled(blocked || oauthLocked || this.saving || this.oauthBusy).onChange((value) => {
           this.draft.transport = value;
           this.credentialInput = "";
           this.credentialAction = "keep";
@@ -2139,19 +2618,27 @@ class McpServerSettingsModal extends Modal {
       dropdown.selectEl?.setAttribute("aria-label", "MCP transport");
     });
     new Setting(contentEl).setName("Enabled").addToggle((toggle) => {
-      toggle.setValue(this.draft.enabled !== false).setDisabled(blocked || this.saving)
-        .onChange((value) => { this.draft.enabled = value; });
+      toggle.setValue(this.draft.enabled !== false).setDisabled(blocked || oauthLocked || this.saving || this.oauthBusy)
+        .onChange((value) => { this.draft.enabled = value; this.updateOAuthControls(); });
     });
-    if (this.draft.transport === MCP_HTTP_TRANSPORT) {
+    if (this.draft.transport === MCP_HTTP_TRANSPORT && mobileOAuth) {
+      new Setting(contentEl).setName("Authentication").setDesc("OAuth 2 - desktop only");
+    } else if (this.draft.transport === MCP_HTTP_TRANSPORT) {
       new Setting(contentEl).setName("Endpoint").addText((text) => {
         text.setValue(this.draft.endpoint ?? "").setPlaceholder("https://example.com/mcp")
-          .setDisabled(this.saving).onChange((value) => { this.draft.endpoint = value; });
+          .setDisabled(oauthLocked || this.saving || this.oauthBusy).onChange((value) => {
+            this.draft.endpoint = value;
+            if (this.draft.authMode === "oauth") this.clearOAuthSecretDraft();
+            this.updateOAuthControls();
+          });
         text.inputEl.setAttribute("aria-label", "MCP HTTP endpoint");
       });
       new Setting(contentEl).setName("Authentication").addDropdown((dropdown) => {
-        dropdown.addOption("none", "None").addOption("bearer", "Bearer")
-          .addOption("custom-headers", "Custom headers").setValue(this.draft.authMode)
-          .setDisabled(this.saving).onChange((value) => {
+        dropdown.addOption("bearer", "Bearer");
+        if (!Platform.isMobile) dropdown.addOption("oauth", "OAuth 2");
+        dropdown.addOption("custom-headers", "Custom headers").addOption("none", "None");
+        dropdown.setValue(this.draft.authMode)
+          .setDisabled(oauthLocked || this.saving || this.oauthBusy).onChange((value) => {
             this.draft.authMode = value;
             this.credentialInput = "";
             this.credentialAction = value === "none" ? "clear" : "replace";
@@ -2171,6 +2658,8 @@ class McpServerSettingsModal extends Modal {
             this.credentialAction = !value ? "clear" : value === this.savedCredentialInput && this.server?.authMode === "bearer" ? "keep" : "replace";
           }
         });
+      } else if (this.draft.authMode === "oauth") {
+        this.renderOAuthSettings(contentEl);
       } else if (this.draft.authMode !== "none") {
         new Setting(contentEl).setName("Headers").setDesc("Stored in Obsidian keychain").addTextArea((text) => {
           text.setValue(this.credentialInput).setDisabled(this.saving).onChange((value) => {
@@ -2203,7 +2692,7 @@ class McpServerSettingsModal extends Modal {
     const footer = new Setting(contentEl);
     footer.settingEl.addClass("codriver-mcp-modal-footer");
     footer.addButton((button) => button.setButtonText("Cancel").setDisabled(this.saving).onClick(() => this.close()));
-    footer.addButton((button) => button.setButtonText(this.saving ? "Saving..." : "Save").setCta().setDisabled(blocked || this.saving).onClick(async () => {
+    footer.addButton((button) => button.setButtonText(this.saving ? "Saving..." : "Save").setCta().setDisabled(blocked || this.saving || this.oauthBusy).onClick(async () => {
       if (this.saving) return;
       try {
         if (this.draft.transport === MCP_STDIO_TRANSPORT) Object.assign(this.draft, parseMcpCommand(this.commandInput, this.server));
@@ -2213,18 +2702,158 @@ class McpServerSettingsModal extends Modal {
         this.saving = true;
         this.render();
         await this.plugin.saveMcpServerDraft(draft);
+        this.saving = false;
         this.close();
         this.onSaved?.();
       } catch (error) {
         this.saving = false;
-        const message = error instanceof McpCredentialError || error instanceof McpCommandError ? error.message : "Unable to save MCP server. Check the command and settings, then retry.";
+        const message = error instanceof McpCredentialError || error instanceof McpCommandError || error instanceof McpOAuthError ? error.message : "Unable to save MCP server. Check the command and settings, then retry.";
         this.render(message);
         new Notice(message);
       }
     }));
   }
+
+  oauthDraftChanged() {
+    const keys = ["transport", "endpoint", "authMode", "enabled"];
+    if (!this.server || keys.some((key) => this.draft[key] !== this.server[key]) || this.credentialAction !== "keep") return true;
+    return (this.draft.oauthRegistration || "automatic") !== (this.server.oauthRegistration || "automatic")
+      || (this.draft.oauthClientId || "") !== (this.server.oauthClientId || "")
+      || String(this.draft.oauthCallbackPort || "") !== String(this.server.oauthCallbackPort || "");
+  }
+
+  clearOAuthSecretDraft() {
+    this.credentialInput = ""; this.savedCredentialInput = ""; this.credentialAction = "replace";
+    if (this.secretInputEl) this.secretInputEl.value = "";
+  }
+
+  renderOAuthSettings(contentEl) {
+    const locked = this.oauthFieldsLocked();
+    this.draft.oauthRegistration ??= "automatic";
+    const registration = new Setting(contentEl).setName("Client registration");
+    registration.settingEl.addClass("codriver-oauth-registration");
+    registration.addDropdown((dropdown) => {
+      dropdown.addOption("automatic", "Automatic").addOption("existing", "Existing client")
+        .setValue(this.draft.oauthRegistration).setDisabled(locked || this.saving || this.oauthBusy)
+        .onChange((value) => { this.draft.oauthRegistration = value; this.render(); });
+    });
+    if (this.draft.oauthRegistration === "automatic") this.addOAuthAction(registration);
+    if (this.draft.oauthRegistration === "existing") {
+      new Setting(contentEl).setName("Client ID").addText((text) => {
+        text.setValue(this.draft.oauthClientId || "").setDisabled(locked || this.saving || this.oauthBusy)
+          .onChange((value) => { this.draft.oauthClientId = value; this.clearOAuthSecretDraft(); this.updateOAuthControls(); });
+        text.inputEl.setAttribute("aria-label", "OAuth Client ID");
+      });
+      const secret = new Setting(contentEl).setName("Client Secret").setDesc("Optional");
+      secret.settingEl.addClass("codriver-oauth-client-secret");
+      this.secretInputEl = renderSecretInput(secret, {
+        value: this.credentialInput, visible: this.showInput, disabled: locked || this.saving || this.oauthBusy,
+        placeholder: "", label: "OAuth Client Secret", visibilityLabel: "client secret",
+        onVisibilityChange: (visible) => { this.showInput = visible; },
+        onChange: (value) => { this.credentialInput = value; this.credentialAction = value === this.savedCredentialInput ? "keep" : "replace"; this.updateOAuthControls(); }
+      });
+      new Setting(contentEl).setName("Callback port").setDesc("Optional").addText((text) => {
+        text.setValue(String(this.draft.oauthCallbackPort || "")).setPlaceholder("Automatic").setDisabled(locked || this.saving || this.oauthBusy)
+          .onChange((value) => { this.draft.oauthCallbackPort = value; this.updateOAuthControls(); });
+        text.inputEl.setAttribute("inputmode", "numeric"); text.inputEl.setAttribute("aria-label", "OAuth callback port");
+      });
+      const connection = new Setting(contentEl);
+      connection.settingEl.addClass("codriver-oauth-connection");
+      this.addOAuthAction(connection);
+    }
+    this.updateOAuthControls();
+  }
+
+  addOAuthAction(connection) {
+    connection.addButton((button) => {
+      this.oauthConnectButton = button;
+      button.onClick(async () => {
+        if (this.saving) return;
+        const service = this.plugin.getMcpOAuthService();
+        if (this.oauthBusy) {
+          service.cancel(this.server.id); this.oauthReviewModal?.close(); this.oauthBusy = false; this.render(); return;
+        }
+        if (this.oauthIsConnected()) {
+          this.saving = true; this.render();
+          try { await service.disconnect(this.server); this.saving = false; this.render(); this.onSaved?.(); }
+          catch (error) { this.saving = false; this.render(error instanceof McpOAuthError ? error.message : "OAuth cleanup failed."); }
+          return;
+        }
+        await this.connectOAuth();
+      });
+    });
+  }
+
+  oauthIsConnected() {
+    return this.oauthFieldsLocked();
+  }
+
+  oauthFieldsLocked() {
+    if (this.server?.authMode !== "oauth") return false;
+    const service = this.plugin.getMcpOAuthService();
+    try { return service.locked ? service.locked(this.server) : service.status(this.server) === "Connected"; }
+    catch { return true; }
+  }
+
+  updateOAuthControls() {
+    if (!this.draft || this.draft.authMode !== "oauth" || !this.oauthConnectButton) return;
+    const service = this.plugin.getMcpOAuthService(), connected = this.oauthIsConnected();
+    this.oauthConnectButton.setButtonText(this.oauthBusy ? "Cancel authorization" : connected ? "Disconnect" : "Connect")
+      .setDisabled(this.saving || this.draft.enabled === false || !service.supported());
+    this.oauthConnectButton.buttonEl.toggleClass("mod-warning", connected && !this.oauthBusy);
+  }
+
+  async connectOAuth() {
+    if (!this.draft || this.saving || this.oauthBusy || this.draft.enabled === false) return;
+    const service = this.plugin.getMcpOAuthService();
+    if (!service.supported()) return;
+    this.oauthBusy = true; this.render();
+    try {
+      const draft = copyMcpServer(this.draft);
+      draft.credentialInput = this.credentialInput;
+      draft.credentialAction = this.credentialAction;
+      this.saving = true; this.render();
+      let saved;
+      try { saved = await this.plugin.saveMcpServerDraft(draft); }
+      finally { this.saving = false; }
+      // Closing while saving must not start a new authorization or restore the modal draft.
+      if (!this.draft || !this.oauthBusy) return;
+      this.server = copyMcpServer(saved); this.draft = copyMcpServer(saved);
+      this.savedCredentialInput = service.read(saved)?.clientSecret || "";
+      this.credentialInput = this.savedCredentialInput; this.credentialAction = "keep";
+      this.onSaved?.(); this.render();
+      const review = await service.prepare(this.server);
+      if (!this.draft || !this.oauthBusy) return;
+      this.oauthReviewModal = new McpOAuthReviewModal(this.app, this.server.name, review, async () => {
+        try {
+          const pending = service.authorize(this.server, (url) => { this.render(); window.open(url); });
+          this.render(); await pending;
+          if (this.draft) this.draft = copyMcpServer(this.server);
+          this.oauthBusy = false; if (this.draft) this.render(); this.onSaved?.();
+        } catch (error) { this.oauthBusy = false; if (this.draft) this.render(error instanceof McpOAuthError ? error.message : "OAuth connection failed."); }
+      }, () => { service.cancel(this.server.id); this.oauthBusy = false; if (this.draft) this.render(); });
+      this.oauthReviewModal.open();
+    } catch (error) { this.oauthBusy = false; if (this.draft) this.render(error instanceof McpOAuthError || error instanceof McpCredentialError ? error.message : "Unable to save or connect the MCP server. Review the settings and retry."); }
+  }
+}
+
+class McpOAuthReviewModal extends Modal {
+  constructor(app, name, review, accept, cancel) { super(app); this.serverName = name; this.review = review; this.accept = accept; this.cancel = cancel; this.accepted = false; }
+  onOpen() {
+    this.contentEl.createEl("h2", { text: `Authorize ${this.serverName}` });
+    new Setting(this.contentEl).setName("Authorization server").setDesc(new URL(this.review.issuer).host);
+    new Setting(this.contentEl).setName("Requested access").setDesc(this.review.scope || "Server default scopes");
+    if (this.review.resource && this.review.resource !== this.review.endpoint) {
+      new Setting(this.contentEl).setName("MCP endpoint").setDesc(this.review.endpoint);
+      new Setting(this.contentEl).setName("OAuth resource").setDesc(this.review.resource);
+    }
+    new Setting(this.contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setButtonText("Continue in browser").setCta().onClick(() => { this.accepted = true; this.close(); void this.accept(); }));
+  }
+  onClose() { if (!this.accepted) this.cancel(); this.contentEl.empty(); }
 }
 module.exports = {
+  BuiltinSkillResetModal,
   CoDriverSettingTab,
   McpServerSettingsModal,
   ProviderSettingsModal,

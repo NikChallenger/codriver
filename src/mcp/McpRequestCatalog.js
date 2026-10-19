@@ -321,7 +321,8 @@ function createCatalogEntry(server, tool, metadata = {}) {
       allowAutomaticProposalApplication: tool.allowAutomaticProposalApplication === true,
       automaticPermissionConfigurable: tool.automaticPermissionConfigurable === true,
       automaticPermissionReadonly: tool.automaticPermissionReadonly === true,
-      writesVault: tool.writesVault === true
+      writesVault: tool.writesVault === true,
+      ...(typeof tool.executionBinding === "string" ? { executionBinding: tool.executionBinding } : {})
     },
     required: metadata.required === true,
     skillScoped: metadata.required === true,
@@ -349,7 +350,8 @@ function createMcpCatalogFingerprint(catalog) {
         outputSchema: entry.tool?.outputSchema,
         annotations: entry.tool?.annotations,
         enabled: entry.tool?.enabled !== false,
-        writesVault: entry.tool?.writesVault === true
+        writesVault: entry.tool?.writesVault === true,
+        ...(typeof entry.tool?.executionBinding === "string" ? { executionBinding: entry.tool.executionBinding } : {})
       },
       required: entry.required,
       skillScoped: entry.skillScoped,

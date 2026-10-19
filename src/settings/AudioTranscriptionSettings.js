@@ -3,7 +3,7 @@ const { OPENAI_COMPATIBLE_PROVIDER_TYPE } = require("../constants");
 const AUDIO_TRANSCRIPTION_DISABLED_MESSAGE = "Audio transcription is off. Enable it in CoDriver Settings before adding audio.";
 const AUDIO_TRANSCRIPTION_SELECTION_REQUIRED_MESSAGE = "Select an audio transcription model in CoDriver Settings before adding audio.";
 const AUDIO_TRANSCRIPTION_SELECTION_UNAVAILABLE_MESSAGE = "The selected transcription model is unavailable. Select another model in CoDriver Settings.";
-const AUDIO_TRANSCRIPTION_TOOLTIP = "Uses the selected provider and model for audio transcription.";
+const AUDIO_TRANSCRIPTION_TOOLTIP = "Transcribe audio files with the selected model.";
 
 const DEFAULT_AUDIO_TRANSCRIPTION_SETTINGS = Object.freeze({
   enabled: false,
@@ -17,6 +17,39 @@ function normalizeAudioTranscriptionSettings(value) {
     providerId: normalizeIdentity(value?.providerId),
     modelId: normalizeIdentity(value?.modelId)
   };
+}
+
+const DEFAULT_VOICE_INPUT_SETTINGS = Object.freeze({
+  enabled: false,
+  providerId: "",
+  modelId: "",
+  timeoutSeconds: 15
+});
+
+function normalizeVoiceInputSettings(value, legacyAudio = null) {
+  // Preserve only the exact previously enabled voice destination during the split.
+  const source = value === undefined && legacyAudio?.voiceInputEnabled === true
+    ? { enabled: true, providerId: legacyAudio.providerId, modelId: legacyAudio.modelId }
+    : value;
+  const timeout = source?.timeoutSeconds;
+  return {
+    enabled: source?.enabled === true,
+    providerId: normalizeIdentity(source?.providerId),
+    modelId: normalizeIdentity(source?.modelId),
+    timeoutSeconds: typeof timeout === "number" && Number.isFinite(timeout)
+      ? Math.max(5, Math.min(300, Math.floor(timeout))) : DEFAULT_VOICE_INPUT_SETTINGS.timeoutSeconds
+  };
+}
+
+function resolveVoiceInputSelection(settings, options = {}) {
+  const voiceInput = normalizeVoiceInputSettings(settings?.voiceInput);
+  const result = resolveAudioTranscriptionSelection({ ...settings, audioTranscription: voiceInput }, options);
+  if (!result.ok) {
+    return { ...result, message: !voiceInput.enabled && options.requireEnabled !== false
+      ? "Voice input is off. Enable it in CoDriver Settings."
+      : "Select an available voice input provider and model in CoDriver Settings." };
+  }
+  return result;
 }
 
 function getAudioTranscriptionModelChoices(settings) {
@@ -125,6 +158,9 @@ module.exports = {
   AUDIO_TRANSCRIPTION_SELECTION_UNAVAILABLE_MESSAGE,
   AUDIO_TRANSCRIPTION_TOOLTIP,
   DEFAULT_AUDIO_TRANSCRIPTION_SETTINGS,
+  DEFAULT_VOICE_INPUT_SETTINGS,
+  normalizeVoiceInputSettings,
+  resolveVoiceInputSelection,
   decodeAudioTranscriptionSelection,
   encodeAudioTranscriptionSelection,
   getAudioTranscriptionModelChoices,
