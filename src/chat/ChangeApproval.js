@@ -83,6 +83,9 @@ function createPendingPatchProposal(input) {
   }
 
   if (input.kind === "frontmatter") {
+    if (notePath.toLowerCase().endsWith(".canvas")) {
+      throw new Error("Canvas patches support text changes only, not frontmatter.");
+    }
     if (Object.hasOwn(input, "changes")) {
       throw new Error("Frontmatter note patches must use before and after objects instead of text changes.");
     }
@@ -107,11 +110,14 @@ function normalizePatchNotePath(value) {
   }
 
   const path = value.trim().replace(/\\/g, "/").replace(/^\/+/, "");
+  if (path.toLowerCase().endsWith(".canvas") && (value !== path || /[:\u0000-\u001f\u007f]/.test(path) || path.split("/").some((part) => !part))) {
+    throw new Error("Canvas patch requires an exact normalized vault-relative path.");
+  }
   if (
-    !path.toLowerCase().endsWith(".md") ||
+    !/\.(?:md|canvas)$/i.test(path) ||
     path.split("/").some((segment) => segment === "." || segment === "..")
   ) {
-    throw new Error("Note patch path must be a vault-relative Markdown path.");
+    throw new Error("Note patch path must be a vault-relative Markdown or Canvas path.");
   }
 
   return path;

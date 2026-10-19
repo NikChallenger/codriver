@@ -1,11 +1,14 @@
-const { Notice, Platform, Plugin } = require("obsidian");
+const { Notice, Platform, Plugin, requireApiVersion } = require("obsidian");
+const { normalizeDirectPluginApiSettings } = require("./vault/VaultReader");
 const { ConnectionRemoval, ConnectionRemovalError } = require("./settings/ConnectionRemoval");
 const { ReleaseNotes } = require("./views/ReleaseNotes");
 const { normalizeReleaseNotesVersion } = require("./settings/ReleaseNotesSettings");
 const { ChatController, COMMAND_ACTION_SESSION_MODE } = require("./chat/ChatController");
+const { BUILTIN_SKILLS, getBuiltinSkill } = require("./skills/BuiltinSkills");
 const {
   DEFAULT_MAX_MCP_TOOLS,
   DEFAULT_SETTINGS,
+  getOpenAiCompatibleEndpointError,
   MAX_MCP_TOOLS_SETTING,
   MAX_REQUEST_CONTEXT_CHARS_SETTING,
   MIN_MCP_TOOLS,
@@ -16,6 +19,8 @@ const { CoDriverSettingTab } = require("./settings/CoDriverSettingTab");
 const { ProviderCredentialError, ProviderCredentialService, validateKey } = require("./settings/ProviderCredentials");
 const {
   normalizeAudioTranscriptionSettings,
+  normalizeVoiceInputSettings,
+  resolveVoiceInputSelection,
   resolveAudioTranscriptionSelection
 } = require("./settings/AudioTranscriptionSettings");
 const {
@@ -42,7 +47,7 @@ const { OpenAiCompatibleProvider } = require("./providers/openai-compatible/Open
 const { GeminiProvider } = require("./providers/gemini/GeminiProvider");
 const { AnthropicProvider } = require("./providers/anthropic/AnthropicProvider");
 const { SessionStorage } = require("./chat/SessionStorage");
-const { ChatView } = require("./views/ChatView");
+const { ChatView, createCanvasWriteGuard } = require("./views/ChatView");
 const {
   CommandActionModal,
   CommandActionPickerModal,
@@ -66,6 +71,8 @@ const {
 const { DiagnosticLogger } = require("./diagnostics/DiagnosticLogger");
 const { McpHttpClient } = require("./mcp/McpHttpClient");
 const { McpCredentialError, McpCredentialService } = require("./mcp/McpCredentials");
+const { McpOAuthService } = require("./mcp/McpOAuthService");
+const { bindingKey } = require("./mcp/McpOAuthProtocol");
 const { McpStdioClient } = require("./mcp/McpStdioClient");
 const {
   STDIO_MCP_UNAVAILABLE_MESSAGE,
@@ -73,6 +80,8 @@ const {
 } = require("./mcp/McpRuntimeSupport");
 const {
   CODRIVER_VAULT_CONFIGURABLE_AUTO_TOOL_NAMES,
+  TEXT_DOCUMENT_AUTO_CONSENT_VERSION,
+  TEXT_DOCUMENT_MUTATION_TOOLS,
   CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME,
   VAULT_AUDIO_AUTO_CONSENT_VERSION,
   CODRIVER_VAULT_TOOL_NAMES,
@@ -107,7 +116,7 @@ function hasPersistedApiKey(settings) {
 function mcpConnectionFingerprint(server, ignoreEnabled = false) {
   return JSON.stringify([server.name, server.transport, server.command, server.args, server.env, server.endpoint,
     server.headers, server.credentialSchemaVersion, server.authMode, server.authSecretName, server.authHeaderPolicy, server.migrationSecretName,
-    ignoreEnabled ? null : server.enabled]);
+    server.oauthRegistration, server.oauthClientId, server.oauthCallbackPort, server.oauthSession, ignoreEnabled ? null : server.enabled]);
 }
 
 function normalizeSettings(settings) {
@@ -131,6 +140,7 @@ function normalizeSettings(settings) {
   settings.mcpServers = Array.isArray(settings.mcpServers)
     ? settings.mcpServers.map((server, index) => normalizeMcpServerSettings(server, index))
     : [];
+  settings.voiceInput = normalizeVoiceInputSettings(settings.voiceInput, settings.audioTranscription);
   settings.audioTranscription = normalizeAudioTranscriptionSettings(settings.audioTranscription);
 
   const enabledProviders = settings.providers.filter((provider) => provider.enabled !== false);
@@ -164,6 +174,8 @@ function normalizeSettings(settings) {
   }
 
   settings.skillSettings = normalizeSkillSettings(settings.skillSettings);
+  delete settings.suggestBuiltinSkills;
+  delete settings.builtinSkillSuggestionsShown;
   settings.commandSettings = normalizeSkillSettings(settings.commandSettings);
   settings.commandFolderPath = normalizeCommandFolderPath(settings.commandFolderPath ?? DEFAULT_COMMAND_FOLDER_PATH);
   settings.skillFolderPath = normalizeSkillFolderPath(
@@ -172,6 +184,7 @@ function normalizeSettings(settings) {
   if (settings.skillFolderPath === LEGACY_HIDDEN_SKILL_FOLDER_PATH) {
     settings.skillFolderPath = DEFAULT_SKILL_FOLDER_PATH;
   }
+  settings.enableAutomaticActiveNoteContext = settings.enableAutomaticActiveNoteContext !== false;
   settings.enableSessionHistory = settings.enableSessionHistory !== false;
   settings.maxSessionHistory = normalizeMaxSessionHistory(settings.maxSessionHistory);
   settings.sessionStartupBehavior = normalizeSessionStartupBehavior(settings.sessionStartupBehavior);
@@ -182,6 +195,10 @@ function normalizeSettings(settings) {
   delete settings.maxRecentMcpToolResultContextChars;
   settings.maxRequestContextChars = normalizeMaxRequestContextChars(settings.maxRequestContextChars);
   settings.enableCoDriverVaultTools = settings.enableCoDriverVaultTools !== false;
+  settings.enableDirectObsidianApiAccess = settings.enableDirectObsidianApiAccess === true;
+  settings.allowAutomaticDirectObsidianApiAccess = settings.allowAutomaticDirectObsidianApiAccess === true;
+  settings.enableDirectPluginApiAccess = settings.enableDirectPluginApiAccess === true;
+  settings.directPluginApiSettings = normalizeDirectPluginApiSettings(settings.directPluginApiSettings);
   settings.codriverVaultToolSettings = normalizeCodriverVaultToolSettings(settings.codriverVaultToolSettings);
   settings.enableDiagnosticLogging = settings.enableDiagnosticLogging === true;
   settings.diagnosticLogLevel = normalizeDiagnosticLogLevel(settings.diagnosticLogLevel);
@@ -557,6 +574,18 @@ function normalizeMcpServerSettings(server, index = 0) {
     ...(typeof server?.authSecretName === "string" ? { authSecretName: server.authSecretName } : {}),
     ...(server?.authHeaderPolicy != null ? { authHeaderPolicy: server.authHeaderPolicy } : {}),
     ...(typeof server?.migrationSecretName === "string" ? { migrationSecretName: server.migrationSecretName } : {}),
+    ...(server?.authMode === "oauth" ? {
+      oauthRegistration: server.oauthRegistration ?? "automatic",
+      oauthClientId: typeof server.oauthClientId === "string" ? server.oauthClientId : "",
+      oauthCallbackPort: server.oauthCallbackPort ?? "",
+      ...(isPlainObject(server.oauthSession) ? { oauthSession: {
+        issuer: typeof server.oauthSession.issuer === "string" ? server.oauthSession.issuer : "",
+        tokenAuthMethod: typeof server.oauthSession.tokenAuthMethod === "string" ? server.oauthSession.tokenAuthMethod : "",
+        connected: server.oauthSession.connected === true,
+        ...(typeof server.oauthSession.resource === "string" ? { resource: server.oauthSession.resource } : {}),
+        ...(server.oauthRegistration !== "existing" && typeof server.oauthSession.clientId === "string" ? { clientId: server.oauthSession.clientId } : {})
+      } } : {})
+    } : {}),
     enabled: server?.enabled !== false,
     tools: Array.isArray(server?.tools) ? server.tools.map(normalizeMcpToolSettings).filter(Boolean) : []
   };
@@ -591,11 +620,13 @@ function normalizeCodriverVaultToolSettings(value) {
   return Object.fromEntries(CODRIVER_VAULT_TOOL_NAMES.map((toolName) => [
     toolName,
     {
+      ...(TEXT_DOCUMENT_MUTATION_TOOLS.includes(toolName) ? { documentAutoConsentVersion: TEXT_DOCUMENT_AUTO_CONSENT_VERSION } : {}),
       ...(toolName === CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME
         ? { autoConsentVersion: VAULT_AUDIO_AUTO_CONSENT_VERSION }
         : { enabled: source[toolName]?.enabled !== false }),
       ...(CODRIVER_VAULT_CONFIGURABLE_AUTO_TOOL_NAMES.includes(toolName)
         ? { allowAutomaticExecution: source[toolName]?.allowAutomaticExecution === true &&
+            (!TEXT_DOCUMENT_MUTATION_TOOLS.includes(toolName) || source[toolName]?.documentAutoConsentVersion === TEXT_DOCUMENT_AUTO_CONSENT_VERSION) &&
             (toolName !== CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME || source[toolName]?.autoConsentVersion === VAULT_AUDIO_AUTO_CONSENT_VERSION) }
         : {})
     }
@@ -715,6 +746,8 @@ class CoDriverPlugin extends Plugin {
   }
 
   onunload() {
+    this.chatController?.cancelVoiceInput?.();
+    this.mcpOAuthService?.dispose();
     this.releaseNotes?.dispose();
     this.commandActionModal?.close?.();
     this.commandActionModal = null;
@@ -723,7 +756,9 @@ class CoDriverPlugin extends Plugin {
 
   createChatRuntimeSupport(overrides = {}) {
     return {
+      guardCanvasWrite: (file, before) => createCanvasWriteGuard(this.app, file, before),
       mcpCredentialService: this.getMcpCredentialService(),
+      mcpOAuthService: this.getMcpOAuthService(),
       getPlatform: () => Platform.isMobile ? "mobile" : "desktop",
       isStdioMcpSupported: () => this.isStdioMcpSupported(),
       getStdioMcpUnavailableMessage: () => this.getStdioMcpUnavailableMessage(),
@@ -807,9 +842,11 @@ class CoDriverPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.mcpCredentialService = new McpCredentialService(this.app?.secretStorage);
+    this.mcpCredentialService = new McpCredentialService(this.app?.secretStorage, { oauthService: this.getMcpOAuthService() });
     this.providerCredentialService = new ProviderCredentialService(this.app?.secretStorage);
     const savedSettings = await this.loadData();
+    const needsSkillOfferCleanup = Object.hasOwn(savedSettings ?? {}, "suggestBuiltinSkills") ||
+      Object.hasOwn(savedSettings ?? {}, "builtinSkillSuggestionsShown");
     const needsMaxMcpToolsMigration = Boolean(savedSettings) && !Object.prototype.hasOwnProperty.call(
       savedSettings,
       "maxMcpTools"
@@ -822,14 +859,20 @@ class CoDriverPlugin extends Plugin {
       savedSettings,
       "audioTranscription"
     );
+    const needsVoiceInputMigration = Boolean(savedSettings) &&
+      (!Object.hasOwn(savedSettings, "voiceInput") || Object.hasOwn(savedSettings.audioTranscription ?? {}, "voiceInputEnabled"));
     const needsVaultAudioConsentMigration = Boolean(savedSettings) &&
       savedSettings.codriverVaultToolSettings?.[CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME]?.autoConsentVersion !== VAULT_AUDIO_AUTO_CONSENT_VERSION;
+    const needsTextDocumentConsentMigration = Boolean(savedSettings) && TEXT_DOCUMENT_MUTATION_TOOLS.some((name) =>
+      savedSettings.codriverVaultToolSettings?.[name]?.documentAutoConsentVersion !== TEXT_DOCUMENT_AUTO_CONSENT_VERSION);
     const needsHiddenSkillFolderPathMigration = normalizeSkillFolderPath(
       savedSettings?.skillFolderPath ?? DEFAULT_SKILL_FOLDER_PATH
     ) === LEGACY_HIDDEN_SKILL_FOLDER_PATH;
     this.settings = normalizeSettings({
       ...cloneDefaultSettings(),
-      ...(savedSettings ?? {})
+      ...(savedSettings ?? {}),
+      voiceInput: Object.hasOwn(savedSettings ?? {}, "voiceInput") ? savedSettings.voiceInput
+        : normalizeVoiceInputSettings(undefined, savedSettings?.audioTranscription)
     });
 
     // Hold legacy material outside normalized settings. Never serialize it again.
@@ -843,14 +886,25 @@ class CoDriverPlugin extends Plugin {
 
     await this.retryMcpCredentialMigration();
 
+    const resetDocumentAutoTools = TEXT_DOCUMENT_MUTATION_TOOLS.filter((name) =>
+      savedSettings?.codriverVaultToolSettings?.[name]?.allowAutomaticExecution === true &&
+      savedSettings?.codriverVaultToolSettings?.[name]?.documentAutoConsentVersion !== TEXT_DOCUMENT_AUTO_CONSENT_VERSION);
+    if (resetDocumentAutoTools.length) {
+      const titles = resetDocumentAutoTools.map((name) => name === "codriver_vault_create_note" ? "Create note" : "Patch note");
+      new Notice(`Canvas support expanded the tool scope. Previous Auto permissions were reset for ${titles.join(" and ")}; enable them again in Settings if desired.`);
+    }
+
     if (
       (
         hasPersistedApiKey(savedSettings) ||
         needsAudioTranscriptionMigration ||
+        needsVoiceInputMigration ||
         needsVaultAudioConsentMigration ||
+        needsTextDocumentConsentMigration ||
         needsMaxMcpToolsMigration ||
         needsSkillFolderPathMigration ||
         needsHiddenSkillFolderPathMigration
+        || needsSkillOfferCleanup
       ) &&
       typeof this.saveData === "function" &&
       !this.pendingProviderKeys.length
@@ -861,16 +915,45 @@ class CoDriverPlugin extends Plugin {
 
   async saveSettings() {
     this.settings = normalizeSettings(this.settings);
+    this.chatController?.voiceInput?.revalidate();
     await this.persistSettings();
     this.registerProviders();
     this.chatController?.updateSettings(this.settings, this.providerRegistry);
+    this.commandActionModal?.chatController?.updateSettings(this.settings, this.providerRegistry);
     await this.diagnosticLogger?.refresh();
     this.refreshChatViews();
+    this.commandActionModal?.render?.();
   }
 
   getMcpCredentialService() {
-    this.mcpCredentialService ??= new McpCredentialService(this.app?.secretStorage);
+    this.mcpCredentialService ??= new McpCredentialService(this.app?.secretStorage, { oauthService: this.getMcpOAuthService() });
     return this.mcpCredentialService;
+  }
+
+  getMcpOAuthService() {
+    this.mcpOAuthService ??= new McpOAuthService({
+      storage: this.app?.secretStorage,
+      diagnostics: () => this.diagnosticLogger,
+      isSupported: () => !Platform.isMobile && typeof requireApiVersion === "function" && requireApiVersion("1.11.5"),
+      getServer: (id) => this.settings?.mcpServers?.filter((server) => server.id === id).length === 1 ? this.getMcpServerSettings(id) : null,
+      isShared: (name, id) => this.getConnectionRemoval().shared(name, "MCP server", id),
+      saveSession: async (server, session, assertCurrent) => {
+        this.assertProviderMigrationComplete();
+        assertCurrent();
+        const current = this.getMcpServerSettings(server.id);
+        const record = { ...current, oauthSession: session };
+        const snapshot = { ...this.settings, mcpServers: this.settings.mcpServers.map((item) => item.id === server.id ? record : item) };
+        await this.saveData(createPersistableSettings(snapshot));
+        assertCurrent();
+        this.settings.mcpServers = this.settings.mcpServers.map((item) => item.id === server.id ? { ...item, oauthSession: session } : item);
+      },
+      queue: (action) => {
+        const pending = (this.settingsWritePromise || Promise.resolve()).then(action);
+        this.settingsWritePromise = pending.catch(() => {});
+        return pending;
+      }
+    });
+    return this.mcpOAuthService;
   }
 
   getProviderCredentialService() {
@@ -975,6 +1058,7 @@ class CoDriverPlugin extends Plugin {
       servers.splice(index < 0 ? servers.length : index, 0, record);
       const snapshot = { ...this.settings, mcpServers: servers };
       verifyCredential?.();
+      if (current?.authMode === "oauth" && bindingKey(current) !== bindingKey(record)) this.mcpOAuthService?.invalidate(current.id);
       await this.saveData(createPersistableSettings(snapshot));
       const live = this.getMcpServerSettings(candidate.id);
       if (expected && (!live || mcpConnectionFingerprint(live, preserveEnabled) !== mcpConnectionFingerprint(expected, preserveEnabled))) {
@@ -1093,6 +1177,7 @@ class CoDriverPlugin extends Plugin {
     const providerType = normalizeProviderType(type);
     const existingOfType = this.settings.providers.filter((provider) => provider.type === providerType).length;
     const provider = createProviderSettings(providerType, this.createUniqueProviderId(providerType));
+    if (providerType === OPENAI_PROVIDER_TYPE) provider.endpoint = "";
 
     if (existingOfType > 0) {
       provider.name = `${provider.name} ${existingOfType + 1}`;
@@ -1103,6 +1188,7 @@ class CoDriverPlugin extends Plugin {
 
   createMcpServerDraft() {
     const server = createMcpServerSettings(this.createUniqueMcpServerId());
+    server.authMode = "bearer";
     const count = this.settings.mcpServers.length + 1;
     server.name = count > 1 ? `MCP server ${count}` : server.name;
     if (!this.isStdioMcpSupported()) {
@@ -1120,6 +1206,10 @@ class CoDriverPlugin extends Plugin {
   async saveProviderDraft(draft) {
     const existing = this.getProviderSettings(draft?.id);
     const providerType = normalizeProviderType(draft?.type);
+    if (providerType === OPENAI_PROVIDER_TYPE) {
+      const endpointError = getOpenAiCompatibleEndpointError(draft?.endpoint);
+      if (endpointError) throw new Error(endpointError);
+    }
     const id = existing?.id ?? this.createUniqueProviderId(providerType);
     const wasSelected = this.settings.selectedProviderId === existing?.id;
     const hadEnabledProvider = this.settings.providers.some((provider) => provider.enabled !== false);
@@ -1185,6 +1275,10 @@ class CoDriverPlugin extends Plugin {
 
   async saveMcpServerDraft(draft) {
     const existing = this.getMcpServerSettings(draft?.id);
+    if (existing?.authMode === "oauth" && this.getMcpOAuthService().locked(existing)) {
+      if (mcpConnectionFingerprint({ ...draft, name: existing.name }) !== mcpConnectionFingerprint(existing)
+        || (draft.credentialAction && draft.credentialAction !== "keep")) throw new McpCredentialError("invalid-credential");
+    }
     const expected = existing ? { ...existing } : null;
     const id = existing?.id ?? this.createUniqueMcpServerId();
     if (draft?.transport === MCP_STDIO_TRANSPORT && !this.isStdioMcpSupported()) {
@@ -1416,6 +1510,7 @@ class CoDriverPlugin extends Plugin {
         Object.prototype.hasOwnProperty.call(update ?? {}, "allowAutomaticExecution")
       ) {
         next.allowAutomaticExecution = update.allowAutomaticExecution === true;
+        if (TEXT_DOCUMENT_MUTATION_TOOLS.includes(toolName)) next.documentAutoConsentVersion = TEXT_DOCUMENT_AUTO_CONSENT_VERSION;
         if (toolName === CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME) {
           next.autoConsentVersion = VAULT_AUDIO_AUTO_CONSENT_VERSION;
         }
@@ -1533,6 +1628,15 @@ class CoDriverPlugin extends Plugin {
     };
   }
 
+  async updateVoiceInputSettings(update) {
+    const next = normalizeVoiceInputSettings({ ...normalizeVoiceInputSettings(this.settings.voiceInput), ...(update ?? {}) });
+    const validation = resolveVoiceInputSelection({ ...this.settings, voiceInput: next }, { requireEnabled: false });
+    if (next.enabled && !validation.ok) return validation;
+    this.settings.voiceInput = next;
+    await this.saveSettings();
+    return { ok: true, ...next };
+  }
+
   async selectProvider(providerId) {
     const provider = this.getProviderSettings(providerId);
     if (!provider) {
@@ -1645,6 +1749,7 @@ class CoDriverPlugin extends Plugin {
         : McpHttpClient;
       const client = new Client(server, {
         credentialService: this.getMcpCredentialService(),
+        oauthService: this.getMcpOAuthService(),
         diagnostics: this.diagnosticLogger
       });
       const discoveredTools = await client.discoverTools();
@@ -1771,6 +1876,10 @@ class CoDriverPlugin extends Plugin {
   }
 
   async testProviderDraftConnection(draft) {
+    if (normalizeProviderType(draft?.type) === OPENAI_PROVIDER_TYPE) {
+      const endpointError = getOpenAiCompatibleEndpointError(draft?.endpoint);
+      if (endpointError) return { ok: false, message: endpointError, models: [] };
+    }
     const providerSettings = normalizeProviderSettings({
       ...draft,
       id: draft?.id || "provider-draft"
@@ -1878,15 +1987,37 @@ class CoDriverPlugin extends Plugin {
   }
 
   async reloadSkills(showNotice = true) {
+    const pending = (this.skillReloadPromise ?? Promise.resolve()).then(() => this.reloadSkillsNow(showNotice));
+    this.skillReloadPromise = pending.catch(() => {});
+    return pending;
+  }
+
+  async reloadSkillsNow(showNotice = true) {
+    const loader = this.skillFolderLoader;
+    const directory = loader.getDirectory();
+    const assertCurrent = () => {
+      if (loader !== this.skillFolderLoader || directory !== this.settings.skillFolderPath) {
+        throw new Error("The skills folder changed. Reload skills again.");
+      }
+    };
     let sources = [];
     const errors = [];
     try {
-      const loadResult = await this.skillFolderLoader.loadSkillSources();
+      let loadResult = await loader.loadSkillSources();
+      assertCurrent();
+      const initialSources = Array.isArray(loadResult) ? loadResult : loadResult?.sources ?? [];
+      sources = initialSources;
+      errors.push(...(Array.isArray(loadResult) ? [] : loadResult?.errors ?? []));
+      if (await loader.ensureBuiltinSkills(initialSources, assertCurrent)) {
+        loadResult = await loader.loadSkillSources();
+        assertCurrent();
+        errors.length = 0;
+        errors.push(...(Array.isArray(loadResult) ? [] : loadResult?.errors ?? []));
+      }
       if (Array.isArray(loadResult)) {
         sources = loadResult;
       } else {
         sources = Array.isArray(loadResult?.sources) ? loadResult.sources : [];
-        errors.push(...(Array.isArray(loadResult?.errors) ? loadResult.errors : []));
       }
     } catch (error) {
       errors.push({
@@ -1895,13 +2026,72 @@ class CoDriverPlugin extends Plugin {
       });
     }
 
+    if (loader !== this.skillFolderLoader || directory !== this.settings.skillFolderPath) {
+      return { loaded: [], errors: [{ path: directory, message: "The skills folder changed. Reload skills again." }] };
+    }
+    sources = sources.map((source) => ({ ...source,
+      builtinId: BUILTIN_SKILLS.find((skill) => source.skillPath === `${directory}/${skill.id}/SKILL.md`)?.id
+    }));
     const result = this.chatController.loadExternalSkillSources(sources);
     result.errors.push(...errors);
     this.skillReloadResult = result;
     if (showNotice) {
       new Notice(createSkillReloadMessage(result));
     }
+    this.refreshChatViews();
     return result;
+  }
+
+  async prepareBuiltinSkillReset(id, path) {
+    const builtin = getBuiltinSkill(id);
+    const skill = this.getLoadedSkillsForSettings().find((item) => item.builtinId === id && item.sourcePath === path);
+    if (!builtin || !skill) throw new Error("The built-in skill is no longer available. Reload skills.");
+    const loader = this.skillFolderLoader;
+    const file = loader.getSkillFile(path);
+    const before = await loader.readVaultFile(file);
+    const review = Object.freeze({ id, path });
+    this.builtinSkillResetReviews ??= new WeakMap();
+    this.builtinSkillResetReviews.set(review, { loader, file, before, skillId: skill.id });
+    return review;
+  }
+
+  async resetBuiltinSkill(review, isCurrent) {
+    const state = this.builtinSkillResetReviews?.get(review);
+    const builtin = getBuiltinSkill(review?.id);
+    if (!state || !builtin || typeof isCurrent !== "function" || !isCurrent()) {
+      throw new Error("The skill reset confirmation expired.");
+    }
+    const assertCurrent = () => {
+      if (!isCurrent() || state.loader !== this.skillFolderLoader || state.loader.getDirectory() !== this.settings.skillFolderPath ||
+          state.loader.getSkillFile(review.path) !== state.file) throw new Error("The skill changed. Confirm its reset again.");
+      if (this.getLoadedSkillsForSettings().some((skill) => skill.id === review.id && skill.sourcePath !== review.path)) {
+        throw new Error("Another local skill already uses the default name. Resolve the conflict before resetting.");
+      }
+      this.app.workspace?.iterateAllLeaves?.((leaf) => {
+        const view = leaf?.view;
+        if (view?.file === state.file && (view.dirty === true || view.saving === true ||
+            (typeof view.getViewData === "function" && view.getViewData() !== state.before))) {
+          throw new Error("Save the skill editor before restoring defaults.");
+        }
+      });
+    };
+    assertCurrent();
+    if (typeof this.app.vault.process !== "function") throw new Error("Skill reset requires Obsidian Vault.process.");
+    this.builtinSkillResetReviews.delete(review);
+    await this.app.vault.process(state.file, (current) => {
+      assertCurrent();
+      if (current !== state.before) throw new Error("The skill changed. Confirm its reset again.");
+      return builtin.content;
+    });
+    let reloadResult;
+    try {
+      if (state.skillId !== builtin.id) {
+        this.settings.skillSettings ??= {};
+        this.settings.skillSettings[builtin.id] = { enabled: this.settings.skillSettings[state.skillId]?.enabled !== false };
+        await this.saveSettings();
+      }
+    } finally { reloadResult = await this.reloadSkills(false); }
+    return { path: review.path, reloadResult };
   }
 
   async reloadCommands(showNotice = true) {

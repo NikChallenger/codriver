@@ -6,6 +6,7 @@ const {
   stripSkillPromptIgnoredBlocks,
   SKILL_TEXT_EXTENSIONS: USER_SKILL_TEXT_EXTENSIONS
 } = require("./SkillFileParser");
+const { BUILTIN_SKILLS, getBuiltinSkill } = require("./BuiltinSkills");
 
 const DEFAULT_SKILL_FOLDER_PATH = "codriver/skills";
 const LEGACY_HIDDEN_SKILL_FOLDER_PATH = ".codriver/skills";
@@ -56,7 +57,8 @@ class SkillFolderLoader {
     return { sources, errors };
   }
 
-  async ensureDirectory() {
+  async ensureDirectory(assertCurrent = () => {}) {
+    assertCurrent();
     const directory = validateSkillFolderPath(this.directory);
     if (!this.vault || typeof this.vault.getAbstractFileByPath !== "function") {
       throw new Error("Skill folders require Obsidian Vault APIs.");
@@ -77,7 +79,9 @@ class SkillFolderLoader {
       if (typeof this.vault.createFolder !== "function") {
         throw new Error("Creating the skills folder requires Obsidian Vault APIs.");
       }
+      assertCurrent();
       current = await this.vault.createFolder(folderPath);
+      assertCurrent();
       if (!isVaultFolder(current)) {
         current = this.getAbstractFileByPath(folderPath);
       }
@@ -119,6 +123,58 @@ class SkillFolderLoader {
       path: file?.path ?? skillPath,
       file
     };
+  }
+
+  async ensureBuiltinSkills(sources, assertCurrent) {
+    let created = false;
+    for (const builtin of BUILTIN_SKILLS) {
+      const override = sources.some((source) => {
+        try { return parseSkillMarkdown(source.content).metadata.name === builtin.id; }
+        catch { return false; }
+      });
+      if (!override) created = (await this.ensureBuiltinSkill(builtin.id, assertCurrent)).created || created;
+    }
+    return created;
+  }
+
+  async ensureBuiltinSkill(id, assertCurrent) {
+    const skill = getBuiltinSkill(id);
+    if (!skill || typeof assertCurrent !== "function") {
+      throw new Error("Built-in skill initialization requires a current skills folder.");
+    }
+    assertCurrent();
+    const directory = validateSkillFolderPath(this.directory);
+    const skillDirectory = `${directory}/${skill.id}`;
+    const skillPath = `${skillDirectory}/SKILL.md`;
+    const existing = this.getAbstractFileByPath(skillPath);
+    if (existing) {
+      if (!isVaultFile(existing)) throw new Error("The built-in skill path collides with a folder.");
+      return { created: false, path: skillPath, file: existing };
+    }
+    const folder = this.getAbstractFileByPath(skillDirectory);
+    if (folder && (!isVaultFolder(folder) || folder.children.length > 0)) {
+      throw new Error("The built-in skill folder already contains user files. Keep them and install the skill manually.");
+    }
+    if (typeof this.vault?.create !== "function" || typeof this.vault?.createFolder !== "function") {
+      throw new Error("Installing a built-in skill requires Obsidian Vault APIs.");
+    }
+    await this.ensureDirectory(assertCurrent);
+    assertCurrent();
+    if (!this.getAbstractFileByPath(skillDirectory)) {
+      await this.vault.createFolder(skillDirectory);
+      assertCurrent();
+    }
+    if (!isVaultFolder(this.getAbstractFileByPath(skillDirectory))) {
+      throw new Error("The built-in skill folder is unavailable.");
+    }
+    if (this.getAbstractFileByPath(skillDirectory).children.length > 0) {
+      throw new Error("The built-in skill folder changed during installation. Existing files were preserved.");
+    }
+    if (this.getAbstractFileByPath(skillPath)) throw createDuplicateSkillError(skill.id, skillPath);
+    assertCurrent();
+    const file = await this.vault.create(skillPath, skill.content);
+    assertCurrent();
+    return { created: true, path: skillPath, file };
   }
 
   getSkillFile(path) {

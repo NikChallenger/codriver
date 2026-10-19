@@ -7,7 +7,7 @@ const sourceRoot = resolve(root, "src");
 const generatedVendorAssetPath = resolve(root, "src/generated/vendorAssets.js");
 const generatedReleaseNotesPath = resolve(root, "src/generated/releaseNotes.js");
 const watchMode = process.argv.includes("--watch");
-const externalModules = ["child_process", "obsidian"];
+const externalModules = ["child_process", "obsidian", "crypto", "dns", "http", "https"];
 const requiredFiles = [
   "manifest.json",
   "styles.css",

@@ -1,11 +1,14 @@
 const LOCAL_TRASH_DIRECTORY = ".trash";
 const MAX_TRASH_DISCOVERY_ENTRIES = 10000;
+const { CanvasValidationError, validateCanvasCreation, validateCanvasDocument, assertCanvasPreservation } = require("./CanvasDocument");
 
 class VaultWriter {
-  constructor(vault, fileManager = null, diagnostics = null) {
+  constructor(vault, fileManager = null, diagnostics = null, canvasGuard = null) {
     this.vault = vault;
     this.fileManager = fileManager;
     this.diagnostics = diagnostics;
+    this.canvasGuard = canvasGuard;
+    this.canvasWrites = new Set();
   }
 
   async planNoteCreation(request) {
@@ -13,6 +16,8 @@ class VaultWriter {
     if (typeof request?.content !== "string") {
       throw new Error("Set Markdown content before creating a note.");
     }
+    if (requestedPath.toLowerCase().endsWith(".canvas")) validateCanvasCreation(request.content);
+    if (requestedPath.toLowerCase().endsWith(".canvas")) this.validateCanvasReferences(request.content);
 
     if (await this.findCreateNoteVaultPath(requestedPath)) {
       throw new Error(`A vault file or folder already exists at: ${requestedPath}`);
@@ -47,9 +52,14 @@ class VaultWriter {
     };
   }
 
-  async createNote(request, authorization) {
+  async createNote(request, authorization, reviewedPlan = null) {
     assertNoteCreateAuthorization(authorization);
     const plan = await this.planNoteCreation(request);
+    if (plan.path.toLowerCase().endsWith(".canvas") && (!reviewedPlan ||
+      reviewedPlan.path !== plan.path || reviewedPlan.content !== plan.content ||
+      JSON.stringify(reviewedPlan.missingParentFolders) !== JSON.stringify(plan.missingParentFolders))) {
+      throw new Error("Canvas creation state changed or is missing its reviewed plan. Prepare creation again.");
+    }
     const createdParentFolders = [];
     this.logCreateNoteDiagnostics("note-create.start", plan, authorization);
 
@@ -59,8 +69,10 @@ class VaultWriter {
       }
 
       for (const folderPath of plan.missingParentFolders) {
+        assertNoteCreateAuthorization(authorization);
         const existingFolder = await this.findCreateNoteVaultPath(folderPath);
         if (existingFolder) {
+          if (plan.path.toLowerCase().endsWith(".canvas")) throw new Error("Canvas destination folder state changed after review. Prepare creation again.");
           if (!isVaultFolder(existingFolder)) {
             throw new Error(`Cannot create the note because a parent path is not a folder: ${folderPath}`);
           }
@@ -75,6 +87,7 @@ class VaultWriter {
         throw new Error(`A vault file or folder already exists at: ${plan.path}`);
       }
 
+      assertNoteCreateAuthorization(authorization);
       const file = await this.vault.create(plan.path, plan.content);
       const result = {
         path: file?.path ?? plan.path,
@@ -406,6 +419,12 @@ class VaultWriter {
 
     proposal.applicationAuthorizationSource = authorization.source;
 
+    if (proposal.notePath?.toLowerCase().endsWith(".canvas")) {
+      if (proposal.kind !== "text") throw new Error("Canvas supports text patches only.");
+      await this.applyApprovedCanvasChange(proposal, authorization);
+      return;
+    }
+
     if (proposal.kind === "frontmatter") {
       await this.applyApprovedFrontmatterChange(proposal, authorization);
       return;
@@ -415,6 +434,20 @@ class VaultWriter {
   }
 
   async validatePendingTextChange(proposal) {
+    if (proposal.notePath?.toLowerCase().endsWith(".canvas")) {
+      const file = this.getCanvasFile(proposal.notePath);
+      const content = await this.vault.read(file);
+      try {
+        const next = this.createCanvasTextApplication(content, this.getTextChanges(proposal)).nextContent;
+        assertCanvasPreservation(content, next);
+        this.validateCanvasReferences(next, content);
+      } catch (error) {
+        if (error instanceof CanvasValidationError) throw error;
+        throw new CanvasValidationError(error instanceof Error ? error.message : "Canvas patch validation failed.");
+      }
+      proposal.canvasSnapshot = { file, content };
+      return { path: file.path, changeCount: this.getTextChanges(proposal).length };
+    }
     const file = this.getMarkdownFile(proposal.notePath);
     const currentContent = await this.vault.read(file);
     const changes = this.getTextChanges(proposal);
@@ -476,6 +509,15 @@ class VaultWriter {
   async rollbackApprovedChange(proposal) {
     if (proposal.status !== "accepted") {
       throw new Error("Only an accepted note change can be rolled back.");
+    }
+    if (proposal.notePath?.toLowerCase().endsWith(".canvas")) {
+      const applied = proposal.canvasAppliedSnapshot;
+      if (!applied) throw new Error("Canvas rollback content is unavailable. Prepare a new patch.");
+      const warning = await this.writeCanvasSnapshot(proposal.notePath, applied.file, applied.after, applied.before,
+        proposal.canvasRollbackAuthorization);
+      proposal.canvasSynchronizationWarning = warning;
+      if (warning) proposal.error = warning;
+      return;
     }
 
     if (proposal.kind === "frontmatter") {
@@ -578,6 +620,116 @@ class VaultWriter {
     }
 
     return file;
+  }
+
+  getCanvasFile(path) {
+    const normalized = normalizeCreateNotePath(path, this.vault.configDir);
+    const file = this.vault.getAbstractFileByPath?.(normalized);
+    if (!file || file.path !== path || file.extension?.toLowerCase() !== "canvas") {
+      throw new Error("Canvas patch requires an existing file at the exact reviewed path.");
+    }
+    return file;
+  }
+
+  createCanvasTextApplication(content, changes) {
+    validateCanvasDocument(content);
+    if (changes.length > 100) throw new CanvasValidationError("Canvas patch exceeds the text-change limit.");
+    const ranges = changes.map((change, index) => {
+      const changeIndex = index + 1;
+      const occurrences = findTextMatches(content, change.before);
+      if (occurrences.length === 0) {
+        throw new CanvasValidationError(`Canvas change ${changeIndex}: before was not found in the saved JSON. Copy the exact saved fragment, including whitespace and JSON escape sequences, or choose a smaller unique fragment.`);
+      }
+      const matches = occurrences.filter((start) =>
+        matchesContext(content, start, change.before, change.contextBefore, change.contextAfter));
+      if (matches.length === 0) {
+        throw new CanvasValidationError(`Canvas change ${changeIndex}: before matched ${occurrences.length} location(s), but contextBefore/contextAfter did not match. Context must be exact adjacent text outside before; omit it when before is unique.`);
+      }
+      if (matches.length > 1) {
+        throw new CanvasValidationError(`Canvas change ${changeIndex}: before and its context matched ${matches.length} locations. Use a unique saved fragment or add exact adjacent context.`);
+      }
+      return { start: matches[0], end: matches[0] + change.before.length, after: change.after, changeIndex };
+    }).sort((a, b) => a.start - b.start);
+    for (let index = 1; index < ranges.length; index += 1) {
+      if (ranges[index].start < ranges[index - 1].end) {
+        throw new CanvasValidationError(`Canvas changes ${ranges[index - 1].changeIndex} and ${ranges[index].changeIndex} overlap. Submit non-overlapping changes.`);
+      }
+    }
+    let nextContent = content;
+    for (const range of ranges.slice().reverse()) nextContent = nextContent.slice(0, range.start) + range.after + nextContent.slice(range.end);
+    validateCanvasDocument(nextContent);
+    return { nextContent, ranges };
+  }
+
+  async applyApprovedCanvasChange(proposal, authorization) {
+    const snapshot = proposal.canvasSnapshot;
+    if (!snapshot) throw new Error("Canvas snapshot is unavailable. Prepare a new patch.");
+    const next = this.createCanvasTextApplication(snapshot.content, this.getTextChanges(proposal)).nextContent;
+    assertCanvasPreservation(snapshot.content, next);
+    this.validateCanvasReferences(next, snapshot.content);
+    const warning = await this.writeCanvasSnapshot(proposal.notePath, snapshot.file, snapshot.content, next, authorization);
+    proposal.canvasAppliedSnapshot = { file: snapshot.file, before: snapshot.content, after: next };
+    if (warning) { proposal.canvasSynchronizationWarning = warning; proposal.error = warning; }
+  }
+
+  async writeCanvasSnapshot(path, file, before, after, authorization) {
+    assertNotePatchAuthorization(authorization);
+    validateCanvasDocument(after);
+    if (this.canvasWrites.has(path) || typeof this.vault.process !== "function" || typeof this.canvasGuard !== "function") {
+      throw new Error("Canvas atomic write synchronization is unavailable or busy.");
+    }
+    this.canvasWrites.add(path);
+    let guard = null;
+    let applied = false;
+    let synchronizationWarning = "";
+    try {
+      await this.vault.process(file, (current) => {
+        if (this.getCanvasFile(path) !== file || current !== before) throw new Error("Canvas changed after review. Read it again and prepare a new patch.");
+        assertNotePatchAuthorization(authorization);
+        this.validateCanvasReferences(after, before);
+        guard = this.canvasGuard(file, before);
+        if (!guard || typeof guard.stage !== "function" || typeof guard.finish !== "function") throw new Error("Canvas synchronization contract is unsupported.");
+        assertNotePatchAuthorization(authorization);
+        guard.stage(after);
+        assertNotePatchAuthorization(authorization);
+        return after;
+      });
+      applied = true;
+    } finally {
+      try {
+        if (guard) {
+          try { await guard.finish(applied ? after : before); }
+          catch (error) {
+            if (!applied) throw error;
+            synchronizationWarning = "Canvas file was written, but its editor could not be synchronized. Close this Canvas tab and open it again before further edits.";
+          }
+        }
+      }
+      finally { this.canvasWrites.delete(path); }
+    }
+    return synchronizationWarning;
+  }
+
+  validateCanvasReferences(content, before = "{}") {
+    const next = validateCanvasDocument(content).document;
+    const oldNodes = new Map((validateCanvasDocument(before).document.nodes ?? []).map((node) => [node.id, node]));
+    for (const node of next.nodes ?? []) {
+      const old = oldNodes.get(node.id);
+      for (const key of node.type === "file" ? ["file"] : node.type === "group" ? ["background"] : []) {
+        if (!Object.hasOwn(node, key) || (old?.type === node.type && old[key] === node[key])) continue;
+        const path = node[key];
+        const config = String(this.vault.configDir || ".obsidian").toLowerCase();
+        const file = this.vault.getAbstractFileByPath?.(path);
+        if (!file || isVaultFolder(file) || file.path !== path || path.toLowerCase() === config || path.toLowerCase().startsWith(`${config}/`)) {
+          throw new Error("New Canvas file/background references require exact existing vault files outside the configuration folder.");
+        }
+      }
+      if (node.type === "link" && (old?.type !== "link" || old.url !== node.url)) {
+        let url;
+        try { url = new URL(node.url); } catch { throw new Error("New Canvas web cards require an HTTP or HTTPS URL."); }
+        if (!["http:", "https:"].includes(url.protocol)) throw new Error("New Canvas web cards require an HTTP or HTTPS URL.");
+      }
+    }
   }
 
   getAppendMarkdownFile(notePath) {
@@ -1413,6 +1565,7 @@ function assertNoteCreateAuthorization(authorization) {
   if (authorization?.status !== "authorized" || !allowedSources.has(authorization?.source)) {
     throw new Error("Note creation requires authorized user approval or automatic permission.");
   }
+  if (typeof authorization.isCurrent === "function" && authorization.isCurrent() !== true) throw new Error("Create note authorization is no longer current.");
 }
 
 function assertFileMoveAuthorization(authorization) {
@@ -1459,6 +1612,7 @@ function assertNotePatchAuthorization(authorization) {
   ) {
     throw new Error("Automatic Patch note permission is no longer enabled. Review and accept the proposal manually.");
   }
+  if (authorization.source !== "automatic-tool-permission" && typeof authorization.isCurrent === "function" && authorization.isCurrent() !== true) throw new Error("Patch note authorization is no longer current.");
 }
 
 function normalizeCreateNotePath(value, configDir = ".obsidian") {
@@ -1495,11 +1649,11 @@ function normalizeCreateNotePath(value, configDir = ".obsidian") {
   }
 
   const fileName = segments.at(-1);
-  if (!fileName || fileName.toLowerCase() === ".md") {
+  if (!fileName || [".md", ".canvas"].includes(fileName.toLowerCase())) {
     throw new Error("Set a valid file name before creating a note.");
   }
-  if (!fileName.toLowerCase().endsWith(".md")) {
-    throw new Error("Only Markdown notes can be created through this tool.");
+  if (!/\.(?:md|canvas)$/i.test(fileName)) {
+    throw new Error("Only Markdown notes or Canvas files can be created through this tool.");
   }
 
   return normalized;

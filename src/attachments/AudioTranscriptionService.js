@@ -545,7 +545,287 @@ function readFiniteNumber(value) {
   return Number.isFinite(value) && value >= 0 ? value : null;
 }
 
+const VOICE_RECORDING_LIMIT_MS = 5 * 60 * 1000;
+const VOICE_OPERATION_TIMEOUT_MS = 15000;
+const VOICE_MAX_BYTES = 15 * 1024 * 1024;
+
+// This processor is bundled source, never user/skill content. It has no network or file access.
+const VOICE_CAPTURE_PROCESSOR = `
+class CoDriverVoiceCapture extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.samples = new Int16Array(2048);
+    this.used = 0;
+    this.total = 0;
+    this.stopped = false;
+    this.port.onmessage = () => {
+      this.stopped = true;
+      this.flush();
+      this.port.postMessage({ stopped: true });
+    };
+  }
+  flush() {
+    if (!this.used) return;
+    const chunk = this.samples.slice(0, this.used);
+    this.port.postMessage({ samples: chunk }, [chunk.buffer]);
+    this.used = 0;
+  }
+  process(inputs) {
+    if (this.stopped) return false;
+    const channels = inputs[0];
+    if (!channels || !channels.length) return true;
+    for (let i = 0; i < channels[0].length; i++) {
+      if (++this.total > sampleRate * 300) {
+        this.stopped = true;
+        this.port.postMessage({ limit: true });
+        return false;
+      }
+      let sample = 0;
+      for (const channel of channels) sample += channel[i] / channels.length;
+      sample = Math.max(-1, Math.min(1, sample));
+      this.samples[this.used++] = sample < 0 ? sample * 32768 : sample * 32767;
+      if (this.used === this.samples.length) this.flush();
+    }
+    return true;
+  }
+}
+registerProcessor("codriver-voice-capture", CoDriverVoiceCapture);
+`;
+
+function voiceError(code, message) {
+  return new AudioTranscriptionError(code, message);
+}
+
+function encodeVoiceWav(chunks, sampleRate) {
+  const count = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  if (!count || !Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000 ||
+      count * 2 + 44 > VOICE_MAX_BYTES || count > sampleRate * 300) {
+    throw voiceError("voice-recording-invalid", "The recording is empty or exceeds the voice input limit.");
+  }
+  const buffer = new ArrayBuffer(44 + count * 2);
+  const view = new DataView(buffer);
+  const text = (offset, value) => {
+    for (let index = 0; index < value.length; index++) view.setUint8(offset + index, value.charCodeAt(index));
+  };
+  text(0, "RIFF"); view.setUint32(4, buffer.byteLength - 8, true); text(8, "WAVE");
+  text(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  text(36, "data"); view.setUint32(40, count * 2, true);
+  let offset = 44;
+  for (const chunk of chunks) for (const sample of chunk) { view.setInt16(offset, sample, true); offset += 2; }
+  return buffer;
+}
+
+async function createDesktopVoiceCapture({ signal, onError }, host = globalThis) {
+  if (!host.navigator?.mediaDevices?.getUserMedia || !host.AudioContext || !host.AudioWorkletNode ||
+      !host.URL?.createObjectURL || !host.Blob) {
+    throw voiceError("voice-unavailable", "Microphone capture is unavailable in this desktop runtime.");
+  }
+  let context, stream, source, node, silent, moduleUrl, flushResolve;
+  let disposed = false, stopping = false, samples = 0;
+  const chunks = [];
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    stream?.getTracks().forEach((track) => track.stop());
+    if (node) { node.port.onmessage = null; node.onprocessorerror = null; node.port.close(); }
+    for (const item of [source, node, silent]) { try { item?.disconnect(); } catch {} }
+    if (context) { context.onstatechange = null; Promise.resolve(context.close()).catch(() => {}); }
+    if (moduleUrl) host.URL.revokeObjectURL(moduleUrl);
+    chunks.length = 0;
+    signal.removeEventListener("abort", dispose);
+  };
+  const fail = () => { if (!disposed && !stopping) onError(voiceError("voice-capture-failed", "Microphone capture stopped unexpectedly.")); };
+  try {
+    throwIfAborted(signal);
+    context = new host.AudioContext({ sampleRate: 16000 });
+    if (!context.audioWorklet?.addModule) throw new Error("Unavailable");
+    signal.addEventListener("abort", dispose, { once: true });
+    // Start resume during the explicit user gesture, before awaiting native permission.
+    const resume = context.resume();
+    const permission = Promise.resolve(host.navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 }, video: false }))
+      .then((value) => {
+        if (signal.aborted || disposed) value.getTracks().forEach((track) => track.stop());
+        return value;
+      });
+    [stream] = await raceWithAbort(Promise.all([permission, resume]), signal);
+    throwIfAborted(signal);
+    moduleUrl = host.URL.createObjectURL(new host.Blob([VOICE_CAPTURE_PROCESSOR], { type: "text/javascript" }));
+    await raceWithAbort(context.audioWorklet.addModule(moduleUrl), signal);
+    throwIfAborted(signal);
+    host.URL.revokeObjectURL(moduleUrl); moduleUrl = null;
+    node = new host.AudioWorkletNode(context, "codriver-voice-capture");
+    node.onprocessorerror = fail;
+    node.port.onmessage = ({ data }) => {
+      if (disposed) return;
+      if (data?.limit) { onError(voiceError("voice-limit", "Voice input reached its recording limit. The recording was discarded.")); return; }
+      if (data?.samples instanceof Int16Array) {
+        samples += data.samples.length;
+        if (samples * 2 + 44 > VOICE_MAX_BYTES || samples > context.sampleRate * 300) {
+          onError(voiceError("voice-limit", "Voice input reached its recording limit. The recording was discarded."));
+          return;
+        }
+        chunks.push(data.samples);
+      }
+      if (data?.stopped) flushResolve?.();
+    };
+    source = context.createMediaStreamSource(stream);
+    silent = context.createGain(); silent.gain.value = 0;
+    source.connect(node); node.connect(silent); silent.connect(context.destination);
+    stream.getTracks().forEach((track) => track.addEventListener("ended", fail, { once: true }));
+    context.onstatechange = () => { if (context.state !== "running") fail(); };
+    if (context.state !== "running") throw new Error("Unavailable");
+    return {
+      dispose,
+      async stop() {
+        throwIfAborted(signal);
+        stopping = true;
+        // Release the microphone immediately; drain already captured samples in port order.
+        stream.getTracks().forEach((track) => track.stop());
+        try {
+          const flushed = new Promise((resolve) => { flushResolve = resolve; });
+          node.port.postMessage({ stop: true });
+          await raceWithAbort(flushed, signal);
+          throwIfAborted(signal);
+          return encodeVoiceWav(chunks, context.sampleRate);
+        } finally { dispose(); }
+      }
+    };
+  } catch (error) {
+    dispose();
+    if (signal.aborted) throw error;
+    throw voiceError("voice-capture-unavailable", "Cannot access the microphone. Check desktop microphone permissions and try again.");
+  }
+}
+
+class VoiceInputSession {
+  constructor({ getConfiguration, createCapture = createDesktopVoiceCapture, transcribe, onChange = () => {},
+    operationTimeoutMs = VOICE_OPERATION_TIMEOUT_MS, recordingLimitMs = VOICE_RECORDING_LIMIT_MS }) {
+    this.getConfiguration = getConfiguration;
+    this.createCapture = createCapture;
+    this.transcribe = transcribe;
+    this.onChange = onChange;
+    this.operationTimeoutMs = operationTimeoutMs;
+    this.recordingLimitMs = recordingLimitMs;
+    this.operation = null;
+    this.resultRevision = 0;
+    this.state = { phase: "idle", error: "" };
+  }
+
+  publish(phase, error = "") {
+    this.state = { phase, error };
+    this.onChange(this.state);
+  }
+
+  isCurrent(operation) {
+    const current = this.getConfiguration();
+    return this.operation === operation && !operation.controller.signal.aborted &&
+      current.available && current.binding === operation.configuration.binding;
+  }
+
+  validate(operation) {
+    if (!this.isCurrent(operation)) {
+      if (this.operation === operation) this.cancel();
+      throw voiceError("voice-stale", "Voice input was cancelled because its context changed.");
+    }
+  }
+
+  revalidate() {
+    if (this.operation && !this.isCurrent(this.operation)) this.cancel();
+  }
+
+  release(operation) {
+    clearTimeout(operation.timer);
+    operation.controller.abort();
+    operation.capture?.dispose();
+    operation.capture = null;
+  }
+
+  cancel() {
+    this.resultRevision += 1;
+    const operation = this.operation;
+    this.operation = null;
+    if (operation) this.release(operation);
+    this.publish("idle");
+  }
+
+  fail(operation, message) {
+    if (this.operation !== operation) return;
+    this.operation = null;
+    this.release(operation);
+    this.publish("error", message);
+  }
+
+  async start() {
+    if (this.operation) return false;
+    const configuration = { ...this.getConfiguration() };
+    if (!configuration.available) { this.publish("error", configuration.error || "Voice input is unavailable."); return false; }
+    const operation = { configuration, controller: new AbortController(), capture: null, timer: null };
+    this.resultRevision += 1;
+    this.operation = operation;
+    operation.timer = setTimeout(() => this.fail(operation, "Microphone access timed out."), this.operationTimeoutMs);
+    this.publish("starting");
+    try {
+      const capture = await raceWithAbort(Promise.resolve(this.createCapture({
+        signal: operation.controller.signal,
+        onError: () => this.fail(operation, "Microphone capture stopped or reached its recording limit. The recording was discarded.")
+      })).then((value) => {
+        if (!this.isCurrent(operation)) value?.dispose();
+        return value;
+      }), operation.controller.signal);
+      operation.capture = capture;
+      this.validate(operation);
+      clearTimeout(operation.timer);
+      operation.timer = setTimeout(() => this.fail(operation, "Voice input reached its recording limit. The recording was discarded."), this.recordingLimitMs);
+      this.publish("recording");
+      return true;
+    } catch {
+      this.fail(operation, "Cannot start microphone capture. Check microphone permissions and try again.");
+      return false;
+    }
+  }
+
+  async stop() {
+    const operation = this.operation;
+    if (!operation || this.state.phase !== "recording") return null;
+    clearTimeout(operation.timer);
+    const timeoutMs = Number.isFinite(operation.configuration.timeoutMs)
+      ? Math.max(5000, Math.min(300000, operation.configuration.timeoutMs)) : this.operationTimeoutMs;
+    operation.timer = setTimeout(() => this.fail(operation, "Voice transcription timed out. The recording was discarded."), timeoutMs);
+    this.publish("transcribing");
+    try {
+      this.validate(operation);
+      let audio = await raceWithAbort(operation.capture.stop(), operation.controller.signal);
+      this.validate(operation);
+      inspectAudioBuffer(audio, { name: "voice-input.wav", extension: "wav", mimeType: "audio/wav", size: audio.byteLength },
+        { maxBytes: VOICE_MAX_BYTES, maxDurationMs: VOICE_RECORDING_LIMIT_MS });
+      const response = await raceWithAbort(Promise.resolve().then(() => {
+        this.validate(operation);
+        return this.transcribe({ audio, model: operation.configuration.model, signal: operation.controller.signal,
+          beforeUpload: () => this.validate(operation) }, operation.configuration);
+      }), operation.controller.signal);
+      audio = null;
+      this.validate(operation);
+      if (typeof response?.text !== "string" || response.text.length > DEFAULT_MAX_TRANSCRIPT_CHARS * 2) throw new Error("Invalid transcript");
+      const normalized = normalizeTranscript(response.text, DEFAULT_MAX_TRANSCRIPT_CHARS);
+      if (!normalized.text || normalized.truncated) throw new Error("Invalid transcript");
+      const result = { text: normalized.text, binding: operation.configuration.binding, revision: this.resultRevision };
+      this.operation = null;
+      this.release(operation);
+      this.publish("idle");
+      return result;
+    } catch {
+      this.fail(operation, "Voice transcription failed or returned no usable speech. The draft was kept unchanged.");
+      return null;
+    }
+  }
+}
+
 module.exports = {
+  VoiceInputSession,
+  createDesktopVoiceCapture,
+  encodeVoiceWav,
   AudioTranscriptionError,
   AudioTranscriptionService,
   DEFAULT_MAX_AUDIO_FILES,

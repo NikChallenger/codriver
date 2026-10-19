@@ -7,13 +7,22 @@ let unpdfConfiguredPromise = null;
 async function extractPdfText(arrayBuffer) {
   await configureUnpdf();
 
-  const pdf = await unpdf.getDocumentProxy(new Uint8Array(arrayBuffer));
-  const result = await unpdf.extractText(pdf, { mergePages: true });
-
-  return {
-    totalPages: result.totalPages ?? 0,
-    text: typeof result.text === "string" ? result.text : String(result.text ?? "")
-  };
+  const pdf = await unpdf.getDocumentProxy(new Uint8Array(arrayBuffer), {
+    isEvalSupported: false,
+    useWorkerFetch: false,
+    cMapUrl: null,
+    standardFontDataUrl: null,
+    wasmUrl: null
+  });
+  try {
+    const result = await unpdf.extractText(pdf, { mergePages: true });
+    return {
+      totalPages: result.totalPages ?? 0,
+      text: typeof result.text === "string" ? result.text : String(result.text ?? "")
+    };
+  } finally {
+    await pdf.loadingTask.destroy();
+  }
 }
 
 async function configureUnpdf() {

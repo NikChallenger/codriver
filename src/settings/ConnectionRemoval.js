@@ -103,6 +103,7 @@ class ConnectionRemoval {
           snapshot.selectedModelId = next?.model || null;
         }
         let saved;
+        if (state.kind === "MCP server") this.plugin.mcpOAuthService?.invalidate(state.id);
         try { saved = await this.persist(snapshot); }
         catch { throw new ConnectionRemovalError("save"); }
         // Do not clean a credential after an unqueued edit during persistence.

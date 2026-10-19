@@ -1,6 +1,7 @@
 const { requestUrl } = require("obsidian");
 const { CODRIVER_PLUGIN_VERSION, MCP_PROTOCOL_VERSION } = require("../constants");
 const { McpCredentialService, parseHeaderLines } = require("./McpCredentials");
+const { McpOAuthError } = require("./McpOAuthProtocol");
 const {
   createJsonRpcErrorDiagnostic,
   hashText,
@@ -11,7 +12,11 @@ const {
 class McpHttpClient {
   constructor(server, options = {}) {
     this.endpoint = String(server?.endpoint ?? "").trim();
-    this.headers = (options.credentialService ?? new McpCredentialService(null)).resolveHeaders(server);
+    this.server = { ...server };
+    this.oauthService = server?.authMode === "oauth" ? options.oauthService : null;
+    if (server?.authMode === "oauth" && !this.oauthService) throw new McpOAuthError("unsupported");
+    this.signal = options.signal;
+    this.headers = this.oauthService ? {} : (options.credentialService ?? new McpCredentialService(null)).resolveHeaders(server);
     this.protocolVersion = MCP_PROTOCOL_VERSION;
     this.sessionId = "";
     this.nextId = 1;
@@ -107,7 +112,7 @@ class McpHttpClient {
         requestId: id,
         error: "MCP server did not return a valid JSON-RPC response.",
         parseState: "invalid-json-rpc",
-        response: createResponseSummary(response, id)
+        response: this.oauthService ? { status: response.status } : createResponseSummary(response, id)
       });
       throw new Error(`MCP server did not return a valid JSON-RPC response for ${method}.`);
     }
@@ -128,6 +133,7 @@ class McpHttpClient {
   }
 
   async postJsonRpc(payload, options = {}) {
+    if (this.signal?.aborted) throw new McpOAuthError("cancelled");
     await this.logDiagnostic("mcp.http.request.started", {
       ...this.serverSummary,
       jsonRpcMethod: payload.method,
@@ -139,12 +145,15 @@ class McpHttpClient {
 
     let response;
     try {
-      response = await requestUrl({
+      const request = {
         url: this.endpoint,
         method: "POST",
         headers: this.createHeaders(options),
         body: JSON.stringify(payload)
-      });
+      };
+      response = this.oauthService
+        ? await this.oauthService.requestMcp(this.server, { ...request, signal: this.signal })
+        : await requestUrl(request);
     } catch (error) {
       await this.logDiagnostic("mcp.http.request.failed", {
         ...this.serverSummary,
@@ -152,6 +161,7 @@ class McpHttpClient {
         requestId: payload.id ?? null,
         error: "transport-error"
       });
+      if (error instanceof McpOAuthError) throw error;
       throw new Error("MCP HTTP transport failed. Check the endpoint and connection.");
     }
 
@@ -159,7 +169,7 @@ class McpHttpClient {
       ...this.serverSummary,
       jsonRpcMethod: payload.method,
       requestId: payload.id ?? null,
-      response: createResponseSummary(response, payload.id ?? null)
+      response: this.oauthService ? { status: response.status } : createResponseSummary(response, payload.id ?? null)
     });
 
     const sessionId = getHeader(response.headers, "Mcp-Session-Id");
