@@ -1,5 +1,5 @@
 const { ARGUMENT_BYTES, CONTENT_BYTES, RECORD_BYTES, byteLength, serializeContent } = require("./DetailedLogContent");
-const DEFAULT_MAX_LOG_BYTES = 512 * 1024;
+const DEFAULT_MAX_LOG_BYTES = 1024 * 1024;
 const DEFAULT_MAX_ARCHIVED_LOGS = 0;
 const DIAGNOSTIC_LOG_VERSION = 1;
 const CURRENT_DIAGNOSTIC_LOG_FILENAME = "diagnostics.log";
