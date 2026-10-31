@@ -3,6 +3,7 @@ export const RELEASE_ASSET_FILES = Object.freeze(["main.js", "manifest.json", "s
 
 // Each release explicitly approves the already-public notes it must preserve.
 const PUBLIC_RETAINED_NOTES_BY_VERSION = Object.freeze({
+  "0.6.1": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md", "docs/releases/0.5.3.md", "docs/releases/0.5.4.md", "docs/releases/0.5.5.md", "docs/releases/0.6.0.md"]),
   "0.5.2": Object.freeze(["docs/releases/0.5.1.md"]),
   "0.5.3": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md"]),
   "0.5.4": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md", "docs/releases/0.5.3.md"]),
@@ -36,6 +37,7 @@ export const PUBLIC_DIRECT_FILES = Object.freeze([
   "src/commands/CommandFolderLoader.js",
   "src/constants.js",
   "src/diagnostics/DiagnosticLogger.js",
+  "src/diagnostics/DetailedLogContent.js",
   "src/diagnostics/DiagnosticLogSharing.js",
   "src/diagnostics/ThinkingShimmerProbe.js",
   "src/main.js",

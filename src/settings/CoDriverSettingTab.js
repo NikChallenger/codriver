@@ -25,6 +25,7 @@ const {
   decodeAudioTranscriptionSelection,
   encodeAudioTranscriptionSelection,
   getAudioTranscriptionModelChoices,
+  isProviderModelDisabled,
   normalizeAudioTranscriptionSettings,
   normalizeVoiceInputSettings,
   resolveVoiceInputSelection,
@@ -665,7 +666,8 @@ class CoDriverSettingTab extends PluginSettingTab {
     if (diagnosticLogTarget === "file") {
       setting.settingEl.addClass("codriver-diagnostic-log-file-setting");
       setting.setDesc(
-        `${this.plugin.getDiagnosticLogPath() || "The CoDriver diagnostic log"}\nThis file is refreshed when CoDriver restarts.`
+        `${this.plugin.getDiagnosticLogPath() || "The CoDriver diagnostic log"}\nThis file is refreshed when CoDriver restarts.${this.plugin.settings.diagnosticLogLevel === "detailed"
+          ? "\nDetailed logging may contain sensitive information." : ""}`
       );
       setting.descEl?.addClass("codriver-diagnostic-log-file-description");
       if (setting.descEl) setting.settingEl.appendChild(setting.descEl);
@@ -675,18 +677,18 @@ class CoDriverSettingTab extends PluginSettingTab {
         toggle
           .setValue(Boolean(this.plugin.settings.enableDiagnosticLogging))
           .onChange(async (value) => {
-            this.plugin.settings.enableDiagnosticLogging = value;
-            await this.plugin.saveSettings();
+            await this.changeDiagnosticLogging({ enableDiagnosticLogging: value });
           });
       })
       .addDropdown((dropdown) => {
         dropdown
           .addOption("errors", "Errors only")
-          .addOption("all", "All events")
+          .addOption("all", "Standard");
+        if (diagnosticLogTarget === "file") dropdown.addOption("detailed", "Detailed");
+        dropdown
           .setValue(this.plugin.settings.diagnosticLogLevel ?? "errors")
           .onChange(async (value) => {
-            this.plugin.settings.diagnosticLogLevel = value;
-            await this.plugin.saveSettings();
+            await this.changeDiagnosticLogging({ diagnosticLogLevel: value });
           });
       })
       .addDropdown((dropdown) => {
@@ -703,9 +705,9 @@ class CoDriverSettingTab extends PluginSettingTab {
           .addOption("console", "Console")
           .setValue(this.plugin.settings.diagnosticLogTarget ?? "console")
           .onChange(async (value) => {
-            this.plugin.settings.diagnosticLogTarget = value;
-            await this.plugin.saveSettings();
-            this.display();
+            await this.changeDiagnosticLogging({ diagnosticLogTarget: value,
+              ...(value === "console" && this.plugin.settings.diagnosticLogLevel === "detailed"
+                ? { diagnosticLogLevel: "all" } : {}) });
           });
       });
 
@@ -714,6 +716,41 @@ class CoDriverSettingTab extends PluginSettingTab {
         this.handleDiagnosticLogShare()
       ), "codriver-diagnostic-share-button");
     }
+  }
+
+  async changeDiagnosticLogging(changes) {
+    const revision = (this.plugin.diagnosticLoggingChangeRevision ?? 0) + 1;
+    this.plugin.diagnosticLoggingChangeRevision = revision;
+    const settings = this.plugin.settings;
+    const previous = diagnosticConfiguration(settings);
+    const next = { ...settings, ...changes };
+    if (diagnosticConfiguration(next) === previous) { this.display(); return; }
+    const file = Platform?.isMobileApp || next.diagnosticLogTarget === "file";
+    const needsConsent = next.enableDiagnosticLogging && next.diagnosticLogLevel === "detailed" && file &&
+      (!settings.enableDiagnosticLogging || settings.diagnosticLogLevel !== "detailed");
+    if (needsConsent) {
+      const confirmed = await new Promise((resolve) => {
+        new DetailedLogConsentModal(this.app, resolve).open();
+      });
+      if (!confirmed || this.plugin.diagnosticLoggingChangeRevision !== revision ||
+          this.plugin.settings !== settings || diagnosticConfiguration(this.plugin.settings) !== previous) {
+        this.display();
+        return;
+      }
+    }
+    this.plugin.diagnosticLogger?.revokeContentConsent();
+    Object.assign(this.plugin.settings, changes);
+    const confirmedConfiguration = diagnosticConfiguration(this.plugin.settings);
+    try {
+      await this.plugin.saveSettings();
+      if (needsConsent && this.plugin.diagnosticLoggingChangeRevision === revision &&
+          diagnosticConfiguration(this.plugin.settings) === confirmedConfiguration) this.plugin.diagnosticLogger?.activateContent();
+    } catch {
+      this.plugin.diagnosticLogger?.revokeContentConsent();
+      this.plugin.settings.enableDiagnosticLogging = false;
+      new Notice("Unable to save diagnostic logging settings. Logging was stopped.");
+    }
+    this.display();
   }
 
   async handleDiagnosticLogShare() {
@@ -737,11 +774,6 @@ class CoDriverSettingTab extends PluginSettingTab {
 
     const navigatorObject = globalThis.navigator;
     const file = createDiagnosticLogFile(result.content);
-    if (!canShareDiagnosticLogFile(navigatorObject, file)) {
-      await copyDiagnosticLogWithNotice(navigatorObject, result.content);
-      return;
-    }
-
     new DiagnosticLogShareModal(this.app, {
       file,
       content: result.content,
@@ -1047,7 +1079,8 @@ class CoDriverSettingTab extends PluginSettingTab {
         title: AUDIO_TRANSCRIPTION_TOOLTIP
       }
     });
-    if (current.providerId && current.modelId && !availableValues.has(selectedValue)) {
+    if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
+      !isProviderModelDisabled(this.plugin.settings.providers?.find((provider) => provider.id === current.providerId), current.modelId)) {
       groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
     }
     select.disabled = !current.enabled && !this.pendingAudioTranscriptionEnable;
@@ -1125,7 +1158,8 @@ class CoDriverSettingTab extends PluginSettingTab {
       attr: { type: "button", "aria-label": "Select voice input provider and model", title: "Uses this provider and model only for microphone input." }
     });
     select.disabled = Platform.isMobile || (!current.enabled && !this.pendingVoiceInputEnable);
-    if (current.providerId && current.modelId && !availableValues.has(selectedValue)) {
+    if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
+      !isProviderModelDisabled(this.plugin.settings.providers?.find((provider) => provider.id === current.providerId), current.modelId)) {
       groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
     }
     bindModelPicker(this, select, {
@@ -1139,10 +1173,14 @@ class CoDriverSettingTab extends PluginSettingTab {
         this.display();
       }
     });
-    if (current.enabled && !resolution.ok) {
+    const voiceConfiguration = this.plugin.chatController?.getVoiceInputConfiguration?.();
+    const unavailableReason = voiceConfiguration?.unavailableReason || (!resolution.ok ? resolution.message : "");
+    if (current.enabled && unavailableReason) {
       setting.settingEl.addClass("is-invalid");
       select.setAttribute("aria-invalid", "true");
-      select.title = resolution.message;
+      select.title = unavailableReason;
+      container.createDiv({ cls: "codriver-voice-unavailable",
+        text: unavailableReason.replace(" Update it in Settings > Providers.", ""), attr: { role: "status" } });
     }
     const options = container.createDiv({ cls: "codriver-voice-input-options", attr: { id: "codriver-voice-input-options" } });
     options.hidden = this.voiceInputExpanded !== true;
@@ -1924,6 +1962,33 @@ class CoDriverVaultDisableModal extends Modal {
   }
 }
 
+const DETAILED_LOG_WARNING = "Detailed logs save assistant answers and tool arguments/results to a local file. They may contain private notes, personal data, or secrets returned by tools. Known credentials are redacted, but redaction is not guaranteed. Reasoning, prompts, and raw attachments/audio are excluded. Review logs before sharing.";
+
+function diagnosticConfiguration(settings) {
+  return JSON.stringify([settings.enableDiagnosticLogging, settings.diagnosticLogLevel, settings.diagnosticLogTarget]);
+}
+
+class DetailedLogConsentModal extends Modal {
+  constructor(app, resolve) {
+    super(app);
+    this.resolve = resolve;
+    this.accepted = false;
+  }
+  onOpen() {
+    this.contentEl.empty();
+    this.contentEl.addClass("codriver-provider-modal");
+    this.contentEl.createEl("h2", { text: "Enable detailed logging?" });
+    this.contentEl.createEl("p", { text: DETAILED_LOG_WARNING });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => button.setCta().setButtonText("Enable detailed logging").onClick(() => {
+        this.accepted = true;
+        this.close();
+      }));
+  }
+  onClose() { this.resolve(this.accepted); }
+}
+
 class DiagnosticLogShareModal extends Modal {
   constructor(app, options) {
     super(app);
@@ -1938,7 +2003,7 @@ class DiagnosticLogShareModal extends Modal {
     contentEl.addClass("codriver-provider-modal");
     contentEl.createEl("h2", { text: "Share diagnostic log?" });
     contentEl.createEl("p", {
-      text: "Diagnostic logs can contain note paths and provider endpoint metadata. They exclude note bodies, prompts, tool argument values, tool output content, API keys, and secrets."
+      text: "This file may include Detailed logs containing assistant answers, private note content, and tool arguments/results from earlier logging. Review it before sharing or copying. Known credential redaction is not guaranteed. Prompts, reasoning, and raw attachments/audio are excluded. If file sharing fails, the confirmed log will be copied to the clipboard."
     });
 
     new Setting(contentEl)
@@ -1950,9 +2015,14 @@ class DiagnosticLogShareModal extends Modal {
       .addButton((button) => {
         button
           .setCta()
-          .setButtonText("Share")
+          .setButtonText(canShareDiagnosticLogFile(this.navigatorObject, this.file) ? "Share" : "Copy")
           .onClick(() => {
             button.setDisabled(true);
+            if (!canShareDiagnosticLogFile(this.navigatorObject, this.file)) {
+              void copyDiagnosticLogWithNotice(this.navigatorObject, this.content);
+              this.close();
+              return;
+            }
             startDiagnosticLogFileShare(this.navigatorObject, this.file, {
               onShared: () => new Notice("Diagnostic log shared."),
               onError: () => {

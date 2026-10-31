@@ -111,8 +111,9 @@ class GeminiClient {
     this.fetch = options.fetch;
   }
 
-  async createHeaders(extraHeaders = {}) {
+  async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
     const apiKey = String((await Promise.resolve(this.apiKeyResolver())) ?? "").trim();
+    onDiagnosticSecret?.(apiKey);
     if (!apiKey) {
       throw new Error("Set a Gemini API key secret before using this provider.");
     }
@@ -212,6 +213,7 @@ class GeminiClient {
         mapped,
         signal,
         onProgress: options.onProgress,
+        onDiagnosticSecret: options.onDiagnosticSecret,
         enableGoogleSearch,
         groundingConfiguration
       });
@@ -221,7 +223,7 @@ class GeminiClient {
       method: "POST",
       headers: await this.createHeaders({
         "Content-Type": "application/json"
-      }),
+      }, options.onDiagnosticSecret),
       body: JSON.stringify(requestBody)
     };
 
@@ -354,7 +356,7 @@ class GeminiClient {
       headers: await this.createHeaders({
         Accept: "text/event-stream",
         "Content-Type": "application/json"
-      }),
+      }, options.onDiagnosticSecret),
       body: JSON.stringify(streamingBody),
       ...(signal ? { signal } : {})
     };

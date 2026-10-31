@@ -1050,6 +1050,9 @@ class ChatView extends ItemView {
       text: warning.body || "This provider call is larger than Maximum context size. Review the estimate before continuing."
     });
     const values = body.createDiv({ cls: "codriver-context-warning-values" });
+    if (warning.commandWarning) {
+      this.renderRequestInfoRow(values, "Expanded command", `${formatNumber(warning.commandCharacters)} characters (warning above 12000)`);
+    }
     this.renderRequestInfoRow(
       values,
       "Current call",
@@ -1086,10 +1089,10 @@ class ChatView extends ItemView {
       },
       {
         decision: "stop",
-        label: "Stop",
+        label: warning.commandWarning ? "Cancel request" : "Stop",
         title: "Stop this provider call without sending it."
       }
-    ];
+    ].filter((definition) => !warning.commandWarning || definition.decision !== "continue-session");
     const buttons = definitions.map((definition) => {
       const button = actions.createEl("button", {
         cls: `codriver-approval-button codriver-context-warning-${definition.decision}`,
@@ -2552,20 +2555,7 @@ class ChatView extends ItemView {
 
     const voiceConfiguration = this.chatController.getVoiceInputConfiguration?.();
     const voiceState = this.chatController.voiceInput?.state ?? { phase: "idle", error: "" };
-    if (voiceConfiguration?.available) {
-      const recording = voiceState.phase === "recording";
-      const microphone = trailingActions.createEl("button", {
-        cls: "codriver-voice-button",
-        attr: { type: "button", "aria-label": recording ? "Stop recording and transcribe" : "Start voice input",
-          title: recording ? "Stop recording and transcribe" : `Record voice input: ${voiceConfiguration.destination}`,
-          "aria-pressed": String(recording) }
-      });
-      setIcon(microphone, recording ? "square" : "mic");
-      microphone.toggleClass("is-recording", recording);
-      microphone.disabled = this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
-      microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
-      microphone.addEventListener("click", () => { void this.toggleVoiceInput(); });
-    }
+    this.renderVoiceInputControls(trailingActions, input, voiceConfiguration, voiceState);
 
     sendButton = trailingActions.createEl("button", {
       cls: "codriver-send-button",
@@ -2592,6 +2582,25 @@ class ChatView extends ItemView {
     if (voiceStatusText) {
       composer.createDiv({ cls: `codriver-voice-status${voiceState.error ? " codriver-voice-error" : ""}`, text: voiceStatusText,
         attr: { role: "status", "aria-live": "polite", title: voiceStatusText } });
+    }
+  }
+
+  renderVoiceInputControls(trailingActions, input, voiceConfiguration, voiceState) {
+    if (voiceConfiguration?.enabled && voiceConfiguration.platform !== "mobile" && !this.chatController.isCommandActionSession?.()) {
+      const unavailable = !voiceConfiguration.available;
+      const reason = voiceConfiguration.unavailableReason || "Voice input is unavailable. Review Settings > Providers.";
+      const tooltip = unavailable ? `Voice input unavailable: ${reason}` : "";
+      const recording = voiceState.phase === "recording";
+      const microphone = trailingActions.createEl("button", {
+        cls: "codriver-voice-button",
+        attr: { type: "button", title: unavailable ? tooltip : recording ? "Stop recording and transcribe" : `Record voice input: ${voiceConfiguration.destination}`,
+          "aria-pressed": String(recording) }
+      });
+      setIcon(microphone, recording ? "square" : "mic");
+      microphone.toggleClass("is-recording", recording);
+      microphone.disabled = unavailable || this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
+      microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
+      microphone.addEventListener("click", () => { if (!unavailable) void this.toggleVoiceInput(); });
     }
   }
 

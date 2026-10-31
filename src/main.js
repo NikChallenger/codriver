@@ -478,7 +478,7 @@ function normalizeSessionStartupBehavior(value) {
 
 function normalizeDiagnosticLogLevel(value) {
   const text = String(value || "").trim().toLowerCase();
-  return text === "errors" ? "errors" : "all";
+  return text === "detailed" ? "detailed" : text === "errors" ? "errors" : "all";
 }
 
 function normalizeDiagnosticLogTarget(value) {
@@ -746,7 +746,9 @@ class CoDriverPlugin extends Plugin {
   }
 
   onunload() {
+    this.diagnosticLogger?.dispose();
     this.chatController?.cancelVoiceInput?.();
+    this.chatController?.directApiAccess?.dispose();
     this.mcpOAuthService?.dispose();
     this.releaseNotes?.dispose();
     this.commandActionModal?.close?.();
@@ -760,6 +762,7 @@ class CoDriverPlugin extends Plugin {
       mcpCredentialService: this.getMcpCredentialService(),
       mcpOAuthService: this.getMcpOAuthService(),
       getPlatform: () => Platform.isMobile ? "mobile" : "desktop",
+
       isStdioMcpSupported: () => this.isStdioMcpSupported(),
       getStdioMcpUnavailableMessage: () => this.getStdioMcpUnavailableMessage(),
       ...overrides
@@ -874,6 +877,11 @@ class CoDriverPlugin extends Plugin {
       voiceInput: Object.hasOwn(savedSettings ?? {}, "voiceInput") ? savedSettings.voiceInput
         : normalizeVoiceInputSettings(undefined, savedSettings?.audioTranscription)
     });
+    // Content consent belongs to this launch, never persisted settings.
+    if (this.settings.diagnosticLogLevel === "detailed") {
+      this.settings.enableDiagnosticLogging = false;
+      if (!Platform.isMobileApp && this.settings.diagnosticLogTarget === "console") this.settings.diagnosticLogLevel = "all";
+    }
 
     // Hold legacy material outside normalized settings. Never serialize it again.
     this.pendingProviderKeys = (Array.isArray(savedSettings?.providers) ? savedSettings.providers : []).flatMap((provider, index) =>

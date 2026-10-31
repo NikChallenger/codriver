@@ -1,4 +1,5 @@
-const DEFAULT_MAX_LOG_BYTES = 512 * 1024;
+const { ARGUMENT_BYTES, CONTENT_BYTES, RECORD_BYTES, byteLength, serializeContent } = require("./DetailedLogContent");
+const DEFAULT_MAX_LOG_BYTES = 1024 * 1024;
 const DEFAULT_MAX_ARCHIVED_LOGS = 0;
 const DIAGNOSTIC_LOG_VERSION = 1;
 const CURRENT_DIAGNOSTIC_LOG_FILENAME = "diagnostics.log";
@@ -19,6 +20,12 @@ class DiagnosticLogger {
     this.sessionId = "";
     this.initializedForLaunch = false;
     this.writeQueue = Promise.resolve();
+    this.contentGeneration = 0;
+    this.contentConsent = false;
+    this.contentConfiguration = "";
+    this.pendingContentBytes = 0;
+    this.pendingContentRecords = 0;
+    this.droppedContentRecords = 0;
   }
 
   isEnabled() {
@@ -56,6 +63,10 @@ class DiagnosticLogger {
       debug(event, detail) {
         return logger.debugForSession(sessionId, event, detail);
       },
+      content(event, value, options = {}) {
+        return logger.content(event, value, { ...options, sessionId: options.sessionId ?? sessionId });
+      },
+      captureContentPermit() { return logger.captureContentPermit(); },
       getLogLevel() {
         return logger.getLogLevel();
       },
@@ -72,6 +83,7 @@ class DiagnosticLogger {
   }
 
   async refresh() {
+    this.syncContentConfiguration();
     await this.pruneArchivedLogs();
     if (!this.isEnabled() || this.getLogTarget() !== "file") {
       return;
@@ -115,15 +127,117 @@ class DiagnosticLogger {
     const normalizedSessionId = normalizeSessionId(sessionId);
     const writeTask = this.writeQueue
       .then(() => this.writeLine(event, detail, normalizedSessionId))
-      .catch((error) => {
-        console.warn("[CoDriver diagnostics] Unable to write diagnostic log.", error);
+      .catch(() => {
+        console.warn("[CoDriver diagnostics] Unable to write diagnostic log.");
       });
     this.writeQueue = writeTask;
     return writeTask;
   }
 
+  syncContentConfiguration() {
+    const configuration = `${this.isEnabled()}:${this.getLogLevel()}:${this.getLogTarget()}`;
+    if (configuration !== this.contentConfiguration) {
+      this.contentConfiguration = configuration;
+      this.revokeContentConsent();
+    }
+  }
+
+  revokeContentConsent() {
+    this.contentConsent = false;
+    this.contentGeneration += 1;
+  }
+
+  activateContent() {
+    this.syncContentConfiguration();
+    this.contentConsent = !this.disposed && this.isEnabled() && this.getLogTarget() === "file" && this.getLogLevel() === "detailed";
+    return this.contentConsent;
+  }
+
+  captureContentPermit() {
+    this.syncContentConfiguration();
+    return this.contentConsent ? this.contentGeneration : null;
+  }
+
+  dispose() {
+    this.disposed = true;
+    this.revokeContentConsent();
+  }
+
+  isContentPermitCurrent(permit) {
+    return permit !== null && permit === this.captureContentPermit();
+  }
+
+  content(event, value, options = {}) {
+    // A permit captured at request/dispatch time prevents backfill after activation.
+    if (!this.isContentPermitCurrent(options.permit) ||
+        !["assistant.final", "tool.arguments", "tool.result", "tool.applied"].includes(event)) return Promise.resolve();
+    if (this.pendingContentRecords >= 32 || this.pendingContentBytes >= 1024 * 1024) {
+      this.droppedContentRecords += 1;
+      return Promise.resolve();
+    }
+    let line;
+    try {
+      const maximum = event === "tool.arguments" ? ARGUMENT_BYTES : CONTENT_BYTES;
+      let detail = serializeContent(value, maximum, options.redactor);
+      const identity = {
+        toolName: typeof options.toolName === "string" ? options.toolName.slice(0, 160) : undefined,
+        callId: normalizeSessionId(options.callId),
+        droppedRecords: this.droppedContentRecords || undefined
+      };
+      line = `${this.createLine(`content.${event}`, { ...identity, ...detail }, options.sessionId ?? this.sessionId)}\n`;
+      if (byteLength(line) > RECORD_BYTES) {
+        detail = serializeContent(detail.content, 12 * 1024, options.redactor);
+        detail.truncated = true;
+        detail.marker = "[TRUNCATED: detailed log record limit]";
+        line = `${this.createLine(`content.${event}`, { ...identity, ...detail }, options.sessionId ?? this.sessionId)}\n`;
+      }
+    } catch {
+      this.droppedContentRecords += 1;
+      return Promise.resolve();
+    }
+    const size = byteLength(line);
+    if (size > RECORD_BYTES || this.pendingContentBytes + size > 1024 * 1024) {
+      this.droppedContentRecords += 1;
+      return Promise.resolve();
+    }
+    this.droppedContentRecords = 0;
+    this.pendingContentBytes += size;
+    this.pendingContentRecords += 1;
+    // Only a bounded, already redacted string is retained in the queue.
+    const permit = options.permit;
+    const task = this.writeQueue.then(async () => {
+      if (!this.isContentPermitCurrent(permit)) return;
+      await this.initializeForLaunch();
+      if (!this.isContentPermitCurrent(permit)) return;
+      let current = await this.adapter.read(this.currentLogPath);
+      if (!this.isContentPermitCurrent(permit)) return;
+      if (byteLength(current) + size > this.maxLogBytes) {
+        await this.rotateCurrentLog(current);
+        current = await this.adapter.read(this.currentLogPath);
+      }
+      if (!this.isContentPermitCurrent(permit)) return;
+      await this.adapter.write(this.currentLogPath, `${current}${line}`);
+    }).catch(() => {
+      console.warn("[CoDriver diagnostics] Unable to write diagnostic log.");
+    }).finally(() => {
+      this.pendingContentBytes -= size;
+      this.pendingContentRecords -= 1;
+      if (this.pendingContentRecords === 0 && this.droppedContentRecords > 0) {
+        const count = this.droppedContentRecords;
+        this.droppedContentRecords = 0;
+        void this.debug("diagnostics.content.dropped", { count });
+      }
+    });
+    this.writeQueue = task;
+    return task;
+  }
+
   async flush() {
-    await this.writeQueue;
+    let pending;
+    do {
+      pending = this.writeQueue;
+      await pending;
+    } while (pending !== this.writeQueue);
   }
 
   async readCurrentLog() {
@@ -196,7 +310,7 @@ class DiagnosticLogger {
       return false;
     }
 
-    return currentContent.length > 0 && currentContent.length + nextLine.length > this.maxLogBytes;
+    return currentContent.length > 0 && byteLength(currentContent) + byteLength(nextLine) > this.maxLogBytes;
   }
 
   async rotateCurrentLog(currentContent, sessionId = "") {
@@ -266,7 +380,8 @@ function sanitizeDetail(detail) {
 }
 
 function normalizeLogLevel(value) {
-  return String(value || "").trim().toLowerCase() === "errors" ? "errors" : "all";
+  const level = String(value || "").trim().toLowerCase();
+  return level === "detailed" ? "detailed" : level === "errors" ? "errors" : "all";
 }
 
 function normalizeLogTarget(value) {

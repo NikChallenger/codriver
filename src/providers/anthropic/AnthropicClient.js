@@ -64,13 +64,14 @@ class AnthropicClient {
     this.fetch = options.fetch;
   }
 
-  async createHeaders(extraHeaders = {}) {
+  async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
     const headers = {
       Accept: "application/json",
       "anthropic-version": this.apiVersion,
       ...extraHeaders
     };
     const apiKey = String((await Promise.resolve(this.apiKeyResolver())) ?? "").trim();
+    onDiagnosticSecret?.(apiKey);
     if (apiKey) {
       headers["x-api-key"] = apiKey;
     }
@@ -163,7 +164,7 @@ class AnthropicClient {
       headers: await this.createHeaders({
         Accept: "text/event-stream",
         "Content-Type": "application/json"
-      }),
+      }, options.onDiagnosticSecret),
       body: JSON.stringify(body),
       ...(signal ? { signal } : {})
     };

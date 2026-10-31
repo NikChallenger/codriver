@@ -23,6 +23,8 @@ class McpHttpClient {
     this.serverSummary = createServerSummary(server);
     this.serverSummary.customHeaderNames = Object.keys(this.headers).sort();
     this.diagnostics = options.diagnostics ?? null;
+    this.onToolDispatch = options.onToolDispatch;
+    this.onDiagnosticSecret = options.onDiagnosticSecret;
   }
 
   async discoverTools() {
@@ -152,8 +154,10 @@ class McpHttpClient {
         body: JSON.stringify(payload)
       };
       response = this.oauthService
-        ? await this.oauthService.requestMcp(this.server, { ...request, signal: this.signal })
-        : await requestUrl(request);
+        ? await this.oauthService.requestMcp(this.server, { ...request, signal: this.signal,
+            onDiagnosticSecret: payload.method === "tools/call" ? this.onDiagnosticSecret : undefined,
+            onDiagnosticHeaders: payload.method === "tools/call" ? (headers) => this.notifyToolDispatch(headers) : undefined })
+        : await this.dispatchRequest(request, payload.method);
     } catch (error) {
       await this.logDiagnostic("mcp.http.request.failed", {
         ...this.serverSummary,
@@ -190,6 +194,15 @@ class McpHttpClient {
     }
 
     await this.diagnostics.debug(event, detail);
+  }
+
+  notifyToolDispatch(headers) {
+    try { this.onToolDispatch?.(headers); } catch { /* Diagnostics are best effort. */ }
+  }
+
+  dispatchRequest(request, method) {
+    if (method === "tools/call") this.notifyToolDispatch(this.headers);
+    return requestUrl(request);
   }
 
   createHeaders(options = {}) {

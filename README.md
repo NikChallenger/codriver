@@ -77,7 +77,9 @@ Edit the built-in Canvas skill in Settings to describe extensions from plugins s
 - Configure **Max tools**, **Max calls**, **Output chars**, and **Maximum context size** to review oversized tool catalogs, automatic call chains, large results, and the combined request context before continuing.
 - **Request info** shows the sent-context breakdown, estimated context tokens, provider-call count, and input/output token usage, with reasoning and cache figures when reported. Use it alongside context limits to monitor token consumption; estimates and incomplete usage are marked.
 - **Session history** stays on your device without saving attachment contents, transcripts, or tool results in it.
-- Diagnostics exclude note content, prompts, provider responses, tool data, transcripts, and secrets.
+- **Errors only** and **Standard** diagnostics exclude note content, prompts, provider responses, tool data, transcripts, and secrets.
+- Detailed logs exclude reasoning/thinking, prompts, internal provider context, raw attachments/audio and transcription-tool transcripts. An assistant answer or ordinary tool result may still quote sensitive source material.
+- Detailed logging requires confirmation each time it is enabled and stays off after restart. The file is refreshed when logging starts in a new CoDriver launch and rotates without archives at 1024 KiB.
 
 Your selected provider still receives the context required for the current request. Review that provider's privacy and retention terms before sending sensitive material.
 

@@ -62,7 +62,7 @@ function getAudioTranscriptionModelChoices(settings) {
     .map((provider) => ({
       providerId: normalizeIdentity(provider.id),
       providerName: normalizeIdentity(provider.name) || normalizeIdentity(provider.id),
-      models: getConfiguredProviderModelIds(provider)
+      models: getAvailableProviderModelIds(provider)
     }))
     .filter((provider) => provider.providerId && provider.models.length > 0);
 }
@@ -86,7 +86,7 @@ function resolveAudioTranscriptionSelection(settings, options = {}) {
     !providerSettings ||
     providerSettings.enabled === false ||
     providerSettings.type !== OPENAI_COMPATIBLE_PROVIDER_TYPE ||
-    !getConfiguredProviderModelIds(providerSettings).includes(selection.modelId)
+    !getAvailableProviderModelIds(providerSettings).includes(selection.modelId)
   ) {
     return createUnavailableResult(
       "audio-transcription-selection-unavailable",
@@ -105,6 +105,14 @@ function resolveAudioTranscriptionSelection(settings, options = {}) {
     modelId: selection.modelId,
     providerSettings
   };
+}
+
+function isProviderModelDisabled(provider, modelId) {
+  return Array.isArray(provider?.hiddenModels) && provider.hiddenModels.includes(modelId);
+}
+
+function getAvailableProviderModelIds(provider) {
+  return getConfiguredProviderModelIds(provider).filter((model) => !isProviderModelDisabled(provider, model));
 }
 
 function getConfiguredProviderModelIds(provider) {
@@ -165,6 +173,7 @@ module.exports = {
   encodeAudioTranscriptionSelection,
   getAudioTranscriptionModelChoices,
   getConfiguredProviderModelIds,
+  isProviderModelDisabled,
   normalizeAudioTranscriptionSettings,
   resolveAudioTranscriptionSelection
 };

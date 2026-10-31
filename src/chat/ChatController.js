@@ -1,4 +1,5 @@
 const { SkillRegistry } = require("../skills/SkillRegistry");
+const { createContentRedactor, projectToolResult } = require("../diagnostics/DetailedLogContent");
 const { FrontmatterSkillMatcher } = require("../skills/FrontmatterSkillMatcher");
 const { expandCommand, hasUnescaped } = require("../commands/CommandExpansion");
 const {
@@ -90,6 +91,7 @@ const {
 
 const SKILL_COMMAND_PATTERN = /^\/skill:([A-Za-z0-9_-]+)(?:\s+([\s\S]+))?$/;
 const COMMAND_CONTEXT = Symbol("command-context");
+const EMBEDDED_COMMAND_CHARACTERS = Symbol("embedded-command-characters");
 const NORMAL_SESSION_MODE = "normal";
 const COMMAND_ACTION_SESSION_MODE = "command-action";
 const MAX_MODEL_ROUTED_SKILLS = 3;
@@ -100,7 +102,7 @@ const DEFAULT_MAX_MCP_TOOL_RESULT_CHARS = 60000;
 const MIN_MCP_TOOL_RESULT_CHARS = 1000;
 const MAX_MCP_TOOL_RESULT_CHARS_SETTING = 240000;
 const MAX_RECENT_MCP_TOOL_ARGUMENT_CONTEXT_CHARS = 2000;
-const MAX_CONTINUATION_REQUEST_CONTEXT_CHARS = 4000;
+const COMMAND_CONTEXT_WARNING_CHARS = 12000;
 const MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS = 2000;
 const MAX_NOTE_CHANGE_CLARIFICATION_CHARS = 600;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS = 360;
@@ -754,7 +756,9 @@ function createRequestContextSummary(messages = [], requestSkills = [], nativeTo
     }
 
     if (text.includes("BEGIN MCP TOOL OUTPUT") || text.includes("BEGIN RECENT MCP TOOL RESULTS")) {
-      byId.get("mcp").characters += text.length;
+      const commandCharacters = Math.min(text.length, message[EMBEDDED_COMMAND_CHARACTERS] || 0);
+      byId.get("command").characters += commandCharacters;
+      byId.get("mcp").characters += text.length - commandCharacters;
       continue;
     }
 
@@ -1302,6 +1306,7 @@ class ChatController {
     this.vaultReader = new VaultReader(app);
     this.directApiAccess = new DirectApiAccess(app);
     this.diagnostics = diagnostics;
+    this.responseDiagnosticContexts = new WeakMap();
     this.vaultWriter = new VaultWriter(app.vault, app.fileManager, this.diagnostics,
       (file, before) => {
         if (typeof this.runtimeSupport.guardCanvasWrite !== "function") throw new Error("Canvas write synchronization is unavailable.");
@@ -1338,6 +1343,7 @@ class ChatController {
     this.changeProposals = [];
     this.mcpToolCalls = [];
     this.recentMcpToolResults = [];
+    this.evidenceVaultRevision = this.directApiAccess.vaultRevision;
     this.pendingRequestContinuation = null;
     this.attachments = [];
     this.draftAttachments = [];
@@ -1502,12 +1508,23 @@ class ChatController {
     let providerBinding = "";
     let credentialsAvailable = true;
     try { providerBinding = configuration.provider?.getContinuationBinding?.() ?? ""; }
-    catch { credentialsAvailable = false; }
+    catch (error) {
+      credentialsAvailable = false;
+      configuration.error ||= ({
+        "secret-missing": "The provider API key is missing. Update it in Settings > Providers.",
+        "storage-unavailable": "Provider secret storage is unavailable. Update Obsidian and retry.",
+        "storage-error": "Unable to access the provider API key. Review Settings > Providers.",
+        "needs-review": "Provider credentials need review in Settings > Providers.",
+        "migration-pending": "Provider key migration is pending. Review Settings > Providers."
+      })[error?.code] || "Provider credentials are unavailable. Review Settings > Providers.";
+    }
+    if (!providerIsCurrent) configuration.error ||= "The provider configuration changed. Review Settings > Providers.";
     const available = enabled && !configuration.error && !this.isCommandActionSession() && providerIsCurrent && credentialsAvailable;
     return {
       ...configuration,
       enabled,
       available,
+      unavailableReason: enabled && !available ? configuration.error || "Voice input is unavailable in this chat." : "",
       timeoutMs: voiceInput.timeoutSeconds * 1000,
       binding: JSON.stringify([this.currentSessionId, this.voiceSessionRevision, enabled,
         configuration.providerId, configuration.model, configuration.endpoint, configuration.authenticationPath,
@@ -1603,7 +1620,8 @@ class ChatController {
       };
     }
 
-    if (!new Set(["continue", "continue-session", "stop"]).has(decision)) {
+    if (!new Set(["continue", "continue-session", "stop"]).has(decision) ||
+      (action.commandWarning && decision === "continue-session")) {
       return {
         ok: false,
         reason: "invalid-action",
@@ -1692,6 +1710,7 @@ class ChatController {
     if (decision === "continue-session") {
       action.contextBudgetScope.suppressed = true;
     }
+    if (action.commandWarning) action.contextBudgetScope.commandConfirmed = true;
 
     const activeRequest = this.createActiveRequest(loadingMessage.id);
     this.activeRequest = activeRequest;
@@ -2501,6 +2520,15 @@ class ChatController {
       throw new AudioTranscriptionError("transcription-not-configured", configuration.error);
     }
 
+    const validateSelection = () => {
+      const current = this.getAudioAttachmentProcessingConfiguration({
+        providerId: configuration.providerId,
+        modelId: configuration.model
+      });
+      if (current.error) throw new AudioTranscriptionError("transcription-not-configured", current.error);
+    };
+    validateSelection();
+
     for (const attachment of audioAttachments) {
       attachment.status = "pending";
       attachment.error = "";
@@ -2524,7 +2552,13 @@ class ChatController {
           extension: attachment.extension,
           mimeType: attachment.mimeType,
           size: attachment.size,
-          readArrayBuffer: attachment.readArrayBuffer
+          readArrayBuffer: async () => {
+            validateSelection();
+            const bytes = await attachment.readArrayBuffer();
+            validateSelection();
+            return bytes;
+          },
+          beforeUpload: validateSelection
         })),
         {
           adapterContext: configuration,
@@ -3513,6 +3547,10 @@ class ChatController {
       toolCall.status = "complete";
       toolCall.error = "";
       toolCall.output = formatMcpToolResult(createAppliedPatchToolResult(proposal));
+      // Application reports only its outcome; reviewed patch arguments were logged at preparation.
+      this.logDetailedContent("tool.applied", { status: "applied" }, {
+        permit: this.diagnostics?.captureContentPermit?.(), toolName: toolCall.toolName, callId: toolCall.id
+      });
       const owner = this.mcpToolChainStates.get(toolCall);
       if (owner === chainState) this.recordMcpToolResultInChain(owner, toolCall);
       this.rememberRecentMcpToolResult(toolCall);
@@ -3627,10 +3665,14 @@ class ChatController {
     const effectiveContent = commandExpansion?.content || skillCommand?.prompt || trimmed || fallbackAttachmentPrompt;
     const displayContent = command ? `${trimmed}` : (skillCommand?.prompt ? effectiveContent : (trimmed || fallbackAttachmentPrompt));
     const pendingContinuation = this.pendingRequestContinuation;
-    const contextBudgetScope = { suppressed: false };
+    const requestSnapshot = this.createRequestSnapshot({
+      rootUserContent: effectiveContent, currentUserContent: effectiveContent,
+      commandId: command?.id || ""
+    });
+    const contextBudgetScope = { suppressed: false, requestSnapshot, commandConfirmed: false };
     const maxToolsScope = { unlimited: false, routingDecision: null };
     const userMessage = {
-      id: createId("message"),
+      id: requestSnapshot.messageId,
       role: "user",
       author: "You",
       time: currentTimeLabel(),
@@ -3851,12 +3893,18 @@ class ChatController {
           priorToolResults: continuesPreviousRequest
             ? pendingContinuation.toolResults
             : [],
-          commandScoped: Boolean(command)
+          commandScoped: Boolean(command),
+          requestSnapshot: continuesPreviousRequest
+            ? Object.freeze({ ...requestSnapshot, rootUserContent: pendingContinuation.rootUserContent,
+                corePrompt: pendingContinuation.requestSnapshot?.corePrompt || requestSnapshot.corePrompt,
+                fingerprint: hashText(JSON.stringify([pendingContinuation.rootUserContent, effectiveContent])) })
+            : requestSnapshot
         });
         const providerMessages = this.getProviderMessages(activeNoteContext, requestSkills, attachmentContext, {
           continuationContext,
           activeNotePathContext,
-          boundMcpCatalog
+          boundMcpCatalog,
+          requestSnapshot: chainState.requestSnapshot
         });
         const nativeTools = this.createMcpNativeToolDefinitions(boundMcpCatalog);
         chainState.nativeToolFingerprint = createNativeToolFingerprint(nativeTools);
@@ -4127,6 +4175,8 @@ class ChatController {
       attachmentContext = null
     } = options;
     const chainState = mcpChainState ?? this.createMcpToolChainState();
+    const diagnosticContext = this.responseDiagnosticContexts.get(response);
+    this.responseDiagnosticContexts.delete(response);
     if (activeRequest) {
       activeRequest.mcpChainState = chainState;
       chainState.activeRequest = activeRequest;
@@ -4204,7 +4254,7 @@ class ChatController {
     }
     for (const toolCall of newToolCalls) {
       this.mcpToolChainStates.set(toolCall, chainState);
-      toolCall.requiresLiveChain = chainState.hasPatchReview === true || chainState.hasAudioCreateReview === true;
+      toolCall.requiresLiveChain = true;
     }
     void this.logDiagnostic("mcp.tool_chain.model_response.parsed", {
       ...createMcpToolChainDiagnostic(chainState),
@@ -4244,6 +4294,14 @@ class ChatController {
       !parsedToolResponse.displayContent &&
       !String(response?.content ?? "").trim() &&
       newToolCalls.length === 0;
+
+    if (diagnosticContext) {
+      // Only display text from a completed, accepted response; never native context or reasoning.
+      if (!loadingMessage.hidden && !this.isRequestCancelled(activeRequest) && parsedToolResponse.displayContent) {
+        this.logDetailedContent("assistant.final", parsedToolResponse.displayContent, diagnosticContext);
+      }
+      diagnosticContext.redactor.clear();
+    }
 
     if (newToolCalls.length > 0) {
       if (userMessage) {
@@ -4298,8 +4356,25 @@ class ChatController {
     };
   }
 
+  createRequestSnapshot(options = {}) {
+    const rootUserContent = String(options.rootUserContent || "");
+    const currentUserContent = String(options.currentUserContent || "");
+    return Object.freeze({
+      id: createId("request-snapshot"),
+      messageId: options.messageId || createId("message"),
+      commandId: options.commandId || "",
+      rootUserContent,
+      currentUserContent,
+      fingerprint: hashText(JSON.stringify([rootUserContent, currentUserContent])),
+      corePrompt: createCoreSystemPrompt({ vaultName: this.app?.vault?.getName?.(), now: new Date() })
+    });
+  }
+
   createMcpToolChainState(requestSkills = null, noteChangeRequested = null, options = {}) {
+    const requestSnapshot = options.requestSnapshot ?? this.createRequestSnapshot(options);
     return {
+      requestSnapshot,
+      evidenceVaultRevision: this.directApiAccess?.vaultRevision ?? null,
       chainId: createId("mcp-chain"),
       sessionId: this.currentSessionId,
       pendingPatchIds: new Set(),
@@ -4323,8 +4398,8 @@ class ChatController {
       mcpToolsDisabled: options.mcpToolsDisabled === true,
       audioTranscriptionConfiguration: options.audioTranscriptionConfiguration ?? null,
       model: typeof options.model === "string" ? options.model.trim() : "",
-      rootUserContent: truncateText(options.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
-      currentUserContent: truncateText(options.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+      rootUserContent: requestSnapshot.rootUserContent,
+      currentUserContent: requestSnapshot.currentUserContent,
       continuationContext: options.continuationContext ?? null,
       contextBudgetScope: options.contextBudgetScope ?? { suppressed: false },
       activeNotePathContext: normalizeActiveNotePathContext(options.activeNotePathContext),
@@ -4369,8 +4444,9 @@ class ChatController {
     state.mcpToolsDisabled = state.mcpToolsDisabled === true;
     state.model = typeof state.model === "string" ? state.model.trim() : "";
 
-    state.rootUserContent = truncateText(state.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS);
-    state.currentUserContent = truncateText(state.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS);
+    state.requestSnapshot ??= this.createRequestSnapshot(state);
+    state.rootUserContent = state.requestSnapshot.rootUserContent;
+    state.currentUserContent = state.requestSnapshot.currentUserContent;
     state.activeNotePathContext = normalizeActiveNotePathContext(state.activeNotePathContext);
     if (!Array.isArray(state.priorToolResults)) {
       state.priorToolResults = [];
@@ -4654,6 +4730,7 @@ class ChatController {
   ) {
     const messages = this.messages
       .filter((message) => {
+        if (options.toolFollowUp && message.id === options.requestSnapshot?.messageId) return false;
         if (message.sendToProvider === false) {
           return false;
         }
@@ -4667,12 +4744,14 @@ class ChatController {
       .slice(-12)
       .map((message) => ({
         role: message.role,
-        content: message.providerContent ?? message.content,
-        ...(message.providerContent ? { [COMMAND_CONTEXT]: true } : {})
+        content: message.id === options.requestSnapshot?.messageId
+          ? options.requestSnapshot.currentUserContent : (message.providerContent ?? message.content),
+        ...(message.providerContent || (message.id === options.requestSnapshot?.messageId && options.requestSnapshot.commandId)
+          ? { [COMMAND_CONTEXT]: true } : {})
       }));
 
     const providerMessages = [
-      this.createProviderSystemMessage(requestSkills, options.boundMcpCatalog ?? null)
+      this.createProviderSystemMessage(requestSkills, options.boundMcpCatalog ?? null, options.requestSnapshot)
     ];
 
     if (activeNoteContext?.included) {
@@ -4716,7 +4795,7 @@ class ChatController {
         "Continue the original request using the latest clarification. Do not treat the clarification as a standalone task.",
         "",
         "BEGIN ORIGINAL USER REQUEST",
-        truncateText(context?.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+        context?.rootUserContent || "",
         "END ORIGINAL USER REQUEST",
         "",
         "BEGIN PREVIOUS ASSISTANT RESPONSE",
@@ -4724,7 +4803,7 @@ class ChatController {
         "END PREVIOUS ASSISTANT RESPONSE",
         "",
         "BEGIN CURRENT USER CLARIFICATION",
-        truncateText(context?.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+        context?.currentUserContent || "",
         "END CURRENT USER CLARIFICATION"
       ].join("\n")
     };
@@ -4744,10 +4823,7 @@ class ChatController {
       return;
     }
 
-    const rootUserContent = truncateText(
-      chainState.rootUserContent || options.effectiveContent || "",
-      MAX_CONTINUATION_REQUEST_CONTEXT_CHARS
-    );
+    const rootUserContent = chainState.rootUserContent || options.effectiveContent || "";
     const assistantContent = truncateText(
       options.assistantContent || "",
       MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS
@@ -4769,6 +4845,7 @@ class ChatController {
         createdAt: result.createdAt
       }));
     this.pendingRequestContinuation = {
+      requestSnapshot: chainState.requestSnapshot,
       rootUserContent,
       assistantContent,
       noteChangeRequested: true,
@@ -6569,6 +6646,15 @@ class ChatController {
             : this.getMcpToolTimeoutMs()
         );
     this.runningMcpToolExecutions.set(toolCall.id, runtime);
+    const contentPermit = this.diagnostics?.captureContentPermit?.() ?? null;
+    const contentRedactor = createContentRedactor();
+    const contentOptions = { permit: contentPermit, redactor: contentRedactor,
+      sessionId: this.currentSessionId, toolName: toolCall.toolName, callId: toolCall.id };
+    const logDispatch = (headers = {}) => {
+      if (runtime.signal?.aborted || contentPermit === null || this.diagnostics?.captureContentPermit?.() !== contentPermit) return;
+      for (const value of Object.values(headers)) contentRedactor.add(value);
+      this.logDetailedContent("tool.arguments", toolCall.arguments, contentOptions);
+    };
     await this.notifyStateChanged();
     void this.logDiagnostic("mcp.tool_call.execution.started", {
       ...createMcpToolExecutionDiagnostic(toolCall),
@@ -6580,6 +6666,7 @@ class ChatController {
     try {
       let result;
       if (server.transport === CODRIVER_INTERNAL_TRANSPORT) {
+        logDispatch();
         const toolResultPromise = this.callFirstPartyMcpTool(toolCall, {
           audioAuthorization,
           noteAppendAuthorization,
@@ -6601,6 +6688,10 @@ class ChatController {
           credentialService: this.runtimeSupport.mcpCredentialService,
           oauthService: this.runtimeSupport.mcpOAuthService,
           signal: runtime.signal,
+          onToolDispatch: logDispatch,
+          onDiagnosticSecret: (value) => {
+            if (contentPermit !== null && this.diagnostics?.captureContentPermit?.() === contentPermit) contentRedactor.add(value);
+          },
           diagnostics: this.diagnostics
         });
         const toolResultPromise = client.callTool(toolCall.toolName, toolCall.arguments);
@@ -6613,7 +6704,8 @@ class ChatController {
         const { McpStdioClient } = require("../mcp/McpStdioClient");
         const client = new McpStdioClient(server, {
           diagnostics: this.diagnostics,
-          requestTimeoutMs: this.getMcpToolTimeoutMs()
+          requestTimeoutMs: this.getMcpToolTimeoutMs(),
+          onToolDispatch: logDispatch
         });
         const toolResultPromise = client.callTool(toolCall.toolName, toolCall.arguments);
         toolResultPromise.catch(() => {});
@@ -6629,6 +6721,12 @@ class ChatController {
         throw new Error("Unsupported MCP transport.");
       }
 
+      // Invalidate older snapshots before registering this operation's outcome.
+      // In particular, a create event must not erase proof of the just-finished create.
+      this.refreshVaultEvidence(options.chainState);
+      if (!runtime.signal?.aborted && !isCodriverVaultTranscribeAudioToolCall(toolCall)) {
+        this.logDetailedToolResult(result, contentOptions);
+      }
       if (isCodriverVaultToolCall(toolCall)) capturePatchWorkList(options.chainState, toolCall.toolName, result);
       toolCall.output = formatMcpToolResult(result);
       const outputLimit = this.getMaxMcpToolResultChars();
@@ -6723,6 +6821,7 @@ class ChatController {
       };
     } finally {
       runtime.dispose();
+      contentRedactor.clear();
       this.runningMcpToolExecutions.delete(toolCall.id);
     }
   }
@@ -6987,7 +7086,9 @@ class ChatController {
         includeRecentMcpResults: false,
         continuationContext: chainState.continuationContext,
         activeNotePathContext: chainState.activeNotePathContext,
-        boundMcpCatalog: chainState.boundMcpCatalog
+        boundMcpCatalog: chainState.boundMcpCatalog,
+        requestSnapshot: chainState.requestSnapshot,
+        toolFollowUp: true
       });
       const followUpMessages = [
         ...providerMessages,
@@ -7371,6 +7472,8 @@ class ChatController {
   }
 
   invalidateRecentVaultWriteContext(notePath, reason, chainState = null) {
+    this.evidenceVaultRevision = this.directApiAccess?.vaultRevision ?? null;
+    if (chainState) chainState.evidenceVaultRevision = this.evidenceVaultRevision;
     const previousRecentCount = Array.isArray(this.recentMcpToolResults)
       ? this.recentMcpToolResults.length
       : 0;
@@ -7512,6 +7615,7 @@ class ChatController {
   }
 
   createRecentMcpToolResultsContextMessage(catalog = null) {
+    this.refreshVaultEvidence();
     const results = Array.isArray(this.recentMcpToolResults)
       ? this.recentMcpToolResults.filter((result) => (
         result &&
@@ -7559,6 +7663,7 @@ class ChatController {
   }
 
   createMcpToolResultsContextMessage(toolCalls, chainState = null) {
+    this.refreshVaultEvidence(chainState);
     const results = Array.isArray(toolCalls) ? toolCalls.filter(Boolean) : [];
     const contextResults = this.getMcpToolResultsForContext(chainState, results);
     const originalRequest = this.getOriginalRequestForToolCall(results[0] ?? contextResults[0]);
@@ -7568,6 +7673,8 @@ class ChatController {
     const lines = [
       `MCP tool ${plural} accumulated for the previous user request.`,
       "Use these results to continue the original request.",
+      "These are captured read snapshots, not a fresh vault inventory. Refresh explicitly when current data is required.",
+      "The original request context below is complete. Any tool-reported truncation or error applies to that tool output, not to the request instructions.",
       "If the results are enough, answer the user directly.",
       "If more MCP data is required, request one additional MCP tool call and wait for CoDriver to return its result.",
       "If more MCP data is required, use only an exact toolName from the current MCP tool catalog.",
@@ -7607,7 +7714,9 @@ class ChatController {
 
     return {
       role: "user",
-      content: lines.join("\n")
+      content: lines.join("\n"),
+      [EMBEDDED_COMMAND_CHARACTERS]: chainState?.requestSnapshot?.commandId
+        ? rootUserContent.length + (currentUserContent !== rootUserContent ? currentUserContent.length : 0) : 0
     };
   }
 
@@ -7840,9 +7949,12 @@ class ChatController {
   }
 
   async callDirectApiTool(toolCall, options) {
+    const evidenceBinding = this.directApiAccess.readEvidenceBinding(toolCall.arguments);
+    const vaultRevision = this.directApiAccess.vaultRevision;
     const isCurrent = () => this.areCoDriverVaultToolsEnabled() &&
       this.settings.codriverVaultToolSettings?.[CODRIVER_API_CALL_TOOL_NAME]?.enabled !== false &&
       options.apiAuthorization?.() === true &&
+      toolCall.apiArgumentSignature === hashText(JSON.stringify(toolCall.arguments ?? {})) &&
       toolCall.apiCallBinding === this.directApiAccess.callBinding(toolCall.arguments) &&
       toolCall.apiBinding === this.directApiAccess.binding(this.settings);
     try {
@@ -7856,9 +7968,25 @@ class ChatController {
       throw new Error("Direct API call failed. Check the method, arguments, target availability and output limits. Plugin work may have had effects before failure.");
     } finally {
       if (toolCall.arguments?.target === "plugin") {
-        this.invalidateRecentVaultWriteContext("", "opaque-plugin-api", options.chainState);
+        const retain = evidenceBinding && vaultRevision !== null &&
+          vaultRevision === this.directApiAccess.vaultRevision &&
+          evidenceBinding === this.directApiAccess.readEvidenceBinding(toolCall.arguments) && isCurrent();
+        if (!retain) this.invalidateRecentVaultWriteContext("", "opaque-plugin-api", options.chainState);
+        void this.logDiagnostic("mcp.read_evidence.retention", {
+          retained: Boolean(retain), reason: retain ? evidenceBinding.startsWith("descriptor") ? "descriptor-discovery" : "verified-dataview-dql" : "opaque-or-changed-plugin-call",
+          vaultRevisionChanged: vaultRevision !== this.directApiAccess.vaultRevision
+        });
       }
     }
+  }
+
+  refreshVaultEvidence(chainState = null) {
+    const revision = this.directApiAccess?.vaultRevision ?? null;
+    if (revision === null) return false;
+    const changed = this.evidenceVaultRevision !== revision ||
+      (chainState && chainState.evidenceVaultRevision !== revision);
+    if (changed) this.invalidateRecentVaultWriteContext("", "vault-revision-changed", chainState);
+    return Boolean(changed);
   }
 
   async callCodriverVaultReadTool(toolCall) {
@@ -8174,6 +8302,20 @@ class ChatController {
     await this.diagnostics.debug(event, detail);
   }
 
+  logDetailedContent(event, value, options) {
+    try {
+      const pending = this.diagnostics?.content?.(event, value, options);
+      pending?.catch?.(() => {});
+    } catch { /* Logging must never change request or tool execution. */ }
+  }
+
+  logDetailedToolResult(result, options) {
+    if (options.permit == null || this.diagnostics?.captureContentPermit?.() !== options.permit) return;
+    try {
+      this.logDetailedContent("tool.result", projectToolResult(result), options);
+    } catch { /* Opaque tool data may be unserializable. */ }
+  }
+
   findMcpToolSettings(serverId, toolName) {
     const firstPartyServer = this.getFirstPartyMcpServerSettings(serverId);
     if (firstPartyServer) {
@@ -8426,7 +8568,14 @@ class ChatController {
       };
     }
     const providerState = mcpChainState ? this.ensureMcpToolChainState(mcpChainState) : null;
+    if (providerState && this.refreshVaultEvidence(providerState)) {
+      throw new Error("The vault changed after this provider context was prepared. Send a new request to refresh its evidence.");
+    }
+    if (this.isRequestCancelled(activeRequest)) throw new McpToolCancelledError("Request cancelled before provider dispatch.");
     const effectiveContextBudgetScope = providerState?.contextBudgetScope ?? contextBudgetScope ?? { suppressed: false };
+    const snapshot = providerState?.requestSnapshot ?? effectiveContextBudgetScope.requestSnapshot;
+    const commandWarning = Boolean(snapshot?.commandId && snapshot.currentUserContent.length > COMMAND_CONTEXT_WARNING_CHARS &&
+      effectiveContextBudgetScope.commandConfirmed !== true);
     const hasMeasuredProviderContext = Boolean(
       providerState?.providerContext && providerState.providerContextCharacters > 0
     );
@@ -8467,11 +8616,11 @@ class ChatController {
 
     const exceedsBudget = !budget.isUnlimited && context.totalCharacters > budget.maximumCharacters;
     let contextBudgetOutcome = "";
-    if (exceedsBudget) {
+    if (exceedsBudget || commandWarning) {
       const explicitBypassOutcome = consumeContextBudgetOverride(overrideContextBudget);
-      if (explicitBypassOutcome) {
+      if (explicitBypassOutcome && !commandWarning) {
         contextBudgetOutcome = explicitBypassOutcome;
-      } else if (effectiveContextBudgetScope.suppressed === true) {
+      } else if (effectiveContextBudgetScope.suppressed === true && !commandWarning) {
         contextBudgetOutcome = "suppressed-for-request";
       } else {
         await this.blockProviderRequestForContextBudget({
@@ -8485,7 +8634,8 @@ class ChatController {
           resume,
           mcpChainState,
           contextBudgetScope: effectiveContextBudgetScope,
-          nativeTools
+          nativeTools,
+          commandWarning
         });
         return {
           blocked: true,
@@ -8533,6 +8683,13 @@ class ChatController {
       messages: providerMessages,
       signal: activeRequest?.signal
     };
+    if (snapshot && purpose !== "skill-routing") {
+      void this.logDiagnostic("request.snapshot.checked", {
+        snapshotId: snapshot.id, commandId: safeDiagnosticLabel(snapshot.commandId),
+        fingerprint: snapshot.fingerprint, originalCharacters: snapshot.currentUserContent.length,
+        retainedCharacters: snapshot.currentUserContent.length, complete: true, phase
+      });
+    }
     if (purpose) {
       request.purpose = purpose;
     }
@@ -8561,8 +8718,23 @@ class ChatController {
     }
 
     let response;
+    const contentPermit = this.diagnostics?.captureContentPermit?.() ?? null;
+    const contentSessionId = this.currentSessionId;
+    const contentRedactor = createContentRedactor();
+    if (contentPermit !== null) request.onDiagnosticSecret = (value) => contentRedactor.add(value);
     try {
+      if (this.isRequestCancelled(activeRequest)) throw new McpToolCancelledError("Request cancelled before provider dispatch.");
+      if (providerState && this.refreshVaultEvidence(providerState)) {
+        throw new Error("The vault changed after this provider context was prepared. Send a new request to refresh its evidence.");
+      }
       response = await provider.sendMessage(request);
+      if (contentPermit !== null && response && typeof response === "object" && purpose !== "skill-routing") {
+        this.responseDiagnosticContexts.set(response, { permit: contentPermit, redactor: contentRedactor,
+          sessionId: contentSessionId });
+      } else contentRedactor.clear();
+    } catch (error) {
+      contentRedactor.clear();
+      throw error;
     } finally {
       await this.flushProviderProgressRender(activeRequest);
     }
@@ -8579,8 +8751,10 @@ class ChatController {
     };
   }
 
-  async blockProviderRequestForContextBudget({ loadingMessage, phase, provider, model, context, budget, diagnostic, resume, mcpChainState = null, contextBudgetScope = null, nativeTools = [] }) {
-    const message = createContextBudgetBlockedMessage(context, budget);
+  async blockProviderRequestForContextBudget({ loadingMessage, phase, provider, model, context, budget, diagnostic, resume, mcpChainState = null, contextBudgetScope = null, nativeTools = [], commandWarning = false }) {
+    const message = commandWarning
+      ? "The expanded command exceeds 12000 characters. Continue sends the entire prepared context; the provider may reject oversized requests."
+      : createContextBudgetBlockedMessage(context, budget);
     const actionId = createId("context-budget");
     if (loadingMessage) {
       loadingMessage.status = "warning";
@@ -8594,7 +8768,11 @@ class ChatController {
           id: actionId,
           status: "pending",
           title: "Context size warning",
-          body: "This provider call is larger than Maximum context size. Review the estimate before continuing.",
+          commandWarning,
+          commandCharacters: commandWarning ? contextBudgetScope?.requestSnapshot?.currentUserContent.length ?? 0 : 0,
+          body: commandWarning
+            ? `The expanded command exceeds 12000 characters. Continue sends the entire prepared context. ${!budget.isUnlimited && context.totalCharacters > budget.maximumCharacters ? "This call also exceeds Maximum context size. " : ""}The provider may reject oversized requests.`
+            : "This provider call is larger than Maximum context size. Review the estimate before continuing.",
           currentCharacters: context.totalCharacters,
           estimatedTokens: context.estimatedTokens,
           maximumCharacters: budget.maximumCharacters,
@@ -8602,6 +8780,7 @@ class ChatController {
         };
         this.pendingContextBudgetOverrides.set(actionId, {
           chainState: mcpChainState,
+          commandWarning,
           contextBudgetScope: contextBudgetScope ?? { suppressed: false },
           context,
           budget,
@@ -8727,16 +8906,16 @@ class ChatController {
     });
   }
 
-  createProviderSystemMessage(requestSkills = this.getRequestSkills(), catalog = null) {
+  createProviderSystemMessage(requestSkills = this.getRequestSkills(), catalog = null, requestSnapshot = null) {
     return {
       role: "system",
-      content: this.getProviderSystemPrompt(requestSkills, catalog)
+      content: this.getProviderSystemPrompt(requestSkills, catalog, requestSnapshot)
     };
   }
 
-  getProviderSystemPrompt(requestSkills = this.getRequestSkills(), catalog = null) {
+  getProviderSystemPrompt(requestSkills = this.getRequestSkills(), catalog = null, requestSnapshot = null) {
     const promptSections = [
-      createCoreSystemPrompt({
+      requestSnapshot?.corePrompt || createCoreSystemPrompt({
         vaultName: this.app.vault.getName()
       })
     ];
@@ -9238,7 +9417,7 @@ class ChatController {
                 "",
                 "PENDING PRIOR REQUEST CONTEXT",
                 "Original user request:",
-                truncateText(pendingContinuation.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+                pendingContinuation.rootUserContent || "",
                 "Previous assistant response:",
                 truncateText(pendingContinuation.assistantContent || "", MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS),
                 "END PENDING PRIOR REQUEST CONTEXT"
@@ -10592,6 +10771,11 @@ function countMcpValidationPathDepth(path) {
 function createMcpToolChainDiagnostic(chainState) {
   const chainLength = Number.isFinite(chainState?.executedCount) ? chainState.executedCount : null;
   return {
+    requestSnapshotId: safeDiagnosticLabel(chainState?.requestSnapshot?.id),
+    requestFingerprint: chainState?.requestSnapshot?.fingerprint || "",
+    requestOriginalCharacters: chainState?.requestSnapshot?.rootUserContent.length ?? 0,
+    requestRetainedCharacters: chainState?.requestSnapshot?.rootUserContent.length ?? 0,
+    requestContextComplete: Boolean(chainState?.requestSnapshot),
     chainId: safeDiagnosticLabel(chainState?.chainId),
     toolChainLength: chainLength,
     chainLength,
@@ -10621,7 +10805,10 @@ function createMcpToolOutputDiagnostic(toolCall) {
   const output = String(toolCall?.output ?? "");
   return {
     outputLength: output.length,
-    outputTruncated: output.includes("[truncated]")
+    outputTruncatedByCoDriver: false,
+    outputContainsTruncationMarker: output.includes("[truncated]"),
+    outputCompleteness: "not-attested",
+    retentionLayer: "tool-output"
   };
 }
 

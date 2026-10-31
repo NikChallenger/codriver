@@ -215,6 +215,7 @@ class CommandActionModal {
   }
 
   onClose() {
+    this.chatController.directApiAccess?.dispose();
     this.captureDraftText();
     this.chatController.setStateChangeHandler(null);
     if (this.instant && this.chatController.isSending()) {

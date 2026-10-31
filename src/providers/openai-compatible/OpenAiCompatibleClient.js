@@ -34,12 +34,13 @@ class OpenAiCompatibleClient {
     this.fetch = options.fetch;
   }
 
-  async createHeaders(extraHeaders = {}) {
+  async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
     const headers = {
       Accept: "application/json",
       ...extraHeaders
     };
     const apiKey = String((await Promise.resolve(this.apiKeyResolver())) ?? "").trim();
+    onDiagnosticSecret?.(apiKey);
 
     if (apiKey.length > 0) {
       headers.Authorization = `Bearer ${apiKey}`;
@@ -98,7 +99,7 @@ class OpenAiCompatibleClient {
     }
 
     if (typeof options.onProgress === "function") {
-      return await this.createStreamingChatCompletion(model, body, nativeTools, signal, options.onProgress);
+      return await this.createStreamingChatCompletion(model, body, nativeTools, signal, options.onProgress, options.onDiagnosticSecret);
     }
 
     const request = {
@@ -106,7 +107,7 @@ class OpenAiCompatibleClient {
       method: "POST",
       headers: await this.createHeaders({
         "Content-Type": "application/json"
-      }),
+      }, options.onDiagnosticSecret),
       body: JSON.stringify(body)
     };
 
@@ -183,14 +184,14 @@ class OpenAiCompatibleClient {
     };
   }
 
-  async createStreamingChatCompletion(model, body, nativeTools, signal, onProgress) {
+  async createStreamingChatCompletion(model, body, nativeTools, signal, onProgress, onDiagnosticSecret) {
     const request = {
       url: `${this.baseUrl}/chat/completions`,
       method: "POST",
       headers: await this.createHeaders({
         Accept: "text/event-stream",
         "Content-Type": "application/json"
-      }),
+      }, onDiagnosticSecret),
       body: JSON.stringify({
         ...body,
         stream: true

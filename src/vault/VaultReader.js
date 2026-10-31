@@ -1327,12 +1327,59 @@ class DirectApiAccess {
     this.identities = new WeakMap();
     this.nextIdentity = 1;
     this.busy = false;
+    this.dataviewQuery = this.captureDataviewQuery();
+    this.dataviewBaselineCaptured = Boolean(this.dataviewQuery);
+    this.vaultRevision = null;
+    this.vaultEvents = [];
+    if (typeof app.vault?.on === "function" && typeof app.vault?.offref === "function") {
+      this.vaultRevision = 0;
+      for (const event of ["create", "modify", "delete", "rename"]) {
+        this.vaultEvents.push(app.vault.on(event, () => { this.vaultRevision++; }));
+      }
+    }
+  }
+
+  dispose() {
+    for (const ref of this.vaultEvents) this.app.vault.offref(ref);
+    this.vaultEvents = [];
+    this.vaultRevision = null;
   }
 
   identity(object) {
     if (!object || !["object", "function"].includes(typeof object)) return 0;
     if (!this.identities.has(object)) this.identities.set(object, this.nextIdentity++);
     return this.identities.get(object);
+  }
+
+  captureDataviewQuery() {
+    try {
+      const plugin = Object.getOwnPropertyDescriptor(this.app.plugins?.plugins, "dataview")?.value;
+      if (plugin?.manifest?.version !== "0.5.68") return null;
+      const api = getDirectDataProperty(plugin, "api");
+      const method = getDirectDataProperty(api, "query");
+      return typeof method === "function" ? { plugin, api, method } : null;
+    } catch { return null; }
+  }
+
+  // A retention classification only. This never grants permission or changes dispatch.
+  readEvidenceBinding(input) {
+    if (input?.target !== "plugin") return "";
+    if (input.method === undefined && (input.args === undefined || (Array.isArray(input.args) && !input.args.length))) {
+      return "descriptor-discovery";
+    }
+    const baseline = this.dataviewQuery;
+    if (!baseline || input.pluginId !== "dataview" || input.method !== "api.query") return "";
+    const args = input.args;
+    if (!Array.isArray(args) || args.length < 1 || args.length > 2 ||
+      !isRetainableDataviewDql(args[0]) ||
+      (args.length === 2 && (typeof args[1] !== "string" || args[1].length > 1000))) return "";
+    try {
+      const current = this.captureDataviewQuery();
+      const resolved = this.resolveMethod(input);
+      if (!current || current.plugin !== baseline.plugin || current.api !== baseline.api ||
+        current.method !== baseline.method || resolved.receiver !== baseline.api || resolved.method !== baseline.method) return "";
+      return JSON.stringify(["dataview-dql-0.5.68", this.identity(current.plugin), this.identity(current.api), this.identity(current.method)]);
+    } catch { return ""; }
   }
 
   plugins() {
@@ -1344,6 +1391,16 @@ class DirectApiAccess {
   }
 
   binding(settings) {
+    // Plugins can finish loading after CoDriver. Pin at most once, before the
+    // first request catalog; never adopt a replacement during an active chain.
+    if (!this.dataviewBaselineCaptured && settings.enableDirectPluginApiAccess === true) {
+      const plugin = Object.getOwnPropertyDescriptor(this.app.plugins?.plugins || {}, "dataview")?.value;
+      const candidate = this.captureDataviewQuery();
+      if (candidate || (plugin && plugin.manifest?.version !== "0.5.68")) {
+        this.dataviewQuery = candidate;
+        this.dataviewBaselineCaptured = true;
+      }
+    }
     return JSON.stringify([
       settings.enableDirectObsidianApiAccess === true,
       settings.allowAutomaticDirectObsidianApiAccess === true,
@@ -1485,6 +1542,53 @@ class DirectApiAccess {
     if (text.length > budget.limit) throw new Error("API result exceeds the current output limit. Request a smaller result.");
     return { content: [{ type: "text", text }], isError: false };
   }
+}
+
+// Conservative subset of string DQL for evidence retention, not a DQL validator or
+// execution sandbox. Unsupported syntax still dispatches under normal API consent,
+// but invalidates evidence. Never accept object ASTs or arbitrary callback values.
+function isRetainableDataviewDql(source) {
+  if (typeof source !== "string" || source.length > 60000 || !/^(TABLE|LIST|TASK|CALENDAR)\b/i.test(source.trim())) return false;
+  const tokens = [];
+  const lexer = /\s+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[A-Za-z_][A-Za-z_0-9-]*|\d+(?:\.\d+)?|=>|!=|<=|>=|[()[\]{},.:+*/%=<>!-]/gy;
+  let position = 0;
+  while (position < source.length) {
+    lexer.lastIndex = position;
+    const match = lexer.exec(source);
+    if (!match) return false;
+    position = lexer.lastIndex;
+    if (!/^\s+$/.test(match[0])) tokens.push(match[0]);
+    if (tokens.length > 8000) return false;
+  }
+  const functions = new Set(["length", "date", "typeof", "choice", "contains", "object", "list", "array", "map", "filter"]);
+  const grouping = new Set(["WHERE", "AND", "OR", "NOT", "BY", "FLATTEN", "LIMIT", "TABLE", "LIST", "TASK", "CALENDAR"]);
+  const valueEnd = (token) => token && (/^[A-Za-z_0-9"']/.test(token) || token === ")" || token === "]" || token === "}");
+  let scanBudget = 32000;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (/^(constructor|prototype|__proto__)$/i.test(token)) return false;
+    // No computed property access or invocation of values/member methods.
+    if (token === "[" && valueEnd(tokens[i - 1]) && !grouping.has(tokens[i - 1]?.toUpperCase())) return false;
+    if (token !== "(") continue;
+    const previous = tokens[i - 1];
+    if (!valueEnd(previous)) continue;
+    if (grouping.has(previous?.toUpperCase())) continue;
+    if (!functions.has(previous) || tokens[i - 2] === ".") return false;
+    if (previous !== "map" && previous !== "filter") continue;
+    let depth = 0;
+    let comma = -1;
+    for (let j = i + 1; j < tokens.length; j++) {
+      if (--scanBudget < 0) return false;
+      if (["(", "[", "{"].includes(tokens[j])) depth++;
+      if ([")", "]", "}"].includes(tokens[j])) { if (depth === 0) break; depth--; }
+      if (tokens[j] === "," && depth === 0) { comma = j; break; }
+    }
+    if (comma < 0 || tokens[comma + 1] !== "(") return false;
+    let end = comma + 2;
+    while (/^[A-Za-z_][A-Za-z_0-9]*$/.test(tokens[end] || "") || tokens[end] === ",") end++;
+    if (tokens[end] !== ")" || tokens[end + 1] !== "=>") return false;
+  }
+  return true;
 }
 
 function parseDirectMethodPath(value) {
