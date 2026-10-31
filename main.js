@@ -2490,6 +2490,7 @@
   },
   "src/chat/ChatController.js": function(module, exports, require) {
     const { SkillRegistry } = require("../skills/SkillRegistry");
+    const { createContentRedactor, projectToolResult } = require("../diagnostics/DetailedLogContent");
     const { FrontmatterSkillMatcher } = require("../skills/FrontmatterSkillMatcher");
     const { expandCommand, hasUnescaped } = require("../commands/CommandExpansion");
     const {
@@ -2581,6 +2582,7 @@
 
     const SKILL_COMMAND_PATTERN = /^\/skill:([A-Za-z0-9_-]+)(?:\s+([\s\S]+))?$/;
     const COMMAND_CONTEXT = Symbol("command-context");
+    const EMBEDDED_COMMAND_CHARACTERS = Symbol("embedded-command-characters");
     const NORMAL_SESSION_MODE = "normal";
     const COMMAND_ACTION_SESSION_MODE = "command-action";
     const MAX_MODEL_ROUTED_SKILLS = 3;
@@ -2591,7 +2593,7 @@
     const MIN_MCP_TOOL_RESULT_CHARS = 1000;
     const MAX_MCP_TOOL_RESULT_CHARS_SETTING = 240000;
     const MAX_RECENT_MCP_TOOL_ARGUMENT_CONTEXT_CHARS = 2000;
-    const MAX_CONTINUATION_REQUEST_CONTEXT_CHARS = 4000;
+    const COMMAND_CONTEXT_WARNING_CHARS = 12000;
     const MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS = 2000;
     const MAX_NOTE_CHANGE_CLARIFICATION_CHARS = 600;
     const MAX_MCP_TOOL_DESCRIPTION_CHARS = 360;
@@ -3245,7 +3247,9 @@
         }
 
         if (text.includes("BEGIN MCP TOOL OUTPUT") || text.includes("BEGIN RECENT MCP TOOL RESULTS")) {
-          byId.get("mcp").characters += text.length;
+          const commandCharacters = Math.min(text.length, message[EMBEDDED_COMMAND_CHARACTERS] || 0);
+          byId.get("command").characters += commandCharacters;
+          byId.get("mcp").characters += text.length - commandCharacters;
           continue;
         }
 
@@ -3793,6 +3797,7 @@
         this.vaultReader = new VaultReader(app);
         this.directApiAccess = new DirectApiAccess(app);
         this.diagnostics = diagnostics;
+        this.responseDiagnosticContexts = new WeakMap();
         this.vaultWriter = new VaultWriter(app.vault, app.fileManager, this.diagnostics,
           (file, before) => {
             if (typeof this.runtimeSupport.guardCanvasWrite !== "function") throw new Error("Canvas write synchronization is unavailable.");
@@ -3829,6 +3834,7 @@
         this.changeProposals = [];
         this.mcpToolCalls = [];
         this.recentMcpToolResults = [];
+        this.evidenceVaultRevision = this.directApiAccess.vaultRevision;
         this.pendingRequestContinuation = null;
         this.attachments = [];
         this.draftAttachments = [];
@@ -3993,12 +3999,23 @@
         let providerBinding = "";
         let credentialsAvailable = true;
         try { providerBinding = configuration.provider?.getContinuationBinding?.() ?? ""; }
-        catch { credentialsAvailable = false; }
+        catch (error) {
+          credentialsAvailable = false;
+          configuration.error ||= ({
+            "secret-missing": "The provider API key is missing. Update it in Settings > Providers.",
+            "storage-unavailable": "Provider secret storage is unavailable. Update Obsidian and retry.",
+            "storage-error": "Unable to access the provider API key. Review Settings > Providers.",
+            "needs-review": "Provider credentials need review in Settings > Providers.",
+            "migration-pending": "Provider key migration is pending. Review Settings > Providers."
+          })[error?.code] || "Provider credentials are unavailable. Review Settings > Providers.";
+        }
+        if (!providerIsCurrent) configuration.error ||= "The provider configuration changed. Review Settings > Providers.";
         const available = enabled && !configuration.error && !this.isCommandActionSession() && providerIsCurrent && credentialsAvailable;
         return {
           ...configuration,
           enabled,
           available,
+          unavailableReason: enabled && !available ? configuration.error || "Voice input is unavailable in this chat." : "",
           timeoutMs: voiceInput.timeoutSeconds * 1000,
           binding: JSON.stringify([this.currentSessionId, this.voiceSessionRevision, enabled,
             configuration.providerId, configuration.model, configuration.endpoint, configuration.authenticationPath,
@@ -4094,7 +4111,8 @@
           };
         }
 
-        if (!new Set(["continue", "continue-session", "stop"]).has(decision)) {
+        if (!new Set(["continue", "continue-session", "stop"]).has(decision) ||
+          (action.commandWarning && decision === "continue-session")) {
           return {
             ok: false,
             reason: "invalid-action",
@@ -4183,6 +4201,7 @@
         if (decision === "continue-session") {
           action.contextBudgetScope.suppressed = true;
         }
+        if (action.commandWarning) action.contextBudgetScope.commandConfirmed = true;
 
         const activeRequest = this.createActiveRequest(loadingMessage.id);
         this.activeRequest = activeRequest;
@@ -4992,6 +5011,15 @@
           throw new AudioTranscriptionError("transcription-not-configured", configuration.error);
         }
 
+        const validateSelection = () => {
+          const current = this.getAudioAttachmentProcessingConfiguration({
+            providerId: configuration.providerId,
+            modelId: configuration.model
+          });
+          if (current.error) throw new AudioTranscriptionError("transcription-not-configured", current.error);
+        };
+        validateSelection();
+
         for (const attachment of audioAttachments) {
           attachment.status = "pending";
           attachment.error = "";
@@ -5015,7 +5043,13 @@
               extension: attachment.extension,
               mimeType: attachment.mimeType,
               size: attachment.size,
-              readArrayBuffer: attachment.readArrayBuffer
+              readArrayBuffer: async () => {
+                validateSelection();
+                const bytes = await attachment.readArrayBuffer();
+                validateSelection();
+                return bytes;
+              },
+              beforeUpload: validateSelection
             })),
             {
               adapterContext: configuration,
@@ -6004,6 +6038,10 @@
           toolCall.status = "complete";
           toolCall.error = "";
           toolCall.output = formatMcpToolResult(createAppliedPatchToolResult(proposal));
+          // Application reports only its outcome; reviewed patch arguments were logged at preparation.
+          this.logDetailedContent("tool.applied", { status: "applied" }, {
+            permit: this.diagnostics?.captureContentPermit?.(), toolName: toolCall.toolName, callId: toolCall.id
+          });
           const owner = this.mcpToolChainStates.get(toolCall);
           if (owner === chainState) this.recordMcpToolResultInChain(owner, toolCall);
           this.rememberRecentMcpToolResult(toolCall);
@@ -6118,10 +6156,14 @@
         const effectiveContent = commandExpansion?.content || skillCommand?.prompt || trimmed || fallbackAttachmentPrompt;
         const displayContent = command ? `${trimmed}` : (skillCommand?.prompt ? effectiveContent : (trimmed || fallbackAttachmentPrompt));
         const pendingContinuation = this.pendingRequestContinuation;
-        const contextBudgetScope = { suppressed: false };
+        const requestSnapshot = this.createRequestSnapshot({
+          rootUserContent: effectiveContent, currentUserContent: effectiveContent,
+          commandId: command?.id || ""
+        });
+        const contextBudgetScope = { suppressed: false, requestSnapshot, commandConfirmed: false };
         const maxToolsScope = { unlimited: false, routingDecision: null };
         const userMessage = {
-          id: createId("message"),
+          id: requestSnapshot.messageId,
           role: "user",
           author: "You",
           time: currentTimeLabel(),
@@ -6342,12 +6384,18 @@
               priorToolResults: continuesPreviousRequest
                 ? pendingContinuation.toolResults
                 : [],
-              commandScoped: Boolean(command)
+              commandScoped: Boolean(command),
+              requestSnapshot: continuesPreviousRequest
+                ? Object.freeze({ ...requestSnapshot, rootUserContent: pendingContinuation.rootUserContent,
+                    corePrompt: pendingContinuation.requestSnapshot?.corePrompt || requestSnapshot.corePrompt,
+                    fingerprint: hashText(JSON.stringify([pendingContinuation.rootUserContent, effectiveContent])) })
+                : requestSnapshot
             });
             const providerMessages = this.getProviderMessages(activeNoteContext, requestSkills, attachmentContext, {
               continuationContext,
               activeNotePathContext,
-              boundMcpCatalog
+              boundMcpCatalog,
+              requestSnapshot: chainState.requestSnapshot
             });
             const nativeTools = this.createMcpNativeToolDefinitions(boundMcpCatalog);
             chainState.nativeToolFingerprint = createNativeToolFingerprint(nativeTools);
@@ -6618,6 +6666,8 @@
           attachmentContext = null
         } = options;
         const chainState = mcpChainState ?? this.createMcpToolChainState();
+        const diagnosticContext = this.responseDiagnosticContexts.get(response);
+        this.responseDiagnosticContexts.delete(response);
         if (activeRequest) {
           activeRequest.mcpChainState = chainState;
           chainState.activeRequest = activeRequest;
@@ -6695,7 +6745,7 @@
         }
         for (const toolCall of newToolCalls) {
           this.mcpToolChainStates.set(toolCall, chainState);
-          toolCall.requiresLiveChain = chainState.hasPatchReview === true || chainState.hasAudioCreateReview === true;
+          toolCall.requiresLiveChain = true;
         }
         void this.logDiagnostic("mcp.tool_chain.model_response.parsed", {
           ...createMcpToolChainDiagnostic(chainState),
@@ -6735,6 +6785,14 @@
           !parsedToolResponse.displayContent &&
           !String(response?.content ?? "").trim() &&
           newToolCalls.length === 0;
+
+        if (diagnosticContext) {
+          // Only display text from a completed, accepted response; never native context or reasoning.
+          if (!loadingMessage.hidden && !this.isRequestCancelled(activeRequest) && parsedToolResponse.displayContent) {
+            this.logDetailedContent("assistant.final", parsedToolResponse.displayContent, diagnosticContext);
+          }
+          diagnosticContext.redactor.clear();
+        }
 
         if (newToolCalls.length > 0) {
           if (userMessage) {
@@ -6789,8 +6847,25 @@
         };
       }
 
+      createRequestSnapshot(options = {}) {
+        const rootUserContent = String(options.rootUserContent || "");
+        const currentUserContent = String(options.currentUserContent || "");
+        return Object.freeze({
+          id: createId("request-snapshot"),
+          messageId: options.messageId || createId("message"),
+          commandId: options.commandId || "",
+          rootUserContent,
+          currentUserContent,
+          fingerprint: hashText(JSON.stringify([rootUserContent, currentUserContent])),
+          corePrompt: createCoreSystemPrompt({ vaultName: this.app?.vault?.getName?.(), now: new Date() })
+        });
+      }
+
       createMcpToolChainState(requestSkills = null, noteChangeRequested = null, options = {}) {
+        const requestSnapshot = options.requestSnapshot ?? this.createRequestSnapshot(options);
         return {
+          requestSnapshot,
+          evidenceVaultRevision: this.directApiAccess?.vaultRevision ?? null,
           chainId: createId("mcp-chain"),
           sessionId: this.currentSessionId,
           pendingPatchIds: new Set(),
@@ -6814,8 +6889,8 @@
           mcpToolsDisabled: options.mcpToolsDisabled === true,
           audioTranscriptionConfiguration: options.audioTranscriptionConfiguration ?? null,
           model: typeof options.model === "string" ? options.model.trim() : "",
-          rootUserContent: truncateText(options.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
-          currentUserContent: truncateText(options.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+          rootUserContent: requestSnapshot.rootUserContent,
+          currentUserContent: requestSnapshot.currentUserContent,
           continuationContext: options.continuationContext ?? null,
           contextBudgetScope: options.contextBudgetScope ?? { suppressed: false },
           activeNotePathContext: normalizeActiveNotePathContext(options.activeNotePathContext),
@@ -6860,8 +6935,9 @@
         state.mcpToolsDisabled = state.mcpToolsDisabled === true;
         state.model = typeof state.model === "string" ? state.model.trim() : "";
 
-        state.rootUserContent = truncateText(state.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS);
-        state.currentUserContent = truncateText(state.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS);
+        state.requestSnapshot ??= this.createRequestSnapshot(state);
+        state.rootUserContent = state.requestSnapshot.rootUserContent;
+        state.currentUserContent = state.requestSnapshot.currentUserContent;
         state.activeNotePathContext = normalizeActiveNotePathContext(state.activeNotePathContext);
         if (!Array.isArray(state.priorToolResults)) {
           state.priorToolResults = [];
@@ -7145,6 +7221,7 @@
       ) {
         const messages = this.messages
           .filter((message) => {
+            if (options.toolFollowUp && message.id === options.requestSnapshot?.messageId) return false;
             if (message.sendToProvider === false) {
               return false;
             }
@@ -7158,12 +7235,14 @@
           .slice(-12)
           .map((message) => ({
             role: message.role,
-            content: message.providerContent ?? message.content,
-            ...(message.providerContent ? { [COMMAND_CONTEXT]: true } : {})
+            content: message.id === options.requestSnapshot?.messageId
+              ? options.requestSnapshot.currentUserContent : (message.providerContent ?? message.content),
+            ...(message.providerContent || (message.id === options.requestSnapshot?.messageId && options.requestSnapshot.commandId)
+              ? { [COMMAND_CONTEXT]: true } : {})
           }));
 
         const providerMessages = [
-          this.createProviderSystemMessage(requestSkills, options.boundMcpCatalog ?? null)
+          this.createProviderSystemMessage(requestSkills, options.boundMcpCatalog ?? null, options.requestSnapshot)
         ];
 
         if (activeNoteContext?.included) {
@@ -7207,7 +7286,7 @@
             "Continue the original request using the latest clarification. Do not treat the clarification as a standalone task.",
             "",
             "BEGIN ORIGINAL USER REQUEST",
-            truncateText(context?.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+            context?.rootUserContent || "",
             "END ORIGINAL USER REQUEST",
             "",
             "BEGIN PREVIOUS ASSISTANT RESPONSE",
@@ -7215,7 +7294,7 @@
             "END PREVIOUS ASSISTANT RESPONSE",
             "",
             "BEGIN CURRENT USER CLARIFICATION",
-            truncateText(context?.currentUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+            context?.currentUserContent || "",
             "END CURRENT USER CLARIFICATION"
           ].join("\n")
         };
@@ -7235,10 +7314,7 @@
           return;
         }
 
-        const rootUserContent = truncateText(
-          chainState.rootUserContent || options.effectiveContent || "",
-          MAX_CONTINUATION_REQUEST_CONTEXT_CHARS
-        );
+        const rootUserContent = chainState.rootUserContent || options.effectiveContent || "";
         const assistantContent = truncateText(
           options.assistantContent || "",
           MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS
@@ -7260,6 +7336,7 @@
             createdAt: result.createdAt
           }));
         this.pendingRequestContinuation = {
+          requestSnapshot: chainState.requestSnapshot,
           rootUserContent,
           assistantContent,
           noteChangeRequested: true,
@@ -9060,6 +9137,15 @@
                 : this.getMcpToolTimeoutMs()
             );
         this.runningMcpToolExecutions.set(toolCall.id, runtime);
+        const contentPermit = this.diagnostics?.captureContentPermit?.() ?? null;
+        const contentRedactor = createContentRedactor();
+        const contentOptions = { permit: contentPermit, redactor: contentRedactor,
+          sessionId: this.currentSessionId, toolName: toolCall.toolName, callId: toolCall.id };
+        const logDispatch = (headers = {}) => {
+          if (runtime.signal?.aborted || contentPermit === null || this.diagnostics?.captureContentPermit?.() !== contentPermit) return;
+          for (const value of Object.values(headers)) contentRedactor.add(value);
+          this.logDetailedContent("tool.arguments", toolCall.arguments, contentOptions);
+        };
         await this.notifyStateChanged();
         void this.logDiagnostic("mcp.tool_call.execution.started", {
           ...createMcpToolExecutionDiagnostic(toolCall),
@@ -9071,6 +9157,7 @@
         try {
           let result;
           if (server.transport === CODRIVER_INTERNAL_TRANSPORT) {
+            logDispatch();
             const toolResultPromise = this.callFirstPartyMcpTool(toolCall, {
               audioAuthorization,
               noteAppendAuthorization,
@@ -9092,6 +9179,10 @@
               credentialService: this.runtimeSupport.mcpCredentialService,
               oauthService: this.runtimeSupport.mcpOAuthService,
               signal: runtime.signal,
+              onToolDispatch: logDispatch,
+              onDiagnosticSecret: (value) => {
+                if (contentPermit !== null && this.diagnostics?.captureContentPermit?.() === contentPermit) contentRedactor.add(value);
+              },
               diagnostics: this.diagnostics
             });
             const toolResultPromise = client.callTool(toolCall.toolName, toolCall.arguments);
@@ -9104,7 +9195,8 @@
             const { McpStdioClient } = require("../mcp/McpStdioClient");
             const client = new McpStdioClient(server, {
               diagnostics: this.diagnostics,
-              requestTimeoutMs: this.getMcpToolTimeoutMs()
+              requestTimeoutMs: this.getMcpToolTimeoutMs(),
+              onToolDispatch: logDispatch
             });
             const toolResultPromise = client.callTool(toolCall.toolName, toolCall.arguments);
             toolResultPromise.catch(() => {});
@@ -9120,6 +9212,12 @@
             throw new Error("Unsupported MCP transport.");
           }
 
+          // Invalidate older snapshots before registering this operation's outcome.
+          // In particular, a create event must not erase proof of the just-finished create.
+          this.refreshVaultEvidence(options.chainState);
+          if (!runtime.signal?.aborted && !isCodriverVaultTranscribeAudioToolCall(toolCall)) {
+            this.logDetailedToolResult(result, contentOptions);
+          }
           if (isCodriverVaultToolCall(toolCall)) capturePatchWorkList(options.chainState, toolCall.toolName, result);
           toolCall.output = formatMcpToolResult(result);
           const outputLimit = this.getMaxMcpToolResultChars();
@@ -9214,6 +9312,7 @@
           };
         } finally {
           runtime.dispose();
+          contentRedactor.clear();
           this.runningMcpToolExecutions.delete(toolCall.id);
         }
       }
@@ -9478,7 +9577,9 @@
             includeRecentMcpResults: false,
             continuationContext: chainState.continuationContext,
             activeNotePathContext: chainState.activeNotePathContext,
-            boundMcpCatalog: chainState.boundMcpCatalog
+            boundMcpCatalog: chainState.boundMcpCatalog,
+            requestSnapshot: chainState.requestSnapshot,
+            toolFollowUp: true
           });
           const followUpMessages = [
             ...providerMessages,
@@ -9862,6 +9963,8 @@
       }
 
       invalidateRecentVaultWriteContext(notePath, reason, chainState = null) {
+        this.evidenceVaultRevision = this.directApiAccess?.vaultRevision ?? null;
+        if (chainState) chainState.evidenceVaultRevision = this.evidenceVaultRevision;
         const previousRecentCount = Array.isArray(this.recentMcpToolResults)
           ? this.recentMcpToolResults.length
           : 0;
@@ -10003,6 +10106,7 @@
       }
 
       createRecentMcpToolResultsContextMessage(catalog = null) {
+        this.refreshVaultEvidence();
         const results = Array.isArray(this.recentMcpToolResults)
           ? this.recentMcpToolResults.filter((result) => (
             result &&
@@ -10050,6 +10154,7 @@
       }
 
       createMcpToolResultsContextMessage(toolCalls, chainState = null) {
+        this.refreshVaultEvidence(chainState);
         const results = Array.isArray(toolCalls) ? toolCalls.filter(Boolean) : [];
         const contextResults = this.getMcpToolResultsForContext(chainState, results);
         const originalRequest = this.getOriginalRequestForToolCall(results[0] ?? contextResults[0]);
@@ -10059,6 +10164,8 @@
         const lines = [
           `MCP tool ${plural} accumulated for the previous user request.`,
           "Use these results to continue the original request.",
+          "These are captured read snapshots, not a fresh vault inventory. Refresh explicitly when current data is required.",
+          "The original request context below is complete. Any tool-reported truncation or error applies to that tool output, not to the request instructions.",
           "If the results are enough, answer the user directly.",
           "If more MCP data is required, request one additional MCP tool call and wait for CoDriver to return its result.",
           "If more MCP data is required, use only an exact toolName from the current MCP tool catalog.",
@@ -10098,7 +10205,9 @@
 
         return {
           role: "user",
-          content: lines.join("\n")
+          content: lines.join("\n"),
+          [EMBEDDED_COMMAND_CHARACTERS]: chainState?.requestSnapshot?.commandId
+            ? rootUserContent.length + (currentUserContent !== rootUserContent ? currentUserContent.length : 0) : 0
         };
       }
 
@@ -10331,9 +10440,12 @@
       }
 
       async callDirectApiTool(toolCall, options) {
+        const evidenceBinding = this.directApiAccess.readEvidenceBinding(toolCall.arguments);
+        const vaultRevision = this.directApiAccess.vaultRevision;
         const isCurrent = () => this.areCoDriverVaultToolsEnabled() &&
           this.settings.codriverVaultToolSettings?.[CODRIVER_API_CALL_TOOL_NAME]?.enabled !== false &&
           options.apiAuthorization?.() === true &&
+          toolCall.apiArgumentSignature === hashText(JSON.stringify(toolCall.arguments ?? {})) &&
           toolCall.apiCallBinding === this.directApiAccess.callBinding(toolCall.arguments) &&
           toolCall.apiBinding === this.directApiAccess.binding(this.settings);
         try {
@@ -10347,9 +10459,25 @@
           throw new Error("Direct API call failed. Check the method, arguments, target availability and output limits. Plugin work may have had effects before failure.");
         } finally {
           if (toolCall.arguments?.target === "plugin") {
-            this.invalidateRecentVaultWriteContext("", "opaque-plugin-api", options.chainState);
+            const retain = evidenceBinding && vaultRevision !== null &&
+              vaultRevision === this.directApiAccess.vaultRevision &&
+              evidenceBinding === this.directApiAccess.readEvidenceBinding(toolCall.arguments) && isCurrent();
+            if (!retain) this.invalidateRecentVaultWriteContext("", "opaque-plugin-api", options.chainState);
+            void this.logDiagnostic("mcp.read_evidence.retention", {
+              retained: Boolean(retain), reason: retain ? evidenceBinding.startsWith("descriptor") ? "descriptor-discovery" : "verified-dataview-dql" : "opaque-or-changed-plugin-call",
+              vaultRevisionChanged: vaultRevision !== this.directApiAccess.vaultRevision
+            });
           }
         }
+      }
+
+      refreshVaultEvidence(chainState = null) {
+        const revision = this.directApiAccess?.vaultRevision ?? null;
+        if (revision === null) return false;
+        const changed = this.evidenceVaultRevision !== revision ||
+          (chainState && chainState.evidenceVaultRevision !== revision);
+        if (changed) this.invalidateRecentVaultWriteContext("", "vault-revision-changed", chainState);
+        return Boolean(changed);
       }
 
       async callCodriverVaultReadTool(toolCall) {
@@ -10665,6 +10793,20 @@
         await this.diagnostics.debug(event, detail);
       }
 
+      logDetailedContent(event, value, options) {
+        try {
+          const pending = this.diagnostics?.content?.(event, value, options);
+          pending?.catch?.(() => {});
+        } catch { /* Logging must never change request or tool execution. */ }
+      }
+
+      logDetailedToolResult(result, options) {
+        if (options.permit == null || this.diagnostics?.captureContentPermit?.() !== options.permit) return;
+        try {
+          this.logDetailedContent("tool.result", projectToolResult(result), options);
+        } catch { /* Opaque tool data may be unserializable. */ }
+      }
+
       findMcpToolSettings(serverId, toolName) {
         const firstPartyServer = this.getFirstPartyMcpServerSettings(serverId);
         if (firstPartyServer) {
@@ -10917,7 +11059,14 @@
           };
         }
         const providerState = mcpChainState ? this.ensureMcpToolChainState(mcpChainState) : null;
+        if (providerState && this.refreshVaultEvidence(providerState)) {
+          throw new Error("The vault changed after this provider context was prepared. Send a new request to refresh its evidence.");
+        }
+        if (this.isRequestCancelled(activeRequest)) throw new McpToolCancelledError("Request cancelled before provider dispatch.");
         const effectiveContextBudgetScope = providerState?.contextBudgetScope ?? contextBudgetScope ?? { suppressed: false };
+        const snapshot = providerState?.requestSnapshot ?? effectiveContextBudgetScope.requestSnapshot;
+        const commandWarning = Boolean(snapshot?.commandId && snapshot.currentUserContent.length > COMMAND_CONTEXT_WARNING_CHARS &&
+          effectiveContextBudgetScope.commandConfirmed !== true);
         const hasMeasuredProviderContext = Boolean(
           providerState?.providerContext && providerState.providerContextCharacters > 0
         );
@@ -10958,11 +11107,11 @@
 
         const exceedsBudget = !budget.isUnlimited && context.totalCharacters > budget.maximumCharacters;
         let contextBudgetOutcome = "";
-        if (exceedsBudget) {
+        if (exceedsBudget || commandWarning) {
           const explicitBypassOutcome = consumeContextBudgetOverride(overrideContextBudget);
-          if (explicitBypassOutcome) {
+          if (explicitBypassOutcome && !commandWarning) {
             contextBudgetOutcome = explicitBypassOutcome;
-          } else if (effectiveContextBudgetScope.suppressed === true) {
+          } else if (effectiveContextBudgetScope.suppressed === true && !commandWarning) {
             contextBudgetOutcome = "suppressed-for-request";
           } else {
             await this.blockProviderRequestForContextBudget({
@@ -10976,7 +11125,8 @@
               resume,
               mcpChainState,
               contextBudgetScope: effectiveContextBudgetScope,
-              nativeTools
+              nativeTools,
+              commandWarning
             });
             return {
               blocked: true,
@@ -11024,6 +11174,13 @@
           messages: providerMessages,
           signal: activeRequest?.signal
         };
+        if (snapshot && purpose !== "skill-routing") {
+          void this.logDiagnostic("request.snapshot.checked", {
+            snapshotId: snapshot.id, commandId: safeDiagnosticLabel(snapshot.commandId),
+            fingerprint: snapshot.fingerprint, originalCharacters: snapshot.currentUserContent.length,
+            retainedCharacters: snapshot.currentUserContent.length, complete: true, phase
+          });
+        }
         if (purpose) {
           request.purpose = purpose;
         }
@@ -11052,8 +11209,23 @@
         }
 
         let response;
+        const contentPermit = this.diagnostics?.captureContentPermit?.() ?? null;
+        const contentSessionId = this.currentSessionId;
+        const contentRedactor = createContentRedactor();
+        if (contentPermit !== null) request.onDiagnosticSecret = (value) => contentRedactor.add(value);
         try {
+          if (this.isRequestCancelled(activeRequest)) throw new McpToolCancelledError("Request cancelled before provider dispatch.");
+          if (providerState && this.refreshVaultEvidence(providerState)) {
+            throw new Error("The vault changed after this provider context was prepared. Send a new request to refresh its evidence.");
+          }
           response = await provider.sendMessage(request);
+          if (contentPermit !== null && response && typeof response === "object" && purpose !== "skill-routing") {
+            this.responseDiagnosticContexts.set(response, { permit: contentPermit, redactor: contentRedactor,
+              sessionId: contentSessionId });
+          } else contentRedactor.clear();
+        } catch (error) {
+          contentRedactor.clear();
+          throw error;
         } finally {
           await this.flushProviderProgressRender(activeRequest);
         }
@@ -11070,8 +11242,10 @@
         };
       }
 
-      async blockProviderRequestForContextBudget({ loadingMessage, phase, provider, model, context, budget, diagnostic, resume, mcpChainState = null, contextBudgetScope = null, nativeTools = [] }) {
-        const message = createContextBudgetBlockedMessage(context, budget);
+      async blockProviderRequestForContextBudget({ loadingMessage, phase, provider, model, context, budget, diagnostic, resume, mcpChainState = null, contextBudgetScope = null, nativeTools = [], commandWarning = false }) {
+        const message = commandWarning
+          ? "The expanded command exceeds 12000 characters. Continue sends the entire prepared context; the provider may reject oversized requests."
+          : createContextBudgetBlockedMessage(context, budget);
         const actionId = createId("context-budget");
         if (loadingMessage) {
           loadingMessage.status = "warning";
@@ -11085,7 +11259,11 @@
               id: actionId,
               status: "pending",
               title: "Context size warning",
-              body: "This provider call is larger than Maximum context size. Review the estimate before continuing.",
+              commandWarning,
+              commandCharacters: commandWarning ? contextBudgetScope?.requestSnapshot?.currentUserContent.length ?? 0 : 0,
+              body: commandWarning
+                ? `The expanded command exceeds 12000 characters. Continue sends the entire prepared context. ${!budget.isUnlimited && context.totalCharacters > budget.maximumCharacters ? "This call also exceeds Maximum context size. " : ""}The provider may reject oversized requests.`
+                : "This provider call is larger than Maximum context size. Review the estimate before continuing.",
               currentCharacters: context.totalCharacters,
               estimatedTokens: context.estimatedTokens,
               maximumCharacters: budget.maximumCharacters,
@@ -11093,6 +11271,7 @@
             };
             this.pendingContextBudgetOverrides.set(actionId, {
               chainState: mcpChainState,
+              commandWarning,
               contextBudgetScope: contextBudgetScope ?? { suppressed: false },
               context,
               budget,
@@ -11218,16 +11397,16 @@
         });
       }
 
-      createProviderSystemMessage(requestSkills = this.getRequestSkills(), catalog = null) {
+      createProviderSystemMessage(requestSkills = this.getRequestSkills(), catalog = null, requestSnapshot = null) {
         return {
           role: "system",
-          content: this.getProviderSystemPrompt(requestSkills, catalog)
+          content: this.getProviderSystemPrompt(requestSkills, catalog, requestSnapshot)
         };
       }
 
-      getProviderSystemPrompt(requestSkills = this.getRequestSkills(), catalog = null) {
+      getProviderSystemPrompt(requestSkills = this.getRequestSkills(), catalog = null, requestSnapshot = null) {
         const promptSections = [
-          createCoreSystemPrompt({
+          requestSnapshot?.corePrompt || createCoreSystemPrompt({
             vaultName: this.app.vault.getName()
           })
         ];
@@ -11729,7 +11908,7 @@
                     "",
                     "PENDING PRIOR REQUEST CONTEXT",
                     "Original user request:",
-                    truncateText(pendingContinuation.rootUserContent || "", MAX_CONTINUATION_REQUEST_CONTEXT_CHARS),
+                    pendingContinuation.rootUserContent || "",
                     "Previous assistant response:",
                     truncateText(pendingContinuation.assistantContent || "", MAX_CONTINUATION_ASSISTANT_CONTEXT_CHARS),
                     "END PENDING PRIOR REQUEST CONTEXT"
@@ -13083,6 +13262,11 @@
     function createMcpToolChainDiagnostic(chainState) {
       const chainLength = Number.isFinite(chainState?.executedCount) ? chainState.executedCount : null;
       return {
+        requestSnapshotId: safeDiagnosticLabel(chainState?.requestSnapshot?.id),
+        requestFingerprint: chainState?.requestSnapshot?.fingerprint || "",
+        requestOriginalCharacters: chainState?.requestSnapshot?.rootUserContent.length ?? 0,
+        requestRetainedCharacters: chainState?.requestSnapshot?.rootUserContent.length ?? 0,
+        requestContextComplete: Boolean(chainState?.requestSnapshot),
         chainId: safeDiagnosticLabel(chainState?.chainId),
         toolChainLength: chainLength,
         chainLength,
@@ -13112,7 +13296,10 @@
       const output = String(toolCall?.output ?? "");
       return {
         outputLength: output.length,
-        outputTruncated: output.includes("[truncated]")
+        outputTruncatedByCoDriver: false,
+        outputContainsTruncationMarker: output.includes("[truncated]"),
+        outputCompleteness: "not-attested",
+        retentionLayer: "tool-output"
       };
     }
 
@@ -14493,7 +14680,7 @@
   },
   "src/constants.js": function(module, exports, require) {
     const VIEW_TYPE_CODRIVER = "codriver-chat-view";
-    const CODRIVER_PLUGIN_VERSION = "0.6.0";
+    const CODRIVER_PLUGIN_VERSION = "0.6.1";
     const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:1234/v1";
     const DEFAULT_GEMINI_BASE_ENDPOINT = "https://generativelanguage.googleapis.com";
     const DEFAULT_GEMINI_API_VERSION = "v1beta";
@@ -14537,6 +14724,155 @@
       MCP_PROTOCOL_VERSION,
       MCP_STDIO_TRANSPORT
     };
+
+  },
+  "src/diagnostics/DetailedLogContent.js": function(module, exports, require) {
+    const ARGUMENT_BYTES = 32 * 1024;
+    const CONTENT_BYTES = 64 * 1024;
+    const RECORD_BYTES = 96 * 1024;
+    const encoder = new TextEncoder();
+    const SENSITIVE_KEY = /(?:api.?key|authorization|password|secret|token|cookie|credential|headers|reasoning|thinking|thought|signature|audio|base64|binary|blob|image|attachment|transcript)/i;
+
+    function byteLength(text) {
+      return encoder.encode(text).length;
+    }
+
+    // Work only on a bounded prefix, including before credential replacement.
+    function prefixBytes(text, maximum) {
+      const prefix = text.slice(0, maximum + 2);
+      const bytes = encoder.encode(prefix);
+      if (bytes.length <= maximum) return new TextDecoder().decode(bytes);
+      let end = maximum;
+      while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+      return new TextDecoder().decode(bytes.subarray(0, end));
+    }
+
+    function createContentRedactor() {
+      let secrets = [];
+      let blocked = false;
+      return {
+        add(value) {
+          if (typeof value !== "string" || !value) return;
+          if (value.length > 32768 || byteLength(value) > 32768 || secrets.length >= 64) {
+            blocked = true;
+            return;
+          }
+          for (const candidate of [value, value.replace(/^Bearer\s+/i, "")]) {
+            if (candidate && !secrets.includes(candidate)) secrets.push(candidate);
+          }
+          secrets.sort((a, b) => b.length - a.length);
+        },
+        text(value, maximum) {
+          if (blocked) return prefixBytes("[Content omitted: credential redaction limit]", maximum);
+          // Include overlap so a credential crossing the output boundary is redacted.
+          let text = prefixBytes(value, maximum + 32768);
+          for (const secret of secrets) text = prefixBytes(text.split(secret).join("[REDACTED]"), maximum + 32768);
+          text = text.replace(/data:[^;,\s]{1,120};base64,[A-Za-z0-9+/=\r\n]+/gi, "[Binary data omitted]")
+            .replace(/[A-Za-z0-9+/]{256,}={0,2}/g, "[Encoded payload omitted]");
+          return prefixBytes(text, maximum);
+        },
+        clear() { secrets = []; blocked = false; }
+      };
+    }
+
+    function serializeContent(value, maximum = CONTENT_BYTES, redactor = createContentRedactor()) {
+      let remaining = maximum;
+      let nodes = 0;
+      let truncated = false;
+      const seen = new WeakSet();
+      function text(value) {
+        const result = redactor.text(value, Math.max(0, remaining));
+        if (result.length < value.length) truncated = true;
+        remaining -= byteLength(result);
+        return result;
+      }
+      function visit(item, depth) {
+        if (++nodes > 2000 || remaining <= 0 || depth > 6) {
+          truncated = true;
+          return "[OMITTED: limit]";
+        }
+        if (typeof item === "string") return text(item);
+        if (item === null || typeof item === "boolean") return item;
+        if (typeof item === "number") return Number.isFinite(item) ? item : "[Non-finite number]";
+        if (typeof item !== "object") return "[Unsupported value]";
+        try {
+          if (seen.has(item)) return "[Circular reference]";
+          const prototype = Object.getPrototypeOf(item);
+          if (!Array.isArray(item) && prototype !== Object.prototype && prototype !== null) return "[Native object omitted]";
+          const type = Object.getOwnPropertyDescriptor(item, "type")?.value;
+          const mimeType = Object.getOwnPropertyDescriptor(item, "mimeType")?.value;
+          if (["image", "audio", "input_audio", "image_url", "file", "blob", "buffer"].includes(type) ||
+              (typeof mimeType === "string" && !isTextMime(mimeType))) return "[Non-text content omitted]";
+          seen.add(item);
+          const result = Array.isArray(item) ? [] : Object.create(null);
+          let count = 0;
+          // Do not materialize an unbounded key array or invoke accessors/toJSON.
+          for (const key in item) {
+            if (!Object.prototype.hasOwnProperty.call(item, key)) continue;
+            if (++count > 200 || nodes >= 2000 || remaining <= 0) {
+              truncated = true;
+              if (Array.isArray(result)) result.push("[OMITTED: limit]");
+              else result.__omitted = "[OMITTED: limit]";
+              break;
+            }
+            const descriptor = Object.getOwnPropertyDescriptor(item, key);
+            const safeKey = text(key);
+            const projected = SENSITIVE_KEY.test(key) ? "[REDACTED]"
+              : !descriptor || !("value" in descriptor) ? "[Accessor omitted]"
+              : visit(descriptor.value, depth + 1);
+            if (Array.isArray(result)) result.push(projected);
+            else result[safeKey] = projected;
+          }
+          return result;
+        } catch {
+          return "[Unserializable object omitted]";
+        }
+      }
+      let content = visit(value, 0);
+      // JSON escaping and structural overhead have their own bounded budget.
+      const serialized = JSON.stringify(content);
+      if (byteLength(serialized) > maximum) {
+        content = prefixBytes(serialized, maximum - 128);
+        truncated = true;
+      }
+      return { content, truncated, retainedBytes: byteLength(typeof content === "string" ? content : JSON.stringify(content)),
+        ...(typeof value === "string" ? { originalCharacters: value.length } : {}),
+        ...(truncated ? { marker: "[TRUNCATED: detailed log limit]" } : {}) };
+    }
+
+    function projectToolResult(result) {
+      // Results are opaque data. Traverse only text/JSON, never binary resource bodies.
+      if (!result || typeof result !== "object") return result;
+      const projected = [];
+      const items = Object.getOwnPropertyDescriptor(result, "content")?.value;
+      if (Array.isArray(items)) {
+        for (let index = 0; index < Math.min(items.length, 200); index += 1) {
+          const item = Object.getOwnPropertyDescriptor(items, String(index))?.value;
+          if (!item || typeof item !== "object") continue;
+          const type = Object.getOwnPropertyDescriptor(item, "type")?.value;
+          const text = Object.getOwnPropertyDescriptor(item, "text")?.value;
+          if (type === "text" && typeof text === "string") projected.push(text);
+          else if (type === "resource") {
+            const resource = Object.getOwnPropertyDescriptor(item, "resource")?.value;
+            const resourceText = resource && Object.getOwnPropertyDescriptor(resource, "text")?.value;
+            const mimeType = resource && Object.getOwnPropertyDescriptor(resource, "mimeType")?.value;
+            if (typeof resourceText === "string" && (mimeType === undefined || isTextMime(mimeType))) projected.push(resourceText);
+            else projected.push("[Non-text resource omitted]");
+          } else projected.push("[Non-text content omitted]");
+        }
+        if (items.length > 200) projected.push("[OMITTED: item limit]");
+      }
+      const structured = Object.getOwnPropertyDescriptor(result, "structuredContent")?.value;
+      if (structured !== undefined) projected.push(structured);
+      return projected;
+    }
+
+    function isTextMime(value) {
+      return typeof value === "string" && /^(?:text\/|application\/(?:json|xml)(?:;|$)|application\/[^;]+\+(?:json|xml)(?:;|$))/i.test(value);
+    }
+
+    module.exports = { ARGUMENT_BYTES, CONTENT_BYTES, RECORD_BYTES, byteLength, prefixBytes,
+      createContentRedactor, serializeContent, projectToolResult };
 
   },
   "src/diagnostics/DiagnosticLogSharing.js": function(module, exports, require) {
@@ -14617,6 +14953,7 @@
 
   },
   "src/diagnostics/DiagnosticLogger.js": function(module, exports, require) {
+    const { ARGUMENT_BYTES, CONTENT_BYTES, RECORD_BYTES, byteLength, serializeContent } = require("./DetailedLogContent");
     const DEFAULT_MAX_LOG_BYTES = 512 * 1024;
     const DEFAULT_MAX_ARCHIVED_LOGS = 0;
     const DIAGNOSTIC_LOG_VERSION = 1;
@@ -14638,6 +14975,12 @@
         this.sessionId = "";
         this.initializedForLaunch = false;
         this.writeQueue = Promise.resolve();
+        this.contentGeneration = 0;
+        this.contentConsent = false;
+        this.contentConfiguration = "";
+        this.pendingContentBytes = 0;
+        this.pendingContentRecords = 0;
+        this.droppedContentRecords = 0;
       }
 
       isEnabled() {
@@ -14675,6 +15018,10 @@
           debug(event, detail) {
             return logger.debugForSession(sessionId, event, detail);
           },
+          content(event, value, options = {}) {
+            return logger.content(event, value, { ...options, sessionId: options.sessionId ?? sessionId });
+          },
+          captureContentPermit() { return logger.captureContentPermit(); },
           getLogLevel() {
             return logger.getLogLevel();
           },
@@ -14691,6 +15038,7 @@
       }
 
       async refresh() {
+        this.syncContentConfiguration();
         await this.pruneArchivedLogs();
         if (!this.isEnabled() || this.getLogTarget() !== "file") {
           return;
@@ -14734,15 +15082,117 @@
         const normalizedSessionId = normalizeSessionId(sessionId);
         const writeTask = this.writeQueue
           .then(() => this.writeLine(event, detail, normalizedSessionId))
-          .catch((error) => {
-            console.warn("[CoDriver diagnostics] Unable to write diagnostic log.", error);
+          .catch(() => {
+            console.warn("[CoDriver diagnostics] Unable to write diagnostic log.");
           });
         this.writeQueue = writeTask;
         return writeTask;
       }
 
+      syncContentConfiguration() {
+        const configuration = `${this.isEnabled()}:${this.getLogLevel()}:${this.getLogTarget()}`;
+        if (configuration !== this.contentConfiguration) {
+          this.contentConfiguration = configuration;
+          this.revokeContentConsent();
+        }
+      }
+
+      revokeContentConsent() {
+        this.contentConsent = false;
+        this.contentGeneration += 1;
+      }
+
+      activateContent() {
+        this.syncContentConfiguration();
+        this.contentConsent = !this.disposed && this.isEnabled() && this.getLogTarget() === "file" && this.getLogLevel() === "detailed";
+        return this.contentConsent;
+      }
+
+      captureContentPermit() {
+        this.syncContentConfiguration();
+        return this.contentConsent ? this.contentGeneration : null;
+      }
+
+      dispose() {
+        this.disposed = true;
+        this.revokeContentConsent();
+      }
+
+      isContentPermitCurrent(permit) {
+        return permit !== null && permit === this.captureContentPermit();
+      }
+
+      content(event, value, options = {}) {
+        // A permit captured at request/dispatch time prevents backfill after activation.
+        if (!this.isContentPermitCurrent(options.permit) ||
+            !["assistant.final", "tool.arguments", "tool.result", "tool.applied"].includes(event)) return Promise.resolve();
+        if (this.pendingContentRecords >= 32 || this.pendingContentBytes >= 1024 * 1024) {
+          this.droppedContentRecords += 1;
+          return Promise.resolve();
+        }
+        let line;
+        try {
+          const maximum = event === "tool.arguments" ? ARGUMENT_BYTES : CONTENT_BYTES;
+          let detail = serializeContent(value, maximum, options.redactor);
+          const identity = {
+            toolName: typeof options.toolName === "string" ? options.toolName.slice(0, 160) : undefined,
+            callId: normalizeSessionId(options.callId),
+            droppedRecords: this.droppedContentRecords || undefined
+          };
+          line = `${this.createLine(`content.${event}`, { ...identity, ...detail }, options.sessionId ?? this.sessionId)}\n`;
+          if (byteLength(line) > RECORD_BYTES) {
+            detail = serializeContent(detail.content, 12 * 1024, options.redactor);
+            detail.truncated = true;
+            detail.marker = "[TRUNCATED: detailed log record limit]";
+            line = `${this.createLine(`content.${event}`, { ...identity, ...detail }, options.sessionId ?? this.sessionId)}\n`;
+          }
+        } catch {
+          this.droppedContentRecords += 1;
+          return Promise.resolve();
+        }
+        const size = byteLength(line);
+        if (size > RECORD_BYTES || this.pendingContentBytes + size > 1024 * 1024) {
+          this.droppedContentRecords += 1;
+          return Promise.resolve();
+        }
+        this.droppedContentRecords = 0;
+        this.pendingContentBytes += size;
+        this.pendingContentRecords += 1;
+        // Only a bounded, already redacted string is retained in the queue.
+        const permit = options.permit;
+        const task = this.writeQueue.then(async () => {
+          if (!this.isContentPermitCurrent(permit)) return;
+          await this.initializeForLaunch();
+          if (!this.isContentPermitCurrent(permit)) return;
+          let current = await this.adapter.read(this.currentLogPath);
+          if (!this.isContentPermitCurrent(permit)) return;
+          if (byteLength(current) + size > this.maxLogBytes) {
+            await this.rotateCurrentLog(current);
+            current = await this.adapter.read(this.currentLogPath);
+          }
+          if (!this.isContentPermitCurrent(permit)) return;
+          await this.adapter.write(this.currentLogPath, `${current}${line}`);
+        }).catch(() => {
+          console.warn("[CoDriver diagnostics] Unable to write diagnostic log.");
+        }).finally(() => {
+          this.pendingContentBytes -= size;
+          this.pendingContentRecords -= 1;
+          if (this.pendingContentRecords === 0 && this.droppedContentRecords > 0) {
+            const count = this.droppedContentRecords;
+            this.droppedContentRecords = 0;
+            void this.debug("diagnostics.content.dropped", { count });
+          }
+        });
+        this.writeQueue = task;
+        return task;
+      }
+
       async flush() {
-        await this.writeQueue;
+        let pending;
+        do {
+          pending = this.writeQueue;
+          await pending;
+        } while (pending !== this.writeQueue);
       }
 
       async readCurrentLog() {
@@ -14815,7 +15265,7 @@
           return false;
         }
 
-        return currentContent.length > 0 && currentContent.length + nextLine.length > this.maxLogBytes;
+        return currentContent.length > 0 && byteLength(currentContent) + byteLength(nextLine) > this.maxLogBytes;
       }
 
       async rotateCurrentLog(currentContent, sessionId = "") {
@@ -14885,7 +15335,8 @@
     }
 
     function normalizeLogLevel(value) {
-      return String(value || "").trim().toLowerCase() === "errors" ? "errors" : "all";
+      const level = String(value || "").trim().toLowerCase();
+      return level === "detailed" ? "detailed" : level === "errors" ? "errors" : "all";
     }
 
     function normalizeLogTarget(value) {
@@ -15135,7 +15586,7 @@
   "src/generated/releaseNotes.js": function(module, exports, require) {
     // Generated from current public release notes by build.mjs.
     module.exports = {
-      "version": "0.6.0",
+      "version": "0.6.1",
       "blocks": [
         {
           "type": "h3",
@@ -15143,35 +15594,7 @@
         },
         {
           "type": "li",
-          "text": "Create and edit Canvas files with validated, reviewable changes and a built-in Canvas skill."
-        },
-        {
-          "type": "li",
-          "text": "Added OAuth 2 authentication support for HTTP MCP servers on desktop."
-        },
-        {
-          "type": "li",
-          "text": "Configure OpenAI-compatible providers using ready-made presets."
-        },
-        {
-          "type": "li",
-          "text": "Use desktop voice input to record speech and insert editable text into the chat."
-        },
-        {
-          "type": "li",
-          "text": "Improved PDF text extraction, preserving line breaks and releasing resources after processing."
-        },
-        {
-          "type": "li",
-          "text": "Control automatic active-note context and remove model-selected skills from the current session."
-        },
-        {
-          "type": "li",
-          "text": "Added experimental Direct API call with separate Obsidian and per-plugin permissions. Plugin methods run with the installed plugin's authority."
-        },
-        {
-          "type": "li",
-          "text": "Added an in-app feedback link."
+          "text": "Added optional Detailed file logging for troubleshooting, including tool arguments, results and final assistant answers. Enabling it requires confirmation because logs may contain sensitive data."
         },
         {
           "type": "h3",
@@ -15179,15 +15602,19 @@
         },
         {
           "type": "li",
-          "text": "Provider generation failures now show a clear error and prevent tool calls from failed responses."
-        },
-        {
-          "type": "h3",
-          "text": "Compatibility"
+          "text": "Audio transcription and Voice input now respect disabled models in provider settings."
         },
         {
           "type": "li",
-          "text": "Editing an open Canvas currently requires Obsidian 1.14.4; unsupported editor versions block the write."
+          "text": "Fixed long commands losing instructions during tool continuations. Commands above 12000 characters now offer Cancel request or Continue with the full context."
+        },
+        {
+          "type": "li",
+          "text": "Fixed the reference time changing during tool continuations."
+        },
+        {
+          "type": "li",
+          "text": "Improved read-context retention for supported read-only Direct Plugin API calls, including calls that return errors."
         }
       ]
     };
@@ -15682,7 +16109,7 @@
 
     function normalizeDiagnosticLogLevel(value) {
       const text = String(value || "").trim().toLowerCase();
-      return text === "errors" ? "errors" : "all";
+      return text === "detailed" ? "detailed" : text === "errors" ? "errors" : "all";
     }
 
     function normalizeDiagnosticLogTarget(value) {
@@ -15950,7 +16377,9 @@
       }
 
       onunload() {
+        this.diagnosticLogger?.dispose();
         this.chatController?.cancelVoiceInput?.();
+        this.chatController?.directApiAccess?.dispose();
         this.mcpOAuthService?.dispose();
         this.releaseNotes?.dispose();
         this.commandActionModal?.close?.();
@@ -15964,6 +16393,7 @@
           mcpCredentialService: this.getMcpCredentialService(),
           mcpOAuthService: this.getMcpOAuthService(),
           getPlatform: () => Platform.isMobile ? "mobile" : "desktop",
+
           isStdioMcpSupported: () => this.isStdioMcpSupported(),
           getStdioMcpUnavailableMessage: () => this.getStdioMcpUnavailableMessage(),
           ...overrides
@@ -16078,6 +16508,11 @@
           voiceInput: Object.hasOwn(savedSettings ?? {}, "voiceInput") ? savedSettings.voiceInput
             : normalizeVoiceInputSettings(undefined, savedSettings?.audioTranscription)
         });
+        // Content consent belongs to this launch, never persisted settings.
+        if (this.settings.diagnosticLogLevel === "detailed") {
+          this.settings.enableDiagnosticLogging = false;
+          if (!Platform.isMobileApp && this.settings.diagnosticLogTarget === "console") this.settings.diagnosticLogLevel = "all";
+        }
 
         // Hold legacy material outside normalized settings. Never serialize it again.
         this.pendingProviderKeys = (Array.isArray(savedSettings?.providers) ? savedSettings.providers : []).flatMap((provider, index) =>
@@ -18545,6 +18980,8 @@
         this.serverSummary = createServerSummary(server);
         this.serverSummary.customHeaderNames = Object.keys(this.headers).sort();
         this.diagnostics = options.diagnostics ?? null;
+        this.onToolDispatch = options.onToolDispatch;
+        this.onDiagnosticSecret = options.onDiagnosticSecret;
       }
 
       async discoverTools() {
@@ -18674,8 +19111,10 @@
             body: JSON.stringify(payload)
           };
           response = this.oauthService
-            ? await this.oauthService.requestMcp(this.server, { ...request, signal: this.signal })
-            : await requestUrl(request);
+            ? await this.oauthService.requestMcp(this.server, { ...request, signal: this.signal,
+                onDiagnosticSecret: payload.method === "tools/call" ? this.onDiagnosticSecret : undefined,
+                onDiagnosticHeaders: payload.method === "tools/call" ? (headers) => this.notifyToolDispatch(headers) : undefined })
+            : await this.dispatchRequest(request, payload.method);
         } catch (error) {
           await this.logDiagnostic("mcp.http.request.failed", {
             ...this.serverSummary,
@@ -18712,6 +19151,15 @@
         }
 
         await this.diagnostics.debug(event, detail);
+      }
+
+      notifyToolDispatch(headers) {
+        try { this.onToolDispatch?.(headers); } catch { /* Diagnostics are best effort. */ }
+      }
+
+      dispatchRequest(request, method) {
+        if (method === "tools/call") this.notifyToolDispatch(this.headers);
+        return requestUrl(request);
       }
 
       createHeaders(options = {}) {
@@ -19576,13 +20024,19 @@
         state.blocked = false; state.status = "Not connected";
         await this.log(server, "disconnect.completed");
       }
-      async headers(server, signal) {
+      async headers(server, signal, onDiagnosticSecret) {
         this.assertSupported();
         const state = this.state(server.id), generation = state.generation;
         this.assertCurrent(server, generation, signal);
         if (state.blocked) throw new McpOAuthError("cleanup");
         let saved = this.read(server);
         if (!saved?.accessToken) throw new McpOAuthError("reconnect");
+        const protect = () => {
+          try {
+            for (const value of [saved.accessToken, saved.refreshToken, saved.clientSecret]) onDiagnosticSecret?.(value);
+          } catch { /* Diagnostics are best effort. */ }
+        };
+        protect();
         this.registration(server);
         if (saved.expiresAt && saved.expiresAt <= Date.now() + 30000) {
           if (!saved.refreshToken) { state.status = "Reconnect required"; throw new McpOAuthError("reconnect"); }
@@ -19592,6 +20046,7 @@
           }
           await state.refresh;
           this.assertCurrent(server, generation, signal); saved = this.read(server);
+          protect();
         }
         this.assertCurrent(server, generation, signal);
         return { Authorization: `Bearer ${saved.accessToken}` };
@@ -19629,9 +20084,11 @@
       }
       async requestMcp(server, options) {
         const state = this.state(server.id), generation = state.generation;
-        const authorization = await this.headers(server, options.signal);
+        const authorization = await this.headers(server, options.signal, options.onDiagnosticSecret);
         this.assertCurrent(server, generation, options.signal);
-        const response = await this.request({ ...options, url: server.endpoint, headers: { ...options.headers, ...authorization }, maxBytes: 8388608 });
+        const { onDiagnosticHeaders, onDiagnosticSecret, ...requestOptions } = options;
+        try { onDiagnosticHeaders?.(authorization); } catch { /* Diagnostics are best effort. */ }
+        const response = await this.request({ ...requestOptions, url: server.endpoint, headers: { ...options.headers, ...authorization }, maxBytes: 8388608 });
         if ([401, 403].includes(response.status)) { state.blocked = true; state.status = "Reconnect required"; await this.log(server, "authorization.failed", { httpStatus: response.status, errorCode: "reconnect" }); throw new McpOAuthError("reconnect"); }
         this.assertCurrent(server, generation, options.signal);
         return response;
@@ -20181,6 +20638,7 @@
         this.stderrTail = "";
         this.serverSummary = createServerSummary(server);
         this.diagnostics = options.diagnostics ?? null;
+        this.onToolDispatch = options.onToolDispatch;
         this.requestTimeoutMs = Number.isFinite(options.requestTimeoutMs)
           ? Math.max(1, Math.trunc(options.requestTimeoutMs))
           : DEFAULT_STDIO_REQUEST_TIMEOUT_MS;
@@ -20368,6 +20826,9 @@
           throw new Error("MCP stdio server process is not running.");
         }
 
+        if (payload.method === "tools/call") {
+          try { this.onToolDispatch?.(); } catch { /* Diagnostics are best effort. */ }
+        }
         child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
       }
 
@@ -20998,13 +21459,14 @@
         this.fetch = options.fetch;
       }
 
-      async createHeaders(extraHeaders = {}) {
+      async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
         const headers = {
           Accept: "application/json",
           "anthropic-version": this.apiVersion,
           ...extraHeaders
         };
         const apiKey = String((await Promise.resolve(this.apiKeyResolver())) ?? "").trim();
+        onDiagnosticSecret?.(apiKey);
         if (apiKey) {
           headers["x-api-key"] = apiKey;
         }
@@ -21097,7 +21559,7 @@
           headers: await this.createHeaders({
             Accept: "text/event-stream",
             "Content-Type": "application/json"
-          }),
+          }, options.onDiagnosticSecret),
           body: JSON.stringify(body),
           ...(signal ? { signal } : {})
         };
@@ -22790,7 +23252,8 @@
           providerContext: request.providerContext,
           continuationMessages: request.continuationMessages,
           toolResults: request.toolResults,
-          onProgress: request.onProgress
+          onProgress: request.onProgress,
+          onDiagnosticSecret: request.onDiagnosticSecret
         });
       }
 
@@ -22947,8 +23410,9 @@
         this.fetch = options.fetch;
       }
 
-      async createHeaders(extraHeaders = {}) {
+      async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
         const apiKey = String((await Promise.resolve(this.apiKeyResolver())) ?? "").trim();
+        onDiagnosticSecret?.(apiKey);
         if (!apiKey) {
           throw new Error("Set a Gemini API key secret before using this provider.");
         }
@@ -23048,6 +23512,7 @@
             mapped,
             signal,
             onProgress: options.onProgress,
+            onDiagnosticSecret: options.onDiagnosticSecret,
             enableGoogleSearch,
             groundingConfiguration
           });
@@ -23057,7 +23522,7 @@
           method: "POST",
           headers: await this.createHeaders({
             "Content-Type": "application/json"
-          }),
+          }, options.onDiagnosticSecret),
           body: JSON.stringify(requestBody)
         };
 
@@ -23190,7 +23655,7 @@
           headers: await this.createHeaders({
             Accept: "text/event-stream",
             "Content-Type": "application/json"
-          }),
+          }, options.onDiagnosticSecret),
           body: JSON.stringify(streamingBody),
           ...(signal ? { signal } : {})
         };
@@ -25065,7 +25530,8 @@
           providerContext: request.providerContext,
           continuationMessages: request.continuationMessages,
           toolResults: request.toolResults,
-          onProgress: request.onProgress
+          onProgress: request.onProgress,
+          onDiagnosticSecret: request.onDiagnosticSecret
         });
       }
 
@@ -25167,12 +25633,13 @@
         this.fetch = options.fetch;
       }
 
-      async createHeaders(extraHeaders = {}) {
+      async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
         const headers = {
           Accept: "application/json",
           ...extraHeaders
         };
         const apiKey = String((await Promise.resolve(this.apiKeyResolver())) ?? "").trim();
+        onDiagnosticSecret?.(apiKey);
 
         if (apiKey.length > 0) {
           headers.Authorization = `Bearer ${apiKey}`;
@@ -25231,7 +25698,7 @@
         }
 
         if (typeof options.onProgress === "function") {
-          return await this.createStreamingChatCompletion(model, body, nativeTools, signal, options.onProgress);
+          return await this.createStreamingChatCompletion(model, body, nativeTools, signal, options.onProgress, options.onDiagnosticSecret);
         }
 
         const request = {
@@ -25239,7 +25706,7 @@
           method: "POST",
           headers: await this.createHeaders({
             "Content-Type": "application/json"
-          }),
+          }, options.onDiagnosticSecret),
           body: JSON.stringify(body)
         };
 
@@ -25316,14 +25783,14 @@
         };
       }
 
-      async createStreamingChatCompletion(model, body, nativeTools, signal, onProgress) {
+      async createStreamingChatCompletion(model, body, nativeTools, signal, onProgress, onDiagnosticSecret) {
         const request = {
           url: `${this.baseUrl}/chat/completions`,
           method: "POST",
           headers: await this.createHeaders({
             Accept: "text/event-stream",
             "Content-Type": "application/json"
-          }),
+          }, onDiagnosticSecret),
           body: JSON.stringify({
             ...body,
             stream: true
@@ -26440,7 +26907,8 @@
           providerContext: request.providerContext,
           continuationMessages: request.continuationMessages,
           toolResults: request.toolResults,
-          onProgress: request.onProgress
+          onProgress: request.onProgress,
+          onDiagnosticSecret: request.onDiagnosticSecret
         });
       }
 
@@ -26869,7 +27337,7 @@
         .map((provider) => ({
           providerId: normalizeIdentity(provider.id),
           providerName: normalizeIdentity(provider.name) || normalizeIdentity(provider.id),
-          models: getConfiguredProviderModelIds(provider)
+          models: getAvailableProviderModelIds(provider)
         }))
         .filter((provider) => provider.providerId && provider.models.length > 0);
     }
@@ -26893,7 +27361,7 @@
         !providerSettings ||
         providerSettings.enabled === false ||
         providerSettings.type !== OPENAI_COMPATIBLE_PROVIDER_TYPE ||
-        !getConfiguredProviderModelIds(providerSettings).includes(selection.modelId)
+        !getAvailableProviderModelIds(providerSettings).includes(selection.modelId)
       ) {
         return createUnavailableResult(
           "audio-transcription-selection-unavailable",
@@ -26912,6 +27380,14 @@
         modelId: selection.modelId,
         providerSettings
       };
+    }
+
+    function isProviderModelDisabled(provider, modelId) {
+      return Array.isArray(provider?.hiddenModels) && provider.hiddenModels.includes(modelId);
+    }
+
+    function getAvailableProviderModelIds(provider) {
+      return getConfiguredProviderModelIds(provider).filter((model) => !isProviderModelDisabled(provider, model));
     }
 
     function getConfiguredProviderModelIds(provider) {
@@ -26972,6 +27448,7 @@
       encodeAudioTranscriptionSelection,
       getAudioTranscriptionModelChoices,
       getConfiguredProviderModelIds,
+      isProviderModelDisabled,
       normalizeAudioTranscriptionSettings,
       resolveAudioTranscriptionSelection
     };
@@ -27005,6 +27482,7 @@
       decodeAudioTranscriptionSelection,
       encodeAudioTranscriptionSelection,
       getAudioTranscriptionModelChoices,
+      isProviderModelDisabled,
       normalizeAudioTranscriptionSettings,
       normalizeVoiceInputSettings,
       resolveVoiceInputSelection,
@@ -27645,7 +28123,8 @@
         if (diagnosticLogTarget === "file") {
           setting.settingEl.addClass("codriver-diagnostic-log-file-setting");
           setting.setDesc(
-            `${this.plugin.getDiagnosticLogPath() || "The CoDriver diagnostic log"}\nThis file is refreshed when CoDriver restarts.`
+            `${this.plugin.getDiagnosticLogPath() || "The CoDriver diagnostic log"}\nThis file is refreshed when CoDriver restarts.${this.plugin.settings.diagnosticLogLevel === "detailed"
+              ? "\nDetailed logging may contain sensitive information." : ""}`
           );
           setting.descEl?.addClass("codriver-diagnostic-log-file-description");
           if (setting.descEl) setting.settingEl.appendChild(setting.descEl);
@@ -27655,18 +28134,18 @@
             toggle
               .setValue(Boolean(this.plugin.settings.enableDiagnosticLogging))
               .onChange(async (value) => {
-                this.plugin.settings.enableDiagnosticLogging = value;
-                await this.plugin.saveSettings();
+                await this.changeDiagnosticLogging({ enableDiagnosticLogging: value });
               });
           })
           .addDropdown((dropdown) => {
             dropdown
               .addOption("errors", "Errors only")
-              .addOption("all", "All events")
+              .addOption("all", "Standard");
+            if (diagnosticLogTarget === "file") dropdown.addOption("detailed", "Detailed");
+            dropdown
               .setValue(this.plugin.settings.diagnosticLogLevel ?? "errors")
               .onChange(async (value) => {
-                this.plugin.settings.diagnosticLogLevel = value;
-                await this.plugin.saveSettings();
+                await this.changeDiagnosticLogging({ diagnosticLogLevel: value });
               });
           })
           .addDropdown((dropdown) => {
@@ -27683,9 +28162,9 @@
               .addOption("console", "Console")
               .setValue(this.plugin.settings.diagnosticLogTarget ?? "console")
               .onChange(async (value) => {
-                this.plugin.settings.diagnosticLogTarget = value;
-                await this.plugin.saveSettings();
-                this.display();
+                await this.changeDiagnosticLogging({ diagnosticLogTarget: value,
+                  ...(value === "console" && this.plugin.settings.diagnosticLogLevel === "detailed"
+                    ? { diagnosticLogLevel: "all" } : {}) });
               });
           });
 
@@ -27694,6 +28173,41 @@
             this.handleDiagnosticLogShare()
           ), "codriver-diagnostic-share-button");
         }
+      }
+
+      async changeDiagnosticLogging(changes) {
+        const revision = (this.plugin.diagnosticLoggingChangeRevision ?? 0) + 1;
+        this.plugin.diagnosticLoggingChangeRevision = revision;
+        const settings = this.plugin.settings;
+        const previous = diagnosticConfiguration(settings);
+        const next = { ...settings, ...changes };
+        if (diagnosticConfiguration(next) === previous) { this.display(); return; }
+        const file = Platform?.isMobileApp || next.diagnosticLogTarget === "file";
+        const needsConsent = next.enableDiagnosticLogging && next.diagnosticLogLevel === "detailed" && file &&
+          (!settings.enableDiagnosticLogging || settings.diagnosticLogLevel !== "detailed");
+        if (needsConsent) {
+          const confirmed = await new Promise((resolve) => {
+            new DetailedLogConsentModal(this.app, resolve).open();
+          });
+          if (!confirmed || this.plugin.diagnosticLoggingChangeRevision !== revision ||
+              this.plugin.settings !== settings || diagnosticConfiguration(this.plugin.settings) !== previous) {
+            this.display();
+            return;
+          }
+        }
+        this.plugin.diagnosticLogger?.revokeContentConsent();
+        Object.assign(this.plugin.settings, changes);
+        const confirmedConfiguration = diagnosticConfiguration(this.plugin.settings);
+        try {
+          await this.plugin.saveSettings();
+          if (needsConsent && this.plugin.diagnosticLoggingChangeRevision === revision &&
+              diagnosticConfiguration(this.plugin.settings) === confirmedConfiguration) this.plugin.diagnosticLogger?.activateContent();
+        } catch {
+          this.plugin.diagnosticLogger?.revokeContentConsent();
+          this.plugin.settings.enableDiagnosticLogging = false;
+          new Notice("Unable to save diagnostic logging settings. Logging was stopped.");
+        }
+        this.display();
       }
 
       async handleDiagnosticLogShare() {
@@ -27717,11 +28231,6 @@
 
         const navigatorObject = globalThis.navigator;
         const file = createDiagnosticLogFile(result.content);
-        if (!canShareDiagnosticLogFile(navigatorObject, file)) {
-          await copyDiagnosticLogWithNotice(navigatorObject, result.content);
-          return;
-        }
-
         new DiagnosticLogShareModal(this.app, {
           file,
           content: result.content,
@@ -28027,7 +28536,8 @@
             title: AUDIO_TRANSCRIPTION_TOOLTIP
           }
         });
-        if (current.providerId && current.modelId && !availableValues.has(selectedValue)) {
+        if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
+          !isProviderModelDisabled(this.plugin.settings.providers?.find((provider) => provider.id === current.providerId), current.modelId)) {
           groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
         }
         select.disabled = !current.enabled && !this.pendingAudioTranscriptionEnable;
@@ -28105,7 +28615,8 @@
           attr: { type: "button", "aria-label": "Select voice input provider and model", title: "Uses this provider and model only for microphone input." }
         });
         select.disabled = Platform.isMobile || (!current.enabled && !this.pendingVoiceInputEnable);
-        if (current.providerId && current.modelId && !availableValues.has(selectedValue)) {
+        if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
+          !isProviderModelDisabled(this.plugin.settings.providers?.find((provider) => provider.id === current.providerId), current.modelId)) {
           groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
         }
         bindModelPicker(this, select, {
@@ -28119,10 +28630,14 @@
             this.display();
           }
         });
-        if (current.enabled && !resolution.ok) {
+        const voiceConfiguration = this.plugin.chatController?.getVoiceInputConfiguration?.();
+        const unavailableReason = voiceConfiguration?.unavailableReason || (!resolution.ok ? resolution.message : "");
+        if (current.enabled && unavailableReason) {
           setting.settingEl.addClass("is-invalid");
           select.setAttribute("aria-invalid", "true");
-          select.title = resolution.message;
+          select.title = unavailableReason;
+          container.createDiv({ cls: "codriver-voice-unavailable",
+            text: unavailableReason.replace(" Update it in Settings > Providers.", ""), attr: { role: "status" } });
         }
         const options = container.createDiv({ cls: "codriver-voice-input-options", attr: { id: "codriver-voice-input-options" } });
         options.hidden = this.voiceInputExpanded !== true;
@@ -28904,6 +29419,33 @@
       }
     }
 
+    const DETAILED_LOG_WARNING = "Detailed logs save assistant answers and tool arguments/results to a local file. They may contain private notes, personal data, or secrets returned by tools. Known credentials are redacted, but redaction is not guaranteed. Reasoning, prompts, and raw attachments/audio are excluded. Review logs before sharing.";
+
+    function diagnosticConfiguration(settings) {
+      return JSON.stringify([settings.enableDiagnosticLogging, settings.diagnosticLogLevel, settings.diagnosticLogTarget]);
+    }
+
+    class DetailedLogConsentModal extends Modal {
+      constructor(app, resolve) {
+        super(app);
+        this.resolve = resolve;
+        this.accepted = false;
+      }
+      onOpen() {
+        this.contentEl.empty();
+        this.contentEl.addClass("codriver-provider-modal");
+        this.contentEl.createEl("h2", { text: "Enable detailed logging?" });
+        this.contentEl.createEl("p", { text: DETAILED_LOG_WARNING });
+        new Setting(this.contentEl)
+          .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+          .addButton((button) => button.setCta().setButtonText("Enable detailed logging").onClick(() => {
+            this.accepted = true;
+            this.close();
+          }));
+      }
+      onClose() { this.resolve(this.accepted); }
+    }
+
     class DiagnosticLogShareModal extends Modal {
       constructor(app, options) {
         super(app);
@@ -28918,7 +29460,7 @@
         contentEl.addClass("codriver-provider-modal");
         contentEl.createEl("h2", { text: "Share diagnostic log?" });
         contentEl.createEl("p", {
-          text: "Diagnostic logs can contain note paths and provider endpoint metadata. They exclude note bodies, prompts, tool argument values, tool output content, API keys, and secrets."
+          text: "This file may include Detailed logs containing assistant answers, private note content, and tool arguments/results from earlier logging. Review it before sharing or copying. Known credential redaction is not guaranteed. Prompts, reasoning, and raw attachments/audio are excluded. If file sharing fails, the confirmed log will be copied to the clipboard."
         });
 
         new Setting(contentEl)
@@ -28930,9 +29472,14 @@
           .addButton((button) => {
             button
               .setCta()
-              .setButtonText("Share")
+              .setButtonText(canShareDiagnosticLogFile(this.navigatorObject, this.file) ? "Share" : "Copy")
               .onClick(() => {
                 button.setDisabled(true);
+                if (!canShareDiagnosticLogFile(this.navigatorObject, this.file)) {
+                  void copyDiagnosticLogWithNotice(this.navigatorObject, this.content);
+                  this.close();
+                  return;
+                }
                 startDiagnosticLogFileShare(this.navigatorObject, this.file, {
                   onShared: () => new Notice("Diagnostic log shared."),
                   onError: () => {
@@ -34277,12 +34824,59 @@
         this.identities = new WeakMap();
         this.nextIdentity = 1;
         this.busy = false;
+        this.dataviewQuery = this.captureDataviewQuery();
+        this.dataviewBaselineCaptured = Boolean(this.dataviewQuery);
+        this.vaultRevision = null;
+        this.vaultEvents = [];
+        if (typeof app.vault?.on === "function" && typeof app.vault?.offref === "function") {
+          this.vaultRevision = 0;
+          for (const event of ["create", "modify", "delete", "rename"]) {
+            this.vaultEvents.push(app.vault.on(event, () => { this.vaultRevision++; }));
+          }
+        }
+      }
+
+      dispose() {
+        for (const ref of this.vaultEvents) this.app.vault.offref(ref);
+        this.vaultEvents = [];
+        this.vaultRevision = null;
       }
 
       identity(object) {
         if (!object || !["object", "function"].includes(typeof object)) return 0;
         if (!this.identities.has(object)) this.identities.set(object, this.nextIdentity++);
         return this.identities.get(object);
+      }
+
+      captureDataviewQuery() {
+        try {
+          const plugin = Object.getOwnPropertyDescriptor(this.app.plugins?.plugins, "dataview")?.value;
+          if (plugin?.manifest?.version !== "0.5.68") return null;
+          const api = getDirectDataProperty(plugin, "api");
+          const method = getDirectDataProperty(api, "query");
+          return typeof method === "function" ? { plugin, api, method } : null;
+        } catch { return null; }
+      }
+
+      // A retention classification only. This never grants permission or changes dispatch.
+      readEvidenceBinding(input) {
+        if (input?.target !== "plugin") return "";
+        if (input.method === undefined && (input.args === undefined || (Array.isArray(input.args) && !input.args.length))) {
+          return "descriptor-discovery";
+        }
+        const baseline = this.dataviewQuery;
+        if (!baseline || input.pluginId !== "dataview" || input.method !== "api.query") return "";
+        const args = input.args;
+        if (!Array.isArray(args) || args.length < 1 || args.length > 2 ||
+          !isRetainableDataviewDql(args[0]) ||
+          (args.length === 2 && (typeof args[1] !== "string" || args[1].length > 1000))) return "";
+        try {
+          const current = this.captureDataviewQuery();
+          const resolved = this.resolveMethod(input);
+          if (!current || current.plugin !== baseline.plugin || current.api !== baseline.api ||
+            current.method !== baseline.method || resolved.receiver !== baseline.api || resolved.method !== baseline.method) return "";
+          return JSON.stringify(["dataview-dql-0.5.68", this.identity(current.plugin), this.identity(current.api), this.identity(current.method)]);
+        } catch { return ""; }
       }
 
       plugins() {
@@ -34294,6 +34888,16 @@
       }
 
       binding(settings) {
+        // Plugins can finish loading after CoDriver. Pin at most once, before the
+        // first request catalog; never adopt a replacement during an active chain.
+        if (!this.dataviewBaselineCaptured && settings.enableDirectPluginApiAccess === true) {
+          const plugin = Object.getOwnPropertyDescriptor(this.app.plugins?.plugins || {}, "dataview")?.value;
+          const candidate = this.captureDataviewQuery();
+          if (candidate || (plugin && plugin.manifest?.version !== "0.5.68")) {
+            this.dataviewQuery = candidate;
+            this.dataviewBaselineCaptured = true;
+          }
+        }
         return JSON.stringify([
           settings.enableDirectObsidianApiAccess === true,
           settings.allowAutomaticDirectObsidianApiAccess === true,
@@ -34435,6 +35039,53 @@
         if (text.length > budget.limit) throw new Error("API result exceeds the current output limit. Request a smaller result.");
         return { content: [{ type: "text", text }], isError: false };
       }
+    }
+
+    // Conservative subset of string DQL for evidence retention, not a DQL validator or
+    // execution sandbox. Unsupported syntax still dispatches under normal API consent,
+    // but invalidates evidence. Never accept object ASTs or arbitrary callback values.
+    function isRetainableDataviewDql(source) {
+      if (typeof source !== "string" || source.length > 60000 || !/^(TABLE|LIST|TASK|CALENDAR)\b/i.test(source.trim())) return false;
+      const tokens = [];
+      const lexer = /\s+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[A-Za-z_][A-Za-z_0-9-]*|\d+(?:\.\d+)?|=>|!=|<=|>=|[()[\]{},.:+*/%=<>!-]/gy;
+      let position = 0;
+      while (position < source.length) {
+        lexer.lastIndex = position;
+        const match = lexer.exec(source);
+        if (!match) return false;
+        position = lexer.lastIndex;
+        if (!/^\s+$/.test(match[0])) tokens.push(match[0]);
+        if (tokens.length > 8000) return false;
+      }
+      const functions = new Set(["length", "date", "typeof", "choice", "contains", "object", "list", "array", "map", "filter"]);
+      const grouping = new Set(["WHERE", "AND", "OR", "NOT", "BY", "FLATTEN", "LIMIT", "TABLE", "LIST", "TASK", "CALENDAR"]);
+      const valueEnd = (token) => token && (/^[A-Za-z_0-9"']/.test(token) || token === ")" || token === "]" || token === "}");
+      let scanBudget = 32000;
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (/^(constructor|prototype|__proto__)$/i.test(token)) return false;
+        // No computed property access or invocation of values/member methods.
+        if (token === "[" && valueEnd(tokens[i - 1]) && !grouping.has(tokens[i - 1]?.toUpperCase())) return false;
+        if (token !== "(") continue;
+        const previous = tokens[i - 1];
+        if (!valueEnd(previous)) continue;
+        if (grouping.has(previous?.toUpperCase())) continue;
+        if (!functions.has(previous) || tokens[i - 2] === ".") return false;
+        if (previous !== "map" && previous !== "filter") continue;
+        let depth = 0;
+        let comma = -1;
+        for (let j = i + 1; j < tokens.length; j++) {
+          if (--scanBudget < 0) return false;
+          if (["(", "[", "{"].includes(tokens[j])) depth++;
+          if ([")", "]", "}"].includes(tokens[j])) { if (depth === 0) break; depth--; }
+          if (tokens[j] === "," && depth === 0) { comma = j; break; }
+        }
+        if (comma < 0 || tokens[comma + 1] !== "(") return false;
+        let end = comma + 2;
+        while (/^[A-Za-z_][A-Za-z_0-9]*$/.test(tokens[end] || "") || tokens[end] === ",") end++;
+        if (tokens[end] !== ")" || tokens[end + 1] !== "=>") return false;
+      }
+      return true;
     }
 
     function parseDirectMethodPath(value) {
@@ -38749,6 +39400,9 @@
           text: warning.body || "This provider call is larger than Maximum context size. Review the estimate before continuing."
         });
         const values = body.createDiv({ cls: "codriver-context-warning-values" });
+        if (warning.commandWarning) {
+          this.renderRequestInfoRow(values, "Expanded command", `${formatNumber(warning.commandCharacters)} characters (warning above 12000)`);
+        }
         this.renderRequestInfoRow(
           values,
           "Current call",
@@ -38785,10 +39439,10 @@
           },
           {
             decision: "stop",
-            label: "Stop",
+            label: warning.commandWarning ? "Cancel request" : "Stop",
             title: "Stop this provider call without sending it."
           }
-        ];
+        ].filter((definition) => !warning.commandWarning || definition.decision !== "continue-session");
         const buttons = definitions.map((definition) => {
           const button = actions.createEl("button", {
             cls: `codriver-approval-button codriver-context-warning-${definition.decision}`,
@@ -40251,20 +40905,7 @@
 
         const voiceConfiguration = this.chatController.getVoiceInputConfiguration?.();
         const voiceState = this.chatController.voiceInput?.state ?? { phase: "idle", error: "" };
-        if (voiceConfiguration?.available) {
-          const recording = voiceState.phase === "recording";
-          const microphone = trailingActions.createEl("button", {
-            cls: "codriver-voice-button",
-            attr: { type: "button", "aria-label": recording ? "Stop recording and transcribe" : "Start voice input",
-              title: recording ? "Stop recording and transcribe" : `Record voice input: ${voiceConfiguration.destination}`,
-              "aria-pressed": String(recording) }
-          });
-          setIcon(microphone, recording ? "square" : "mic");
-          microphone.toggleClass("is-recording", recording);
-          microphone.disabled = this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
-          microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
-          microphone.addEventListener("click", () => { void this.toggleVoiceInput(); });
-        }
+        this.renderVoiceInputControls(trailingActions, input, voiceConfiguration, voiceState);
 
         sendButton = trailingActions.createEl("button", {
           cls: "codriver-send-button",
@@ -40291,6 +40932,25 @@
         if (voiceStatusText) {
           composer.createDiv({ cls: `codriver-voice-status${voiceState.error ? " codriver-voice-error" : ""}`, text: voiceStatusText,
             attr: { role: "status", "aria-live": "polite", title: voiceStatusText } });
+        }
+      }
+
+      renderVoiceInputControls(trailingActions, input, voiceConfiguration, voiceState) {
+        if (voiceConfiguration?.enabled && voiceConfiguration.platform !== "mobile" && !this.chatController.isCommandActionSession?.()) {
+          const unavailable = !voiceConfiguration.available;
+          const reason = voiceConfiguration.unavailableReason || "Voice input is unavailable. Review Settings > Providers.";
+          const tooltip = unavailable ? `Voice input unavailable: ${reason}` : "";
+          const recording = voiceState.phase === "recording";
+          const microphone = trailingActions.createEl("button", {
+            cls: "codriver-voice-button",
+            attr: { type: "button", title: unavailable ? tooltip : recording ? "Stop recording and transcribe" : `Record voice input: ${voiceConfiguration.destination}`,
+              "aria-pressed": String(recording) }
+          });
+          setIcon(microphone, recording ? "square" : "mic");
+          microphone.toggleClass("is-recording", recording);
+          microphone.disabled = unavailable || this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
+          microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
+          microphone.addEventListener("click", () => { if (!unavailable) void this.toggleVoiceInput(); });
         }
       }
 
@@ -41991,6 +42651,7 @@
       }
 
       onClose() {
+        this.chatController.directApiAccess?.dispose();
         this.captureDraftText();
         this.chatController.setStateChangeHandler(null);
         if (this.instant && this.chatController.isSending()) {

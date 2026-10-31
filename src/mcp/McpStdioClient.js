@@ -28,6 +28,7 @@ class McpStdioClient {
     this.stderrTail = "";
     this.serverSummary = createServerSummary(server);
     this.diagnostics = options.diagnostics ?? null;
+    this.onToolDispatch = options.onToolDispatch;
     this.requestTimeoutMs = Number.isFinite(options.requestTimeoutMs)
       ? Math.max(1, Math.trunc(options.requestTimeoutMs))
       : DEFAULT_STDIO_REQUEST_TIMEOUT_MS;
@@ -215,6 +216,9 @@ class McpStdioClient {
       throw new Error("MCP stdio server process is not running.");
     }
 
+    if (payload.method === "tools/call") {
+      try { this.onToolDispatch?.(); } catch { /* Diagnostics are best effort. */ }
+    }
     child.stdin.write(`${JSON.stringify(payload)}\n`, "utf8");
   }
 

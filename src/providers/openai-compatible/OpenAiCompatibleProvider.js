@@ -50,7 +50,8 @@ class OpenAiCompatibleProvider {
       providerContext: request.providerContext,
       continuationMessages: request.continuationMessages,
       toolResults: request.toolResults,
-      onProgress: request.onProgress
+      onProgress: request.onProgress,
+      onDiagnosticSecret: request.onDiagnosticSecret
     });
   }
 

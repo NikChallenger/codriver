@@ -292,13 +292,19 @@ class McpOAuthService {
     state.blocked = false; state.status = "Not connected";
     await this.log(server, "disconnect.completed");
   }
-  async headers(server, signal) {
+  async headers(server, signal, onDiagnosticSecret) {
     this.assertSupported();
     const state = this.state(server.id), generation = state.generation;
     this.assertCurrent(server, generation, signal);
     if (state.blocked) throw new McpOAuthError("cleanup");
     let saved = this.read(server);
     if (!saved?.accessToken) throw new McpOAuthError("reconnect");
+    const protect = () => {
+      try {
+        for (const value of [saved.accessToken, saved.refreshToken, saved.clientSecret]) onDiagnosticSecret?.(value);
+      } catch { /* Diagnostics are best effort. */ }
+    };
+    protect();
     this.registration(server);
     if (saved.expiresAt && saved.expiresAt <= Date.now() + 30000) {
       if (!saved.refreshToken) { state.status = "Reconnect required"; throw new McpOAuthError("reconnect"); }
@@ -308,6 +314,7 @@ class McpOAuthService {
       }
       await state.refresh;
       this.assertCurrent(server, generation, signal); saved = this.read(server);
+      protect();
     }
     this.assertCurrent(server, generation, signal);
     return { Authorization: `Bearer ${saved.accessToken}` };
@@ -345,9 +352,11 @@ class McpOAuthService {
   }
   async requestMcp(server, options) {
     const state = this.state(server.id), generation = state.generation;
-    const authorization = await this.headers(server, options.signal);
+    const authorization = await this.headers(server, options.signal, options.onDiagnosticSecret);
     this.assertCurrent(server, generation, options.signal);
-    const response = await this.request({ ...options, url: server.endpoint, headers: { ...options.headers, ...authorization }, maxBytes: 8388608 });
+    const { onDiagnosticHeaders, onDiagnosticSecret, ...requestOptions } = options;
+    try { onDiagnosticHeaders?.(authorization); } catch { /* Diagnostics are best effort. */ }
+    const response = await this.request({ ...requestOptions, url: server.endpoint, headers: { ...options.headers, ...authorization }, maxBytes: 8388608 });
     if ([401, 403].includes(response.status)) { state.blocked = true; state.status = "Reconnect required"; await this.log(server, "authorization.failed", { httpStatus: response.status, errorCode: "reconnect" }); throw new McpOAuthError("reconnect"); }
     this.assertCurrent(server, generation, options.signal);
     return response;
