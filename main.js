@@ -1430,6 +1430,7 @@
       AudioValidationError,
       inspectAudioBuffer
     } = require("./AudioInspector");
+    const { normalizeVoiceSpeechThreshold } = require("../settings/AudioTranscriptionSettings");
 
     const DEFAULT_MAX_AUDIO_FILES = 3;
     const DEFAULT_MAX_COMBINED_AUDIO_BYTES = 30 * 1024 * 1024;
@@ -1974,6 +1975,22 @@
     const VOICE_RECORDING_LIMIT_MS = 5 * 60 * 1000;
     const VOICE_OPERATION_TIMEOUT_MS = 15000;
     const VOICE_MAX_BYTES = 15 * 1024 * 1024;
+    const VOICE_STOP_ERROR_CODES = new Set([
+      "voice-recording-empty",
+      "voice-recording-invalid",
+      "transcription-not-configured",
+      "transcription-endpoint-invalid",
+      "transcription-endpoint-unsafe",
+      "transcription-model-missing",
+      "transcription-secret-missing",
+      "transcription-authentication-failed",
+      "transcription-rate-limited",
+      "transcription-provider-rejected",
+      "transcription-provider-unavailable",
+      "transcription-response-invalid",
+      "transcription-result-empty",
+      "transcription-result-invalid"
+    ]);
 
     // This processor is bundled source, never user/skill content. It has no network or file access.
     const VOICE_CAPTURE_PROCESSOR = `
@@ -2024,9 +2041,10 @@
 
     function encodeVoiceWav(chunks, sampleRate) {
       const count = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      if (!count || !Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000 ||
+      if (!count) throw voiceError("voice-recording-empty", "The microphone did not capture audio samples.");
+      if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000 ||
           count * 2 + 44 > VOICE_MAX_BYTES || count > sampleRate * 300) {
-        throw voiceError("voice-recording-invalid", "The recording is empty or exceeds the voice input limit.");
+        throw voiceError("voice-recording-invalid", "The recording format or size is outside the voice input limits.");
       }
       const buffer = new ArrayBuffer(44 + count * 2);
       const view = new DataView(buffer);
@@ -2041,6 +2059,56 @@
       let offset = 44;
       for (const chunk of chunks) for (const sample of chunk) { view.setInt16(offset, sample, true); offset += 2; }
       return buffer;
+    }
+
+    function hasVoiceActivity(audio, speechThresholdDbfs) {
+      const headerSize = 44;
+      const wav = new DataView(audio);
+      const sampleRate = wav.getUint32(24, true);
+      const sampleBytes = wav.byteLength - headerSize;
+      // The desktop encoder emits one fixed-format mono PCM16 data chunk.
+      if (wav.getUint32(4, true) !== wav.byteLength - 8 ||
+          wav.getUint32(12) !== 0x666d7420 || wav.getUint32(16, true) !== 16 || // "fmt "
+          wav.getUint16(20, true) !== 1 || wav.getUint16(22, true) !== 1 ||
+          sampleRate < 8000 || sampleRate > 96000 || wav.getUint32(28, true) !== sampleRate * 2 ||
+          wav.getUint16(32, true) !== 2 || wav.getUint16(34, true) !== 16 ||
+          wav.getUint32(36) !== 0x64617461 || wav.getUint32(40, true) !== sampleBytes || sampleBytes % 2 !== 0) { // "data"
+        throw voiceError("voice-recording-invalid", "The recording does not match the microphone WAV format.");
+      }
+
+      const frameSamples = Math.round(sampleRate * 0.02);
+      const windowSamples = Math.round(sampleRate * 0.2);
+      const minimumSamples = Math.ceil(sampleRate * 0.1);
+      const thresholdDbfs = normalizeVoiceSpeechThreshold(speechThresholdDbfs);
+      const minimumPower = 32768 ** 2 * 10 ** (thresholdDbfs / 10);
+      const activeFrames = [];
+      let activeSamples = 0;
+      const sampleCount = sampleBytes / 2;
+      for (let start = 0; start < sampleCount; start += frameSamples) {
+        const end = Math.min(start + frameSamples, sampleCount);
+        const count = end - start;
+        let sum = 0;
+        let sumOfSquares = 0;
+        for (let offset = headerSize + start * 2; offset < headerSize + end * 2; offset += 2) {
+          const sample = wav.getInt16(offset, true);
+          sum += sample;
+          sumOfSquares += sample * sample;
+        }
+        // Mean-square power after removing the frame's DC offset.
+        const power = sumOfSquares / count - (sum / count) ** 2;
+        if (power < minimumPower) continue;
+
+        const windowStart = end - windowSamples;
+        while (activeFrames.length && activeFrames[0].end <= windowStart) {
+          const expired = activeFrames.shift();
+          activeSamples -= expired.end - expired.start;
+        }
+        activeFrames.push({ start, end });
+        activeSamples += count;
+        const outsideWindow = Math.max(0, windowStart - activeFrames[0].start);
+        if (activeSamples - outsideWindow >= minimumSamples) return true;
+      }
+      return false;
     }
 
     async function createDesktopVoiceCapture({ signal, onError }, host = globalThis) {
@@ -2139,8 +2207,9 @@
         this.state = { phase: "idle", error: "" };
       }
 
-      publish(phase, error = "") {
+      publish(phase, error = "", failure) {
         this.state = { phase, error };
+        if (failure) this.state.failure = failure;
         this.onChange(this.state);
       }
 
@@ -2176,11 +2245,11 @@
         this.publish("idle");
       }
 
-      fail(operation, message) {
+      fail(operation, message, failure) {
         if (this.operation !== operation) return;
         this.operation = null;
         this.release(operation);
-        this.publish("error", message);
+        this.publish("error", message, failure);
       }
 
       async start() {
@@ -2218,31 +2287,58 @@
         clearTimeout(operation.timer);
         const timeoutMs = Number.isFinite(operation.configuration.timeoutMs)
           ? Math.max(5000, Math.min(300000, operation.configuration.timeoutMs)) : this.operationTimeoutMs;
-        operation.timer = setTimeout(() => this.fail(operation, "Voice transcription timed out. The recording was discarded."), timeoutMs);
+        let stage = "capture-finalization";
+        operation.timer = setTimeout(() => this.fail(operation, "Voice transcription timed out. The recording was discarded.",
+          { stage, code: "timeout" }), timeoutMs);
         this.publish("transcribing");
         try {
           this.validate(operation);
           let audio = await raceWithAbort(operation.capture.stop(), operation.controller.signal);
           this.validate(operation);
+          stage = "recording-validation";
           inspectAudioBuffer(audio, { name: "voice-input.wav", extension: "wav", mimeType: "audio/wav", size: audio.byteLength },
             { maxBytes: VOICE_MAX_BYTES, maxDurationMs: VOICE_RECORDING_LIMIT_MS });
+          if (!hasVoiceActivity(audio, operation.configuration.speechThresholdDbfs)) {
+            this.operation = null;
+            this.release(operation);
+            this.publish("no-speech");
+            return null;
+          }
+          stage = "provider-preparation";
           const response = await raceWithAbort(Promise.resolve().then(() => {
             this.validate(operation);
             return this.transcribe({ audio, model: operation.configuration.model, signal: operation.controller.signal,
-              beforeUpload: () => this.validate(operation) }, operation.configuration);
+              beforeUpload: () => {
+                this.validate(operation);
+                stage = "provider-request";
+              } }, operation.configuration);
           }), operation.controller.signal);
           audio = null;
           this.validate(operation);
-          if (typeof response?.text !== "string" || response.text.length > DEFAULT_MAX_TRANSCRIPT_CHARS * 2) throw new Error("Invalid transcript");
+          stage = "transcript-validation";
+          if (typeof response?.text !== "string" || response.text.length > DEFAULT_MAX_TRANSCRIPT_CHARS * 2) {
+            throw voiceError("transcription-result-invalid", "The transcription result is invalid.");
+          }
           const normalized = normalizeTranscript(response.text, DEFAULT_MAX_TRANSCRIPT_CHARS);
-          if (!normalized.text || normalized.truncated) throw new Error("Invalid transcript");
+          if (!normalized.text) throw voiceError("transcription-result-empty", "The transcription result is empty.");
+          if (normalized.truncated) throw voiceError("transcription-result-invalid", "The transcription result exceeds the voice input limit.");
           const result = { text: normalized.text, binding: operation.configuration.binding, revision: this.resultRevision };
           this.operation = null;
           this.release(operation);
           this.publish("idle");
           return result;
-        } catch {
-          this.fail(operation, "Voice transcription failed or returned no usable speech. The draft was kept unchanged.");
+        } catch (error) {
+          const failure = { stage, code: "failed" };
+          let message = "Voice transcription failed or returned no usable speech. The draft was kept unchanged.";
+          if (error instanceof AudioTranscriptionError && VOICE_STOP_ERROR_CODES.has(error.code)) {
+            failure.code = error.code;
+            const { httpStatus } = error;
+            if (stage === "provider-request" && Number.isInteger(httpStatus) && httpStatus >= 300 && httpStatus <= 599) {
+              failure.httpStatus = httpStatus;
+              message = `Voice transcription failed (HTTP ${httpStatus}). The draft was kept unchanged.`;
+            }
+          }
+          this.fail(operation, message, failure);
           return null;
         }
       }
@@ -3823,7 +3919,7 @@
           }),
           onChange: (state) => {
             if (state.phase === "error") {
-              void this.logDiagnostic("voice.input.failed", { status: "error", message: state.error }).catch(() => {});
+              void this.logDiagnostic("voice.input.failed", { status: "error", message: state.error, ...state.failure }).catch(() => {});
             }
             void this.notifyStateChanged({ type: "voice-input" });
           }
@@ -4017,9 +4113,10 @@
           available,
           unavailableReason: enabled && !available ? configuration.error || "Voice input is unavailable in this chat." : "",
           timeoutMs: voiceInput.timeoutSeconds * 1000,
+          speechThresholdDbfs: voiceInput.speechThresholdDbfs,
           binding: JSON.stringify([this.currentSessionId, this.voiceSessionRevision, enabled,
             configuration.providerId, configuration.model, configuration.endpoint, configuration.authenticationPath,
-            providerBinding, voiceInput.timeoutSeconds])
+            providerBinding, voiceInput.timeoutSeconds, voiceInput.speechThresholdDbfs])
         };
       }
 
@@ -7385,7 +7482,8 @@
       }
 
       async retryEmptyProviderResponseIfNeeded(response, options) {
-        if (!isEmptyProviderResponse(response) || options?.activeRequest?.streamingRequested === true) {
+        if (!isEmptyProviderResponse(response) || options?.activeRequest?.streamingRequested === true
+          || options?.provider?.allowResponseRetries === false) {
           return {
             response,
             cancelled: false,
@@ -7504,8 +7602,11 @@
           !providerResponseHasMcpToolCall(response) &&
           !isConciseNoteChangeClarification(response)
         );
-        if (activeRequest?.streamingRequested === true && missingRequiredToolCall) {
-          void this.logDiagnostic("provider.note_change_tool.streaming_contract_failed", {
+        if (missingRequiredToolCall && (activeRequest?.streamingRequested === true || provider?.allowResponseRetries === false)) {
+          const diagnostic = activeRequest?.streamingRequested === true
+            ? "provider.note_change_tool.streaming_contract_failed"
+            : "provider.note_change_tool.buffered_contract_failed";
+          void this.logDiagnostic(diagnostic, {
             ...createMcpToolChainDiagnostic(chainState),
             phase,
             model: safeDiagnosticLabel(model),
@@ -11230,11 +11331,13 @@
           await this.flushProviderProgressRender(activeRequest);
         }
         if (
-          activeRequest?.streamingRequested === true &&
+          (activeRequest?.streamingRequested === true || provider?.allowResponseRetries === false) &&
           isEmptyProviderResponse(response) &&
           !didProviderAttemptUnavailableToolCall(response)
         ) {
-          throw new Error("The provider returned an empty streaming response.");
+          throw new Error(activeRequest?.streamingRequested === true
+            ? "The provider returned an empty streaming response."
+            : "The provider returned an empty response.");
         }
         return {
           blocked: false,
@@ -14680,7 +14783,7 @@
   },
   "src/constants.js": function(module, exports, require) {
     const VIEW_TYPE_CODRIVER = "codriver-chat-view";
-    const CODRIVER_PLUGIN_VERSION = "0.6.1";
+    const CODRIVER_PLUGIN_VERSION = "0.6.2";
     const DEFAULT_OPENAI_COMPATIBLE_BASE_URL = "http://localhost:1234/v1";
     const DEFAULT_GEMINI_BASE_ENDPOINT = "https://generativelanguage.googleapis.com";
     const DEFAULT_GEMINI_API_VERSION = "v1beta";
@@ -15586,7 +15689,7 @@
   "src/generated/releaseNotes.js": function(module, exports, require) {
     // Generated from current public release notes by build.mjs.
     module.exports = {
-      "version": "0.6.1",
+      "version": "0.6.2",
       "blocks": [
         {
           "type": "h3",
@@ -15594,7 +15697,11 @@
         },
         {
           "type": "li",
-          "text": "Added optional Detailed file logging for troubleshooting, including tool arguments, results and final assistant answers. Enabling it requires confirmation because logs may contain sensitive data."
+          "text": "Updated searchable model pickers and aligned model controls in provider settings."
+        },
+        {
+          "type": "li",
+          "text": "Added a speech sensitivity slider for desktop Voice input."
         },
         {
           "type": "h3",
@@ -15602,19 +15709,11 @@
         },
         {
           "type": "li",
-          "text": "Audio transcription and Voice input now respect disabled models in provider settings."
+          "text": "Voice input checks the recording level before uploading and skips transcription when the signal is too quiet."
         },
         {
           "type": "li",
-          "text": "Fixed long commands losing instructions during tool continuations. Commands above 12000 characters now offer Cancel request or Continue with the full context."
-        },
-        {
-          "type": "li",
-          "text": "Fixed the reference time changing during tool continuations."
-        },
-        {
-          "type": "li",
-          "text": "Improved read-context retention for supported read-only Direct Plugin API calls, including calls that return errors."
+          "text": "Enable CORS supports streamed responses on desktop."
         }
       ]
     };
@@ -15892,7 +15991,8 @@
         temperature: "",
         topP: "",
         topK: "",
-        reasoningEffort: ""
+        reasoningEffort: "",
+        enableCors: false
       };
     }
 
@@ -15930,6 +16030,12 @@
         normalizedProvider.temperature = normalizeOptionalRangedNumberText(provider?.temperature, 0, 2);
         normalizedProvider.topP = normalizeOptionalRangedNumberText(provider?.topP, 0, 1);
         normalizedProvider.topK = normalizeOptionalIntegerText(provider?.topK);
+      }
+
+      if (providerType === OPENAI_PROVIDER_TYPE) {
+        normalizedProvider.enableCors = provider?.enableCors === true;
+      } else {
+        delete normalizedProvider.enableCors;
       }
 
       if (providerType === ANTHROPIC_PROVIDER_TYPE) {
@@ -16494,7 +16600,9 @@
           "audioTranscription"
         );
         const needsVoiceInputMigration = Boolean(savedSettings) &&
-          (!Object.hasOwn(savedSettings, "voiceInput") || Object.hasOwn(savedSettings.audioTranscription ?? {}, "voiceInputEnabled"));
+          (!Object.hasOwn(savedSettings, "voiceInput") ||
+            Object.hasOwn(savedSettings.voiceInput ?? {}, "speechSensitivity") ||
+            Object.hasOwn(savedSettings.audioTranscription ?? {}, "voiceInputEnabled"));
         const needsVaultAudioConsentMigration = Boolean(savedSettings) &&
           savedSettings.codriverVaultToolSettings?.[CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME]?.autoConsentVersion !== VAULT_AUDIO_AUTO_CONSENT_VERSION;
         const needsTextDocumentConsentMigration = Boolean(savedSettings) && TEXT_DOCUMENT_MUTATION_TOOLS.some((name) =>
@@ -21178,6 +21286,99 @@
     };
 
   },
+  "src/providers/DesktopStreamingTransport.js": function(module, exports, require) {
+    function createDesktopChatUrl(baseUrl) {
+      const url = new URL(baseUrl);
+      if (!/^https?:\/\//i.test(baseUrl) || !url.hostname || url.username || url.password || url.hash) {
+        throw new Error("Use a complete HTTP(S) provider endpoint without credentials or a fragment.");
+      }
+      url.pathname = `${url.pathname.replace(/\/+$/, "")}/chat/completions`;
+      return url;
+    }
+
+    function openDesktopStreamingResponse(url, { method, headers, body, signal }) {
+      let request;
+      let toWeb;
+      try {
+        const transport = url.protocol === "https:" ? require("https") : require("http");
+        request = transport.request;
+        toWeb = require("stream").Readable.toWeb;
+      } catch {
+        throw new Error("Enable CORS streaming requires Node HTTP support in Obsidian Desktop.");
+      }
+      if (typeof request !== "function" || typeof toWeb !== "function") {
+        throw new Error("Enable CORS streaming requires Node HTTP support in Obsidian Desktop.");
+      }
+
+      signal?.throwIfAborted();
+      return new Promise((resolve, reject) => {
+        const failConnection = () => reject(signal?.aborted
+          ? signal.reason
+          : new Error("Could not connect to the provider using Enable CORS. Check the endpoint and network."));
+        try {
+          const outgoing = request(url.href, {
+            method,
+            ...(url.protocol === "https:" ? { rejectUnauthorized: true } : {}),
+            headers: {
+              ...headers,
+              "Accept-Encoding": "identity",
+              "Content-Length": new TextEncoder().encode(body).byteLength
+            },
+            signal
+          }, (incoming) => {
+            const status = incoming.statusCode;
+            if (status < 200 || status >= 300) {
+              incoming.destroy();
+              resolve({ status });
+              return;
+            }
+
+            const encoding = String(incoming.headers["content-encoding"] ?? "").trim().toLowerCase();
+            if (encoding && encoding !== "identity") {
+              incoming.destroy();
+              reject(new Error("The provider sent a compressed stream. Enable CORS on desktop requires an uncompressed event stream."));
+              return;
+            }
+            try {
+              const stream = toWeb(incoming, {
+                strategy: { highWaterMark: incoming.readableHighWaterMark, size: (chunk) => chunk.byteLength }
+              });
+              resolve({
+                status,
+                body: {
+                  getReader() {
+                    const reader = stream.getReader();
+                    return {
+                      async read() {
+                        try {
+                          return await reader.read();
+                        } catch {
+                          if (signal?.aborted) throw signal.reason;
+                          throw new Error("The provider connection closed before the stream completed.");
+                        }
+                      },
+                      releaseLock: () => reader.releaseLock()
+                    };
+                  }
+                },
+                close: () => incoming.destroy()
+              });
+            } catch {
+              incoming.destroy();
+              reject(new Error("Obsidian Desktop could not open the provider event stream."));
+            }
+          });
+          outgoing.on("error", failConnection);
+          outgoing.end(body);
+        } catch {
+          failConnection();
+        }
+      });
+    }
+
+    module.exports = { createDesktopChatUrl, openDesktopStreamingResponse };
+
+  },
   "src/providers/ProviderRegistry.js": function(module, exports, require) {
     class ProviderRegistry {
       constructor() {
@@ -21330,6 +21531,7 @@
         } catch {
           // The stream may already have released its reader after cancellation.
         }
+        response.close?.();
       }
 
       if (eventCount === 0) {
@@ -25599,6 +25801,7 @@
   "src/providers/openai-compatible/OpenAiCompatibleClient.js": function(module, exports, require) {
     const { requestUrl } = require("obsidian");
     const { DEFAULT_OPENAI_COMPATIBLE_BASE_URL } = require("../../constants");
+    const { createDesktopChatUrl, openDesktopStreamingResponse } = require("../DesktopStreamingTransport");
     const {
       consumeServerSentEvents,
       isSuccessfulResponse,
@@ -25631,6 +25834,8 @@
         this.requestOptions = normalizeRequestOptions(options.requestOptions);
         this.diagnostics = options.diagnostics ?? null;
         this.fetch = options.fetch;
+        this.enableCors = options.enableCors === true;
+        this.desktopChatBaseUrl = this.enableCors && options.desktopCorsStreaming === true ? String(baseUrl ?? "") : null;
       }
 
       async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
@@ -25697,7 +25902,7 @@
           body.parallel_tool_calls = false;
         }
 
-        if (typeof options.onProgress === "function") {
+        if ((!this.enableCors || this.desktopChatBaseUrl !== null) && typeof options.onProgress === "function") {
           return await this.createStreamingChatCompletion(model, body, nativeTools, signal, options.onProgress, options.onDiagnosticSecret);
         }
 
@@ -25710,21 +25915,18 @@
           body: JSON.stringify(body)
         };
 
-        if (signal) {
-          request.signal = signal;
-        }
-
         const response = await this.sendRequest(request, {
           event: "provider.openai.chat.request.failed",
           endpoint: summarizeEndpoint(this.baseUrl),
           model
-        });
+        }, signal);
         const jsonRead = readResponseJson(response);
+        const responseStatus = Number.isInteger(response?.status) ? response.status : null;
 
         await this.logDiagnostic("provider.openai.chat.response.received", {
           endpoint: summarizeEndpoint(this.baseUrl),
           model,
-          response: createChatResponseSummary(response, jsonRead)
+          response: this.enableCors ? { status: responseStatus, hasJson: jsonRead.hasJson } : createChatResponseSummary(response, jsonRead)
         });
 
         if (response.status < 200 || response.status >= 300) {
@@ -25732,8 +25934,9 @@
             status: "failed",
             endpoint: summarizeEndpoint(this.baseUrl),
             model,
-            response: createProviderHttpErrorSummary(response, jsonRead)
+            response: this.enableCors ? { status: responseStatus } : createProviderHttpErrorSummary(response, jsonRead)
           });
+          if (this.enableCors) throw new Error(`Chat completion request failed with status ${responseStatus ?? "unknown"}.`);
           throw new Error(createProviderHttpErrorMessage("Chat completion request", response, jsonRead));
         }
 
@@ -25743,7 +25946,7 @@
             status: "failed",
             endpoint: summarizeEndpoint(this.baseUrl),
             model,
-            response: createRejectedChatResponseSummary(response, jsonRead)
+            response: this.enableCors ? { status: responseStatus, hasJson: jsonRead.hasJson } : createRejectedChatResponseSummary(response, jsonRead)
           });
           throw new Error(`The provider responded, but not with an OpenAI-compatible chat response. ${endpointGuidance(this.baseUrl)}`);
         }
@@ -25772,6 +25975,7 @@
 
         const metadata = createOpenAiResponseMetadata(data, firstChoice);
         const providerContext = createOpenAiProviderContext(body.messages, message, message.tool_calls, toolCalls);
+        signal?.throwIfAborted();
         return {
           content,
           toolCalls,
@@ -25784,8 +25988,9 @@
       }
 
       async createStreamingChatCompletion(model, body, nativeTools, signal, onProgress, onDiagnosticSecret) {
+        const desktopUrl = this.desktopChatBaseUrl === null ? null : createDesktopChatUrl(this.desktopChatBaseUrl);
         const request = {
-          url: `${this.baseUrl}/chat/completions`,
+          url: desktopUrl?.href ?? `${this.baseUrl}/chat/completions`,
           method: "POST",
           headers: await this.createHeaders({
             Accept: "text/event-stream",
@@ -25799,17 +26004,34 @@
         };
         let response;
         try {
-          response = await openStreamingResponse(request, { fetch: this.fetch });
+          response = desktopUrl
+            ? await openDesktopStreamingResponse(desktopUrl, request)
+            : await openStreamingResponse(request, { fetch: this.fetch });
         } catch (error) {
+          const aborted = signal?.aborted === true || error?.name === "AbortError";
+          const connectionFailed = !aborted && !desktopUrl && error instanceof TypeError;
           await this.logDiagnostic("provider.openai.chat.request.failed", {
             endpoint: summarizeEndpoint(this.baseUrl),
             model,
-            error: createProviderRequestErrorSummary(error)
+            reason: aborted ? "cancelled" : connectionFailed ? "stream-connection-failed" : "stream-unavailable"
           });
+          if (connectionFailed) {
+            throw new Error("Could not connect to the provider for streaming. Check the endpoint and network. If the provider blocks browser requests due to CORS, turn on Enable CORS in the provider settings.");
+          }
           throw error;
         }
 
         if (!isSuccessfulResponse(response)) {
+          if (desktopUrl) {
+            const status = response.status;
+            await this.logDiagnostic("provider.openai.chat.response.failed", {
+              status: "failed", endpoint: summarizeEndpoint(this.baseUrl), model, response: { status }
+            });
+            if (status >= 300 && status < 400) {
+              throw new Error(`Chat completion request returned a redirect (${status}). Use the final provider endpoint with Enable CORS.`);
+            }
+            throw new Error(`Chat completion request failed with status ${status}.`);
+          }
           const snapshot = await readFetchResponse(response);
           const jsonRead = createFetchJsonRead(snapshot);
           await this.logDiagnostic("provider.openai.chat.response.failed", {
@@ -25834,6 +26056,7 @@
             throw new Error("The provider returned malformed JSON in the Chat Completions event stream.");
           }
           if (data?.error) {
+            if (desktopUrl) throw new Error("The provider reported an error in the Chat Completions stream.");
             const snapshot = {
               status: Number.isInteger(response.status) ? response.status : 200,
               headers: {},
@@ -25880,6 +26103,7 @@
         const toolCalls = normalizeOpenAiToolCalls(rawToolCalls, nativeTools);
         const assistantMessage = createStreamingOpenAiAssistantMessage(state, rawToolCalls);
         const providerContext = createOpenAiProviderContext(body.messages, assistantMessage, rawToolCalls, toolCalls);
+        if (desktopUrl) signal?.throwIfAborted();
         return {
           content: state.content,
           toolCalls,
@@ -25912,19 +26136,36 @@
         await this.diagnostics.debug(event, detail);
       }
 
-      async sendRequest(request, failureDiagnostic) {
+      async sendRequest(request, failureDiagnostic, signal) {
+        let onAbort;
         try {
-          return await requestUrl({
-            ...request,
-            throw: false
+          signal?.throwIfAborted();
+          if (!signal) return await requestUrl({ ...request, throw: false });
+
+          // Obsidian buffers the response and cannot abort an in-flight requestUrl call.
+          const cancelled = new Promise((_, reject) => {
+            onAbort = () => reject(signal.reason);
+            signal.addEventListener("abort", onAbort, { once: true });
           });
+          const response = await Promise.race([cancelled, requestUrl({ ...request, throw: false })]);
+          signal.throwIfAborted();
+          return response;
         } catch (error) {
+          if (signal?.aborted) throw signal.reason;
+          const status = readErrorStatus(error);
           await this.logDiagnostic(failureDiagnostic.event, {
             endpoint: failureDiagnostic.endpoint,
             model: failureDiagnostic.model,
-            error: createProviderRequestErrorSummary(error)
+            error: this.enableCors ? { status } : createProviderRequestErrorSummary(error)
           });
+          if (this.enableCors) {
+            throw new Error(status === null
+              ? "Could not connect to the provider. Check the endpoint and network."
+              : `Chat completion request failed with status ${status}.`);
+          }
           throw error;
+        } finally {
+          if (onAbort) signal.removeEventListener("abort", onAbort);
         }
       }
     }
@@ -26855,6 +27096,7 @@
 
   },
   "src/providers/openai-compatible/OpenAiCompatibleProvider.js": function(module, exports, require) {
+    const { Platform } = require("obsidian");
     const { OPENAI_COMPATIBLE_PROVIDER_TYPE } = require("../../constants");
     const { OpenAiCompatibleClient } = require("./OpenAiCompatibleClient");
     const { OpenAiCompatibleTranscriptionAdapter } = require("./OpenAiCompatibleTranscriptionAdapter");
@@ -26864,7 +27106,10 @@
         this.id = settings.id;
         this.name = settings.name;
         this.type = OPENAI_COMPATIBLE_PROVIDER_TYPE;
-        this.supportsStreaming = true;
+        const enableCors = settings.enableCors === true;
+        const desktopCorsStreaming = enableCors && Platform?.isDesktopApp === true;
+        this.supportsStreaming = !enableCors || desktopCorsStreaming;
+        this.allowResponseRetries = !enableCors;
         this.defaultModel = settings.model;
         this.models = Array.isArray(settings.models) ? settings.models : [];
         this.hiddenModels = Array.isArray(settings.hiddenModels) ? settings.hiddenModels : [];
@@ -26879,11 +27124,15 @@
           temperature: settings.temperature,
           topP: settings.topP,
           topK: settings.topK,
-          reasoningEffort: settings.reasoningEffort
+          reasoningEffort: settings.reasoningEffort,
+          enableCors,
+          desktopCorsStreaming
         });
         this.client = new OpenAiCompatibleClient(settings.endpoint, () => this.resolveApiKey(), {
           diagnostics: this.diagnostics,
           fetch: options.fetch,
+          enableCors,
+          desktopCorsStreaming,
           requestOptions: {
             temperature: parseOptionalNumber(settings.temperature),
             top_p: parseOptionalNumber(settings.topP),
@@ -27047,7 +27296,9 @@
           );
         }
         if (response.status < 200 || response.status >= 300) {
-          throw createHttpError(response.status);
+          const error = createHttpError(response.status);
+          error.httpStatus = response.status;
+          throw error;
         }
 
         const data = readJsonResponse(response);
@@ -27294,12 +27545,22 @@
       };
     }
 
+    const VOICE_INPUT_SPEECH_THRESHOLD_DBFS = Object.freeze({ min: -70, max: -20, default: -55 });
+    const LEGACY_VOICE_INPUT_SENSITIVITY = Object.freeze({ low: -50, normal: -55, high: -60 });
+
     const DEFAULT_VOICE_INPUT_SETTINGS = Object.freeze({
       enabled: false,
       providerId: "",
       modelId: "",
-      timeoutSeconds: 15
+      timeoutSeconds: 15,
+      speechThresholdDbfs: VOICE_INPUT_SPEECH_THRESHOLD_DBFS.default
     });
+
+    function normalizeVoiceSpeechThreshold(value) {
+      const { min, max, default: defaultThreshold } = VOICE_INPUT_SPEECH_THRESHOLD_DBFS;
+      return typeof value === "number" && Number.isFinite(value)
+        ? Math.max(min, Math.min(max, Math.round(value))) : defaultThreshold;
+    }
 
     function normalizeVoiceInputSettings(value, legacyAudio = null) {
       // Preserve only the exact previously enabled voice destination during the split.
@@ -27307,12 +27568,18 @@
         ? { enabled: true, providerId: legacyAudio.providerId, modelId: legacyAudio.modelId }
         : value;
       const timeout = source?.timeoutSeconds;
+      const legacySensitivity = source?.speechSensitivity;
+      let threshold = source?.speechThresholdDbfs;
+      if (threshold === undefined && typeof legacySensitivity === "string" && Object.hasOwn(LEGACY_VOICE_INPUT_SENSITIVITY, legacySensitivity)) {
+        threshold = LEGACY_VOICE_INPUT_SENSITIVITY[legacySensitivity];
+      }
       return {
         enabled: source?.enabled === true,
         providerId: normalizeIdentity(source?.providerId),
         modelId: normalizeIdentity(source?.modelId),
         timeoutSeconds: typeof timeout === "number" && Number.isFinite(timeout)
-          ? Math.max(5, Math.min(300, Math.floor(timeout))) : DEFAULT_VOICE_INPUT_SETTINGS.timeoutSeconds
+          ? Math.max(5, Math.min(300, Math.floor(timeout))) : DEFAULT_VOICE_INPUT_SETTINGS.timeoutSeconds,
+        speechThresholdDbfs: normalizeVoiceSpeechThreshold(threshold)
       };
     }
 
@@ -27442,6 +27709,8 @@
       AUDIO_TRANSCRIPTION_TOOLTIP,
       DEFAULT_AUDIO_TRANSCRIPTION_SETTINGS,
       DEFAULT_VOICE_INPUT_SETTINGS,
+      VOICE_INPUT_SPEECH_THRESHOLD_DBFS,
+      normalizeVoiceSpeechThreshold,
       normalizeVoiceInputSettings,
       resolveVoiceInputSelection,
       decodeAudioTranscriptionSelection,
@@ -27479,6 +27748,7 @@
     } = require("../mcp/CodriverVaultMcpServer");
     const {
       AUDIO_TRANSCRIPTION_TOOLTIP,
+      VOICE_INPUT_SPEECH_THRESHOLD_DBFS,
       decodeAudioTranscriptionSelection,
       encodeAudioTranscriptionSelection,
       getAudioTranscriptionModelChoices,
@@ -28530,11 +28800,7 @@
         const select = setting.controlEl.createEl("button", {
           cls: "codriver-audio-transcription-select codriver-model-select-trigger",
           text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId : `Unavailable: ${current.modelId}`) : "Select model",
-          attr: {
-            type: "button",
-            "aria-label": "Select audio transcription model",
-            title: AUDIO_TRANSCRIPTION_TOOLTIP
-          }
+          attr: { type: "button", "aria-label": "Select audio transcription model" }
         });
         if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
           !isProviderModelDisabled(this.plugin.settings.providers?.find((provider) => provider.id === current.providerId), current.modelId)) {
@@ -28542,7 +28808,7 @@
         }
         select.disabled = !current.enabled && !this.pendingAudioTranscriptionEnable;
         bindModelPicker(this, select, {
-          label: "Select audio transcription model", groups, selectedValue,
+          label: "Select audio transcription model", groups, selectedValue, compact: true, preferAbove: true,
           onChoose: async (value) => {
             const selection = decodeAudioTranscriptionSelection(value);
             if (!selection.providerId || !selection.modelId) {
@@ -28566,7 +28832,7 @@
         if (current.enabled && !resolution.ok) {
           setting.settingEl.classList.add("is-invalid");
           select.setAttribute("aria-invalid", "true");
-          select.title = `${AUDIO_TRANSCRIPTION_TOOLTIP} ${resolution.message}`;
+          select.setAttribute("aria-description", resolution.message);
         }
         if (this.pendingAudioTranscriptionEnable) {
           setTimeout(() => select.focus(), 0);
@@ -28612,7 +28878,7 @@
           cls: "codriver-audio-transcription-select codriver-model-select-trigger",
           text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId
             : `Unavailable: ${current.modelId}`) : "Select model",
-          attr: { type: "button", "aria-label": "Select voice input provider and model", title: "Uses this provider and model only for microphone input." }
+          attr: { type: "button", "aria-label": "Select voice input provider and model" }
         });
         select.disabled = Platform.isMobile || (!current.enabled && !this.pendingVoiceInputEnable);
         if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
@@ -28620,7 +28886,7 @@
           groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
         }
         bindModelPicker(this, select, {
-          label: "Select voice input provider and model", groups, selectedValue,
+          label: "Select voice input provider and model", groups, selectedValue, compact: true, preferAbove: true,
           onChoose: async (value) => {
             const selection = decodeAudioTranscriptionSelection(value);
             if (!selection.providerId || !selection.modelId) return;
@@ -28635,7 +28901,6 @@
         if (current.enabled && unavailableReason) {
           setting.settingEl.addClass("is-invalid");
           select.setAttribute("aria-invalid", "true");
-          select.title = unavailableReason;
           container.createDiv({ cls: "codriver-voice-unavailable",
             text: unavailableReason.replace(" Update it in Settings > Providers.", ""), attr: { role: "status" } });
         }
@@ -28672,6 +28937,36 @@
           const result = await this.plugin.updateVoiceInputSettings({ timeoutSeconds: seconds });
           if (!result.ok) { input.value = String(current.timeoutSeconds); new Notice(result.message); }
           else current.timeoutSeconds = seconds;
+        });
+        const sensitivity = new Setting(options).setName("Speech sensitivity");
+        sensitivity.settingEl.setAttribute("title", "Raise sensitivity for quiet speech. Lower it if background noise triggers transcription.");
+        const { min, max } = VOICE_INPUT_SPEECH_THRESHOLD_DBFS;
+        // Higher slider positions lower the signal threshold and increase sensitivity.
+        const slider = sensitivity.controlEl.createEl("input", {
+          cls: "codriver-voice-input-sensitivity",
+          attr: { type: "range", min: String(-max), max: String(-min), step: "1", "aria-label": "Speech sensitivity" }
+        });
+        const thresholdLabel = sensitivity.controlEl.createSpan({ cls: "codriver-voice-input-threshold", attr: { "aria-hidden": "true" } });
+        const showThreshold = (threshold) => {
+          const text = `${threshold} dBFS`;
+          thresholdLabel.textContent = text;
+          slider.setAttribute("aria-valuetext", text);
+        };
+        slider.value = String(-current.speechThresholdDbfs);
+        slider.disabled = !current.enabled && !this.pendingVoiceInputEnable;
+        showThreshold(current.speechThresholdDbfs);
+        slider.addEventListener("input", () => showThreshold(-Number(slider.value)));
+        slider.addEventListener("change", async () => {
+          const threshold = -Number(slider.value);
+          const result = await this.plugin.updateVoiceInputSettings({ speechThresholdDbfs: threshold });
+          if (result.ok) current.speechThresholdDbfs = threshold;
+          else {
+            if (-Number(slider.value) === threshold) {
+              slider.value = String(-current.speechThresholdDbfs);
+              showThreshold(current.speechThresholdDbfs);
+            }
+            new Notice(result.message);
+          }
         });
       }
 
@@ -29643,6 +29938,16 @@
           endpointSetting.setDesc("Choose Custom to enter your regional workspace base URL from the Alibaba Cloud console.");
         }
 
+        if (this.draft.type === OPENAI_PROVIDER_TYPE) {
+          const corsSetting = new Setting(contentEl).setName("Enable CORS");
+          corsSetting.addToggle((toggle) => {
+            toggle.toggleEl.setAttribute("aria-label", "Enable CORS");
+            toggle.setValue(this.draft.enableCors === true).onChange((value) => {
+              this.draft.enableCors = value;
+            });
+          });
+        }
+
         if (this.draft.type === GEMINI_PROVIDER_TYPE) {
           new Setting(contentEl)
             .setName("API version")
@@ -29688,17 +29993,49 @@
 
         const modelSetting = new Setting(contentEl).setName("Default model");
         modelSetting.settingEl.classList.add("codriver-provider-model-setting");
+        modelSetting.addButton((button) => {
+          button
+            .setButtonText(this.draft.type === OPENAI_PROVIDER_TYPE ? "Load models" : "Test connection")
+            .onClick(async () => {
+              if (this.testing || this.saving) return;
+              if (!this.validateProviderEndpoint()) return;
+              this.testing = true;
+              this.setBusyControls(true);
+              let result;
+              try { result = await this.plugin.testProviderDraftConnection(this.credentialDraft()); }
+              catch { result = { ok: false, models: [], message: "Unable to connect to the provider. Check the endpoint, API key and account access." }; }
+              finally { this.testing = false; this.restoreBusyControls(); }
+              if (!this.draft) return;
+              this.modelCatalogUnavailable = !result.ok || !result.models?.length;
+              if (result.ok) {
+                this.draft.models = result.models;
+                if (this.manualModelEntered && this.draft.model.trim()) {
+                  this.draft.models = this.getDraftModels();
+                }
+                this.draft.model = this.draft.models.includes(this.draft.model)
+                  ? this.draft.model
+                  : this.draft.models[0] ?? "";
+              }
+              button.setDisabled(false);
+              const message = this.draft.type === OPENAI_PROVIDER_TYPE
+                ? result.ok ? result.models.length ? "Model list loaded. Chat requests have not been tested."
+                  : "No models returned. You can enter a model ID manually."
+                  : `${result.message} You can enter a model ID manually.`
+                : result.message;
+              this.render(message, result.ok);
+            });
+        });
         const models = this.getDraftModels();
         const selectedValue = models.includes(this.draft.model) ? this.draft.model : models[0] ?? "";
         let modelIdInput = null;
         const modelButton = modelSetting.controlEl.createEl("button", {
           cls: "codriver-model-select-trigger",
           text: selectedValue || "Load models first",
-          attr: { type: "button", "aria-label": "Select default model", title: selectedValue || "Load models first" }
+          attr: { type: "button", "aria-label": "Select default model" }
         });
         modelButton.disabled = models.length === 0;
         const pickerOptions = {
-          label: "Select default model", selectedValue,
+          label: "Select default model", selectedValue, compact: true,
           groups: [{ label: "", models: models.map((model) => ({ model, label: model, value: model })) }],
           onChoose: (value) => {
             this.draft.model = value;
@@ -29708,43 +30045,10 @@
             this.manualModelEntered = false;
             if (modelIdInput) modelIdInput.value = value;
             modelButton.textContent = value;
-            modelButton.title = value;
             pickerOptions.selectedValue = value;
           }
         };
         bindModelPicker(this, modelButton, pickerOptions);
-        modelSetting.addButton((button) => {
-            button
-              .setButtonText(this.draft.type === OPENAI_PROVIDER_TYPE ? "Load models" : "Test connection")
-              .onClick(async () => {
-                if (this.testing || this.saving) return;
-                if (!this.validateProviderEndpoint()) return;
-                this.testing = true;
-                this.setBusyControls(true);
-                let result;
-                try { result = await this.plugin.testProviderDraftConnection(this.credentialDraft()); }
-                catch { result = { ok: false, models: [], message: "Unable to connect to the provider. Check the endpoint, API key and account access." }; }
-                finally { this.testing = false; this.restoreBusyControls(); }
-                if (!this.draft) return;
-                this.modelCatalogUnavailable = !result.ok || !result.models?.length;
-                if (result.ok) {
-                  this.draft.models = result.models;
-                  if (this.manualModelEntered && this.draft.model.trim()) {
-                    this.draft.models = this.getDraftModels();
-                  }
-                  this.draft.model = this.draft.models.includes(this.draft.model)
-                    ? this.draft.model
-                    : this.draft.models[0] ?? "";
-                }
-                button.setDisabled(false);
-                const message = this.draft.type === OPENAI_PROVIDER_TYPE
-                  ? result.ok ? result.models.length ? "Model list loaded. Chat compatibility depends on the selected model."
-                    : "No models returned. You can enter a model ID manually."
-                    : `${result.message} You can enter a model ID manually.`
-                  : result.message;
-                this.render(message, result.ok);
-              });
-          });
 
         if (this.draft.type === OPENAI_PROVIDER_TYPE) {
           const manualSetting = new Setting(contentEl).setName("Model ID").addText((text) => {
@@ -29758,7 +30062,6 @@
               this.modelPickerPopover?.close();
               const currentModels = this.getDraftModels();
               modelButton.textContent = this.draft.model || (currentModels.length ? "Choose loaded model" : "Load models first");
-              modelButton.title = modelButton.textContent;
               modelButton.disabled = currentModels.length === 0;
               pickerOptions.selectedValue = this.draft.model;
               pickerOptions.groups = [{ label: "", models: currentModels.map((model) => ({ model, label: model, value: model })) }];
@@ -29885,7 +30188,8 @@
         const proposal = getOpenAiCompatiblePresetUpdate(this.draft, id);
         if (!proposal) return;
         const hadValues = Boolean(this.credentialInput || this.draft.apiKeySecretName || this.draft.model
-          || this.draft.models?.length || this.draft.temperature || this.draft.topP || this.draft.topK || this.draft.reasoningEffort);
+          || this.draft.models?.length || this.draft.temperature || this.draft.topP || this.draft.topK
+          || this.draft.reasoningEffort || this.draft.enableCors);
         if (proposal.endpointChanged) {
           this.plugin.discardProviderCredentialDraft?.(this.saveCredentialDraft);
           if (this.saveCredentialDraft) this.saveCredentialDraft.credentialInput = "";
@@ -31150,7 +31454,7 @@
       if (id !== "custom" && genericName) update.name = preset.name;
       if (endpointChanged) {
         Object.assign(update, { endpoint: preset.endpoint, apiKeySecretName: "", model: "", models: [], hiddenModels: [],
-          temperature: "", topP: "", topK: "", reasoningEffort: "" });
+          temperature: "", topP: "", topK: "", reasoningEffort: "", enableCors: false });
       }
       return { update, endpointChanged };
     }
@@ -40855,25 +41159,18 @@
         const selectedModelId = this.chatController.getSelectedModelId();
         const modelPickerButton = modelPicker.createEl("button", {
           cls: "codriver-model-picker-button",
-          attr: {
-            type: "button",
-            "aria-label": "Select model",
-            title: selectedModelId ? `Model: ${selectedModelId}` : "Select model"
-          }
+          attr: { type: "button", "aria-label": "Select model" }
         });
         setIcon(modelPickerButton, "bot");
         this.modelPickerButtonEl = modelPickerButton;
         modelPickerButton.disabled = modelChoices.length === 0;
-        if (modelPickerButton.disabled) modelPickerButton.title = "No visible models";
+        if (modelPickerButton.disabled) modelPickerButton.setAttribute("aria-description", "No visible models");
         modelPicker.createDiv({
           cls: "codriver-selected-model-name",
-          text: selectedModelId || "No model",
-          attr: {
-            title: selectedModelId || "No model selected"
-          }
+          text: selectedModelId || "No model"
         });
         bindModelPicker(this, modelPickerButton, {
-          label: "Select model", preferAbove: true,
+          label: "Select model", compact: true, preferAbove: true,
           selectedValue: encodeModelOptionValue(selectedProviderId, selectedModelId),
           groups: modelChoices.map((provider) => ({
             label: provider.providerName,
@@ -40928,7 +41225,7 @@
           void submitDraft();
         });
         const voiceStatusText = voiceState.error || ({ starting: "Waiting for microphone...", recording: "Recording. Click Stop to transcribe. Escape to cancel.",
-          transcribing: "Transcribing... Escape to cancel." }[voiceState.phase] ?? "");
+          transcribing: "Transcribing... Escape to cancel.", "no-speech": "No speech detected." }[voiceState.phase] ?? "");
         if (voiceStatusText) {
           composer.createDiv({ cls: `codriver-voice-status${voiceState.error ? " codriver-voice-error" : ""}`, text: voiceStatusText,
             attr: { role: "status", "aria-live": "polite", title: voiceStatusText } });
@@ -40949,7 +41246,10 @@
           setIcon(microphone, recording ? "square" : "mic");
           microphone.toggleClass("is-recording", recording);
           microphone.disabled = unavailable || this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
-          microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
+          microphone.addEventListener("mousedown", (event) => {
+            this.rememberVoiceCaret(input);
+            if (event.button === 0 && input.ownerDocument?.activeElement === input) event.preventDefault();
+          });
           microphone.addEventListener("click", () => { if (!unavailable) void this.toggleVoiceInput(); });
         }
       }
@@ -42947,7 +43247,7 @@
         // Keep modal focus containment and stacking ownership intact.
         this.host = this.button.closest(".modal") ?? doc.body;
         this.element = this.host.createDiv({
-          cls: "codriver-model-popover",
+          cls: this.options.compact ? "codriver-model-popover codriver-model-popover-compact" : "codriver-model-popover",
           attr: { id: `${listId}-dialog`, role: "dialog", "aria-label": this.options.label }
         });
         this.button.setAttribute("aria-expanded", "true");
@@ -42957,10 +43257,15 @@
           attr: { id: listId, role: "listbox", "aria-label": this.options.listLabel || "Models" }
         };
         if (!this.options.searchFirst) this.list = this.element.createDiv(listOptions);
-        this.search = this.element.createEl("input", {
+        const searchHost = this.options.compact
+          ? this.element.createDiv({ cls: "search-input-container codriver-model-popover-search-field" })
+          : this.element;
+        this.search = searchHost.createEl("input", {
           cls: "codriver-model-popover-search",
           attr: {
-            type: "search", placeholder: this.options.searchPlaceholder || "Search", "aria-label": this.options.searchLabel || "Search models",
+            type: "search",
+            placeholder: this.options.searchPlaceholder || (this.options.compact ? "Search models" : "Search"),
+            "aria-label": this.options.searchLabel || "Search models",
             role: "combobox", "aria-autocomplete": "list", "aria-expanded": "true",
             "aria-controls": listId
           }
@@ -43006,7 +43311,10 @@
         let index = 0;
         for (const group of groups) {
           const groupEl = this.list.createDiv({ attr: { role: "group", "aria-label": group.label || "Models" } });
-          if (group.label) groupEl.createDiv({ cls: "codriver-model-popover-heading", text: group.label, attr: { "aria-hidden": "true" } });
+          if (group.label) {
+            groupEl.addClass("codriver-model-popover-provider");
+            groupEl.createDiv({ cls: "codriver-model-popover-heading", text: group.label, attr: { "aria-hidden": "true" } });
+          }
           for (const model of group.models) {
             const active = model.value === this.activeValue && !model.disabled;
             const id = `${this.list.getAttribute("id")}-${index++}`;
@@ -43014,11 +43322,12 @@
               cls: `codriver-model-popover-option${active ? " is-active" : ""}`,
               text: model.label,
               attr: {
-                id, type: "button", role: "option", tabindex: "-1", title: model.label,
+                id, type: "button", role: "option", tabindex: "-1",
                 "aria-selected": String(model.value === this.options.selectedValue),
                 "aria-disabled": String(Boolean(model.disabled))
               }
             });
+            if (!this.options.compact) option.setAttribute("title", model.label);
             option.disabled = Boolean(model.disabled);
             // Keep the search focused so a mobile keyboard does not resize before selection.
             option.addEventListener("pointerdown", (event) => event.preventDefault());
@@ -43109,6 +43418,7 @@
     }
 
     function bindModelPicker(owner, button, options) {
+      if (options.compact) button.addClass("codriver-model-picker-compact-trigger");
       button.setAttribute("aria-haspopup", "dialog");
       button.setAttribute("aria-expanded", "false");
       const open = () => {
@@ -43537,7 +43847,7 @@
 
   function __load(request, parentId) {
     const id = parentId ? __resolve(request, parentId) : request;
-    const externalModules = new Set(["child_process","obsidian","crypto","dns","http","https"]);
+    const externalModules = new Set(["child_process","obsidian","crypto","dns","http","https","stream"]);
     if (externalModules.has(id)) {
       return require(id);
     }

@@ -261,7 +261,8 @@ function createProviderSettings(type, id = "") {
     temperature: "",
     topP: "",
     topK: "",
-    reasoningEffort: ""
+    reasoningEffort: "",
+    enableCors: false
   };
 }
 
@@ -299,6 +300,12 @@ function normalizeProviderSettings(provider, index = 0) {
     normalizedProvider.temperature = normalizeOptionalRangedNumberText(provider?.temperature, 0, 2);
     normalizedProvider.topP = normalizeOptionalRangedNumberText(provider?.topP, 0, 1);
     normalizedProvider.topK = normalizeOptionalIntegerText(provider?.topK);
+  }
+
+  if (providerType === OPENAI_PROVIDER_TYPE) {
+    normalizedProvider.enableCors = provider?.enableCors === true;
+  } else {
+    delete normalizedProvider.enableCors;
   }
 
   if (providerType === ANTHROPIC_PROVIDER_TYPE) {
@@ -863,7 +870,9 @@ class CoDriverPlugin extends Plugin {
       "audioTranscription"
     );
     const needsVoiceInputMigration = Boolean(savedSettings) &&
-      (!Object.hasOwn(savedSettings, "voiceInput") || Object.hasOwn(savedSettings.audioTranscription ?? {}, "voiceInputEnabled"));
+      (!Object.hasOwn(savedSettings, "voiceInput") ||
+        Object.hasOwn(savedSettings.voiceInput ?? {}, "speechSensitivity") ||
+        Object.hasOwn(savedSettings.audioTranscription ?? {}, "voiceInputEnabled"));
     const needsVaultAudioConsentMigration = Boolean(savedSettings) &&
       savedSettings.codriverVaultToolSettings?.[CODRIVER_VAULT_TRANSCRIBE_AUDIO_TOOL_NAME]?.autoConsentVersion !== VAULT_AUDIO_AUTO_CONSENT_VERSION;
     const needsTextDocumentConsentMigration = Boolean(savedSettings) && TEXT_DOCUMENT_MUTATION_TOOLS.some((name) =>

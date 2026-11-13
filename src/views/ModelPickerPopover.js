@@ -23,7 +23,7 @@ class ModelPickerPopover {
     // Keep modal focus containment and stacking ownership intact.
     this.host = this.button.closest(".modal") ?? doc.body;
     this.element = this.host.createDiv({
-      cls: "codriver-model-popover",
+      cls: this.options.compact ? "codriver-model-popover codriver-model-popover-compact" : "codriver-model-popover",
       attr: { id: `${listId}-dialog`, role: "dialog", "aria-label": this.options.label }
     });
     this.button.setAttribute("aria-expanded", "true");
@@ -33,10 +33,15 @@ class ModelPickerPopover {
       attr: { id: listId, role: "listbox", "aria-label": this.options.listLabel || "Models" }
     };
     if (!this.options.searchFirst) this.list = this.element.createDiv(listOptions);
-    this.search = this.element.createEl("input", {
+    const searchHost = this.options.compact
+      ? this.element.createDiv({ cls: "search-input-container codriver-model-popover-search-field" })
+      : this.element;
+    this.search = searchHost.createEl("input", {
       cls: "codriver-model-popover-search",
       attr: {
-        type: "search", placeholder: this.options.searchPlaceholder || "Search", "aria-label": this.options.searchLabel || "Search models",
+        type: "search",
+        placeholder: this.options.searchPlaceholder || (this.options.compact ? "Search models" : "Search"),
+        "aria-label": this.options.searchLabel || "Search models",
         role: "combobox", "aria-autocomplete": "list", "aria-expanded": "true",
         "aria-controls": listId
       }
@@ -82,7 +87,10 @@ class ModelPickerPopover {
     let index = 0;
     for (const group of groups) {
       const groupEl = this.list.createDiv({ attr: { role: "group", "aria-label": group.label || "Models" } });
-      if (group.label) groupEl.createDiv({ cls: "codriver-model-popover-heading", text: group.label, attr: { "aria-hidden": "true" } });
+      if (group.label) {
+        groupEl.addClass("codriver-model-popover-provider");
+        groupEl.createDiv({ cls: "codriver-model-popover-heading", text: group.label, attr: { "aria-hidden": "true" } });
+      }
       for (const model of group.models) {
         const active = model.value === this.activeValue && !model.disabled;
         const id = `${this.list.getAttribute("id")}-${index++}`;
@@ -90,11 +98,12 @@ class ModelPickerPopover {
           cls: `codriver-model-popover-option${active ? " is-active" : ""}`,
           text: model.label,
           attr: {
-            id, type: "button", role: "option", tabindex: "-1", title: model.label,
+            id, type: "button", role: "option", tabindex: "-1",
             "aria-selected": String(model.value === this.options.selectedValue),
             "aria-disabled": String(Boolean(model.disabled))
           }
         });
+        if (!this.options.compact) option.setAttribute("title", model.label);
         option.disabled = Boolean(model.disabled);
         // Keep the search focused so a mobile keyboard does not resize before selection.
         option.addEventListener("pointerdown", (event) => event.preventDefault());
@@ -185,6 +194,7 @@ class ModelPickerPopover {
 }
 
 function bindModelPicker(owner, button, options) {
+  if (options.compact) button.addClass("codriver-model-picker-compact-trigger");
   button.setAttribute("aria-haspopup", "dialog");
   button.setAttribute("aria-expanded", "false");
   const open = () => {

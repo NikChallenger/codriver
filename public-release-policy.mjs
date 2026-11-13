@@ -4,6 +4,7 @@ export const RELEASE_ASSET_FILES = Object.freeze(["main.js", "manifest.json", "s
 // Each release explicitly approves the already-public notes it must preserve.
 const PUBLIC_RETAINED_NOTES_BY_VERSION = Object.freeze({
   "0.6.1": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md", "docs/releases/0.5.3.md", "docs/releases/0.5.4.md", "docs/releases/0.5.5.md", "docs/releases/0.6.0.md"]),
+  "0.6.2": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md", "docs/releases/0.5.3.md", "docs/releases/0.5.4.md", "docs/releases/0.5.5.md", "docs/releases/0.6.0.md", "docs/releases/0.6.1.md"]),
   "0.5.2": Object.freeze(["docs/releases/0.5.1.md"]),
   "0.5.3": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md"]),
   "0.5.4": Object.freeze(["docs/releases/0.5.1.md", "docs/releases/0.5.2.md", "docs/releases/0.5.3.md"]),
@@ -52,6 +53,7 @@ export const PUBLIC_DIRECT_FILES = Object.freeze([
   "src/mcp/McpRuntimeSupport.js",
   "src/mcp/McpStdioClient.js",
   "src/mcp/McpToolUtils.js",
+  "src/providers/DesktopStreamingTransport.js",
   "src/providers/ProviderRegistry.js",
   "src/providers/StreamingTransport.js",
   "src/providers/anthropic/AnthropicClient.js",

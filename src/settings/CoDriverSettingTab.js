@@ -22,6 +22,7 @@ const {
 } = require("../mcp/CodriverVaultMcpServer");
 const {
   AUDIO_TRANSCRIPTION_TOOLTIP,
+  VOICE_INPUT_SPEECH_THRESHOLD_DBFS,
   decodeAudioTranscriptionSelection,
   encodeAudioTranscriptionSelection,
   getAudioTranscriptionModelChoices,
@@ -1073,11 +1074,7 @@ class CoDriverSettingTab extends PluginSettingTab {
     const select = setting.controlEl.createEl("button", {
       cls: "codriver-audio-transcription-select codriver-model-select-trigger",
       text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId : `Unavailable: ${current.modelId}`) : "Select model",
-      attr: {
-        type: "button",
-        "aria-label": "Select audio transcription model",
-        title: AUDIO_TRANSCRIPTION_TOOLTIP
-      }
+      attr: { type: "button", "aria-label": "Select audio transcription model" }
     });
     if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
       !isProviderModelDisabled(this.plugin.settings.providers?.find((provider) => provider.id === current.providerId), current.modelId)) {
@@ -1085,7 +1082,7 @@ class CoDriverSettingTab extends PluginSettingTab {
     }
     select.disabled = !current.enabled && !this.pendingAudioTranscriptionEnable;
     bindModelPicker(this, select, {
-      label: "Select audio transcription model", groups, selectedValue,
+      label: "Select audio transcription model", groups, selectedValue, compact: true, preferAbove: true,
       onChoose: async (value) => {
         const selection = decodeAudioTranscriptionSelection(value);
         if (!selection.providerId || !selection.modelId) {
@@ -1109,7 +1106,7 @@ class CoDriverSettingTab extends PluginSettingTab {
     if (current.enabled && !resolution.ok) {
       setting.settingEl.classList.add("is-invalid");
       select.setAttribute("aria-invalid", "true");
-      select.title = `${AUDIO_TRANSCRIPTION_TOOLTIP} ${resolution.message}`;
+      select.setAttribute("aria-description", resolution.message);
     }
     if (this.pendingAudioTranscriptionEnable) {
       setTimeout(() => select.focus(), 0);
@@ -1155,7 +1152,7 @@ class CoDriverSettingTab extends PluginSettingTab {
       cls: "codriver-audio-transcription-select codriver-model-select-trigger",
       text: current.modelId ? (availableValues.has(selectedValue) ? current.modelId
         : `Unavailable: ${current.modelId}`) : "Select model",
-      attr: { type: "button", "aria-label": "Select voice input provider and model", title: "Uses this provider and model only for microphone input." }
+      attr: { type: "button", "aria-label": "Select voice input provider and model" }
     });
     select.disabled = Platform.isMobile || (!current.enabled && !this.pendingVoiceInputEnable);
     if (current.providerId && current.modelId && !availableValues.has(selectedValue) &&
@@ -1163,7 +1160,7 @@ class CoDriverSettingTab extends PluginSettingTab {
       groups.push({ label: "", models: [{ model: current.modelId, label: `Unavailable: ${current.providerId} / ${current.modelId}`, value: selectedValue, disabled: true }] });
     }
     bindModelPicker(this, select, {
-      label: "Select voice input provider and model", groups, selectedValue,
+      label: "Select voice input provider and model", groups, selectedValue, compact: true, preferAbove: true,
       onChoose: async (value) => {
         const selection = decodeAudioTranscriptionSelection(value);
         if (!selection.providerId || !selection.modelId) return;
@@ -1178,7 +1175,6 @@ class CoDriverSettingTab extends PluginSettingTab {
     if (current.enabled && unavailableReason) {
       setting.settingEl.addClass("is-invalid");
       select.setAttribute("aria-invalid", "true");
-      select.title = unavailableReason;
       container.createDiv({ cls: "codriver-voice-unavailable",
         text: unavailableReason.replace(" Update it in Settings > Providers.", ""), attr: { role: "status" } });
     }
@@ -1215,6 +1211,36 @@ class CoDriverSettingTab extends PluginSettingTab {
       const result = await this.plugin.updateVoiceInputSettings({ timeoutSeconds: seconds });
       if (!result.ok) { input.value = String(current.timeoutSeconds); new Notice(result.message); }
       else current.timeoutSeconds = seconds;
+    });
+    const sensitivity = new Setting(options).setName("Speech sensitivity");
+    sensitivity.settingEl.setAttribute("title", "Raise sensitivity for quiet speech. Lower it if background noise triggers transcription.");
+    const { min, max } = VOICE_INPUT_SPEECH_THRESHOLD_DBFS;
+    // Higher slider positions lower the signal threshold and increase sensitivity.
+    const slider = sensitivity.controlEl.createEl("input", {
+      cls: "codriver-voice-input-sensitivity",
+      attr: { type: "range", min: String(-max), max: String(-min), step: "1", "aria-label": "Speech sensitivity" }
+    });
+    const thresholdLabel = sensitivity.controlEl.createSpan({ cls: "codriver-voice-input-threshold", attr: { "aria-hidden": "true" } });
+    const showThreshold = (threshold) => {
+      const text = `${threshold} dBFS`;
+      thresholdLabel.textContent = text;
+      slider.setAttribute("aria-valuetext", text);
+    };
+    slider.value = String(-current.speechThresholdDbfs);
+    slider.disabled = !current.enabled && !this.pendingVoiceInputEnable;
+    showThreshold(current.speechThresholdDbfs);
+    slider.addEventListener("input", () => showThreshold(-Number(slider.value)));
+    slider.addEventListener("change", async () => {
+      const threshold = -Number(slider.value);
+      const result = await this.plugin.updateVoiceInputSettings({ speechThresholdDbfs: threshold });
+      if (result.ok) current.speechThresholdDbfs = threshold;
+      else {
+        if (-Number(slider.value) === threshold) {
+          slider.value = String(-current.speechThresholdDbfs);
+          showThreshold(current.speechThresholdDbfs);
+        }
+        new Notice(result.message);
+      }
     });
   }
 
@@ -2186,6 +2212,16 @@ class ProviderSettingsModal extends Modal {
       endpointSetting.setDesc("Choose Custom to enter your regional workspace base URL from the Alibaba Cloud console.");
     }
 
+    if (this.draft.type === OPENAI_PROVIDER_TYPE) {
+      const corsSetting = new Setting(contentEl).setName("Enable CORS");
+      corsSetting.addToggle((toggle) => {
+        toggle.toggleEl.setAttribute("aria-label", "Enable CORS");
+        toggle.setValue(this.draft.enableCors === true).onChange((value) => {
+          this.draft.enableCors = value;
+        });
+      });
+    }
+
     if (this.draft.type === GEMINI_PROVIDER_TYPE) {
       new Setting(contentEl)
         .setName("API version")
@@ -2231,17 +2267,49 @@ class ProviderSettingsModal extends Modal {
 
     const modelSetting = new Setting(contentEl).setName("Default model");
     modelSetting.settingEl.classList.add("codriver-provider-model-setting");
+    modelSetting.addButton((button) => {
+      button
+        .setButtonText(this.draft.type === OPENAI_PROVIDER_TYPE ? "Load models" : "Test connection")
+        .onClick(async () => {
+          if (this.testing || this.saving) return;
+          if (!this.validateProviderEndpoint()) return;
+          this.testing = true;
+          this.setBusyControls(true);
+          let result;
+          try { result = await this.plugin.testProviderDraftConnection(this.credentialDraft()); }
+          catch { result = { ok: false, models: [], message: "Unable to connect to the provider. Check the endpoint, API key and account access." }; }
+          finally { this.testing = false; this.restoreBusyControls(); }
+          if (!this.draft) return;
+          this.modelCatalogUnavailable = !result.ok || !result.models?.length;
+          if (result.ok) {
+            this.draft.models = result.models;
+            if (this.manualModelEntered && this.draft.model.trim()) {
+              this.draft.models = this.getDraftModels();
+            }
+            this.draft.model = this.draft.models.includes(this.draft.model)
+              ? this.draft.model
+              : this.draft.models[0] ?? "";
+          }
+          button.setDisabled(false);
+          const message = this.draft.type === OPENAI_PROVIDER_TYPE
+            ? result.ok ? result.models.length ? "Model list loaded. Chat requests have not been tested."
+              : "No models returned. You can enter a model ID manually."
+              : `${result.message} You can enter a model ID manually.`
+            : result.message;
+          this.render(message, result.ok);
+        });
+    });
     const models = this.getDraftModels();
     const selectedValue = models.includes(this.draft.model) ? this.draft.model : models[0] ?? "";
     let modelIdInput = null;
     const modelButton = modelSetting.controlEl.createEl("button", {
       cls: "codriver-model-select-trigger",
       text: selectedValue || "Load models first",
-      attr: { type: "button", "aria-label": "Select default model", title: selectedValue || "Load models first" }
+      attr: { type: "button", "aria-label": "Select default model" }
     });
     modelButton.disabled = models.length === 0;
     const pickerOptions = {
-      label: "Select default model", selectedValue,
+      label: "Select default model", selectedValue, compact: true,
       groups: [{ label: "", models: models.map((model) => ({ model, label: model, value: model })) }],
       onChoose: (value) => {
         this.draft.model = value;
@@ -2251,43 +2319,10 @@ class ProviderSettingsModal extends Modal {
         this.manualModelEntered = false;
         if (modelIdInput) modelIdInput.value = value;
         modelButton.textContent = value;
-        modelButton.title = value;
         pickerOptions.selectedValue = value;
       }
     };
     bindModelPicker(this, modelButton, pickerOptions);
-    modelSetting.addButton((button) => {
-        button
-          .setButtonText(this.draft.type === OPENAI_PROVIDER_TYPE ? "Load models" : "Test connection")
-          .onClick(async () => {
-            if (this.testing || this.saving) return;
-            if (!this.validateProviderEndpoint()) return;
-            this.testing = true;
-            this.setBusyControls(true);
-            let result;
-            try { result = await this.plugin.testProviderDraftConnection(this.credentialDraft()); }
-            catch { result = { ok: false, models: [], message: "Unable to connect to the provider. Check the endpoint, API key and account access." }; }
-            finally { this.testing = false; this.restoreBusyControls(); }
-            if (!this.draft) return;
-            this.modelCatalogUnavailable = !result.ok || !result.models?.length;
-            if (result.ok) {
-              this.draft.models = result.models;
-              if (this.manualModelEntered && this.draft.model.trim()) {
-                this.draft.models = this.getDraftModels();
-              }
-              this.draft.model = this.draft.models.includes(this.draft.model)
-                ? this.draft.model
-                : this.draft.models[0] ?? "";
-            }
-            button.setDisabled(false);
-            const message = this.draft.type === OPENAI_PROVIDER_TYPE
-              ? result.ok ? result.models.length ? "Model list loaded. Chat compatibility depends on the selected model."
-                : "No models returned. You can enter a model ID manually."
-                : `${result.message} You can enter a model ID manually.`
-              : result.message;
-            this.render(message, result.ok);
-          });
-      });
 
     if (this.draft.type === OPENAI_PROVIDER_TYPE) {
       const manualSetting = new Setting(contentEl).setName("Model ID").addText((text) => {
@@ -2301,7 +2336,6 @@ class ProviderSettingsModal extends Modal {
           this.modelPickerPopover?.close();
           const currentModels = this.getDraftModels();
           modelButton.textContent = this.draft.model || (currentModels.length ? "Choose loaded model" : "Load models first");
-          modelButton.title = modelButton.textContent;
           modelButton.disabled = currentModels.length === 0;
           pickerOptions.selectedValue = this.draft.model;
           pickerOptions.groups = [{ label: "", models: currentModels.map((model) => ({ model, label: model, value: model })) }];
@@ -2428,7 +2462,8 @@ class ProviderSettingsModal extends Modal {
     const proposal = getOpenAiCompatiblePresetUpdate(this.draft, id);
     if (!proposal) return;
     const hadValues = Boolean(this.credentialInput || this.draft.apiKeySecretName || this.draft.model
-      || this.draft.models?.length || this.draft.temperature || this.draft.topP || this.draft.topK || this.draft.reasoningEffort);
+      || this.draft.models?.length || this.draft.temperature || this.draft.topP || this.draft.topK
+      || this.draft.reasoningEffort || this.draft.enableCors);
     if (proposal.endpointChanged) {
       this.plugin.discardProviderCredentialDraft?.(this.saveCredentialDraft);
       if (this.saveCredentialDraft) this.saveCredentialDraft.credentialInput = "";

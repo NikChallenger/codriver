@@ -1,3 +1,4 @@
+const { Platform } = require("obsidian");
 const { OPENAI_COMPATIBLE_PROVIDER_TYPE } = require("../../constants");
 const { OpenAiCompatibleClient } = require("./OpenAiCompatibleClient");
 const { OpenAiCompatibleTranscriptionAdapter } = require("./OpenAiCompatibleTranscriptionAdapter");
@@ -7,7 +8,10 @@ class OpenAiCompatibleProvider {
     this.id = settings.id;
     this.name = settings.name;
     this.type = OPENAI_COMPATIBLE_PROVIDER_TYPE;
-    this.supportsStreaming = true;
+    const enableCors = settings.enableCors === true;
+    const desktopCorsStreaming = enableCors && Platform?.isDesktopApp === true;
+    this.supportsStreaming = !enableCors || desktopCorsStreaming;
+    this.allowResponseRetries = !enableCors;
     this.defaultModel = settings.model;
     this.models = Array.isArray(settings.models) ? settings.models : [];
     this.hiddenModels = Array.isArray(settings.hiddenModels) ? settings.hiddenModels : [];
@@ -22,11 +26,15 @@ class OpenAiCompatibleProvider {
       temperature: settings.temperature,
       topP: settings.topP,
       topK: settings.topK,
-      reasoningEffort: settings.reasoningEffort
+      reasoningEffort: settings.reasoningEffort,
+      enableCors,
+      desktopCorsStreaming
     });
     this.client = new OpenAiCompatibleClient(settings.endpoint, () => this.resolveApiKey(), {
       diagnostics: this.diagnostics,
       fetch: options.fetch,
+      enableCors,
+      desktopCorsStreaming,
       requestOptions: {
         temperature: parseOptionalNumber(settings.temperature),
         top_p: parseOptionalNumber(settings.topP),

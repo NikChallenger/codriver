@@ -19,12 +19,22 @@ function normalizeAudioTranscriptionSettings(value) {
   };
 }
 
+const VOICE_INPUT_SPEECH_THRESHOLD_DBFS = Object.freeze({ min: -70, max: -20, default: -55 });
+const LEGACY_VOICE_INPUT_SENSITIVITY = Object.freeze({ low: -50, normal: -55, high: -60 });
+
 const DEFAULT_VOICE_INPUT_SETTINGS = Object.freeze({
   enabled: false,
   providerId: "",
   modelId: "",
-  timeoutSeconds: 15
+  timeoutSeconds: 15,
+  speechThresholdDbfs: VOICE_INPUT_SPEECH_THRESHOLD_DBFS.default
 });
+
+function normalizeVoiceSpeechThreshold(value) {
+  const { min, max, default: defaultThreshold } = VOICE_INPUT_SPEECH_THRESHOLD_DBFS;
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(min, Math.min(max, Math.round(value))) : defaultThreshold;
+}
 
 function normalizeVoiceInputSettings(value, legacyAudio = null) {
   // Preserve only the exact previously enabled voice destination during the split.
@@ -32,12 +42,18 @@ function normalizeVoiceInputSettings(value, legacyAudio = null) {
     ? { enabled: true, providerId: legacyAudio.providerId, modelId: legacyAudio.modelId }
     : value;
   const timeout = source?.timeoutSeconds;
+  const legacySensitivity = source?.speechSensitivity;
+  let threshold = source?.speechThresholdDbfs;
+  if (threshold === undefined && typeof legacySensitivity === "string" && Object.hasOwn(LEGACY_VOICE_INPUT_SENSITIVITY, legacySensitivity)) {
+    threshold = LEGACY_VOICE_INPUT_SENSITIVITY[legacySensitivity];
+  }
   return {
     enabled: source?.enabled === true,
     providerId: normalizeIdentity(source?.providerId),
     modelId: normalizeIdentity(source?.modelId),
     timeoutSeconds: typeof timeout === "number" && Number.isFinite(timeout)
-      ? Math.max(5, Math.min(300, Math.floor(timeout))) : DEFAULT_VOICE_INPUT_SETTINGS.timeoutSeconds
+      ? Math.max(5, Math.min(300, Math.floor(timeout))) : DEFAULT_VOICE_INPUT_SETTINGS.timeoutSeconds,
+    speechThresholdDbfs: normalizeVoiceSpeechThreshold(threshold)
   };
 }
 
@@ -167,6 +183,8 @@ module.exports = {
   AUDIO_TRANSCRIPTION_TOOLTIP,
   DEFAULT_AUDIO_TRANSCRIPTION_SETTINGS,
   DEFAULT_VOICE_INPUT_SETTINGS,
+  VOICE_INPUT_SPEECH_THRESHOLD_DBFS,
+  normalizeVoiceSpeechThreshold,
   normalizeVoiceInputSettings,
   resolveVoiceInputSelection,
   decodeAudioTranscriptionSelection,

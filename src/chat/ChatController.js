@@ -1332,7 +1332,7 @@ class ChatController {
       }),
       onChange: (state) => {
         if (state.phase === "error") {
-          void this.logDiagnostic("voice.input.failed", { status: "error", message: state.error }).catch(() => {});
+          void this.logDiagnostic("voice.input.failed", { status: "error", message: state.error, ...state.failure }).catch(() => {});
         }
         void this.notifyStateChanged({ type: "voice-input" });
       }
@@ -1526,9 +1526,10 @@ class ChatController {
       available,
       unavailableReason: enabled && !available ? configuration.error || "Voice input is unavailable in this chat." : "",
       timeoutMs: voiceInput.timeoutSeconds * 1000,
+      speechThresholdDbfs: voiceInput.speechThresholdDbfs,
       binding: JSON.stringify([this.currentSessionId, this.voiceSessionRevision, enabled,
         configuration.providerId, configuration.model, configuration.endpoint, configuration.authenticationPath,
-        providerBinding, voiceInput.timeoutSeconds])
+        providerBinding, voiceInput.timeoutSeconds, voiceInput.speechThresholdDbfs])
     };
   }
 
@@ -4894,7 +4895,8 @@ class ChatController {
   }
 
   async retryEmptyProviderResponseIfNeeded(response, options) {
-    if (!isEmptyProviderResponse(response) || options?.activeRequest?.streamingRequested === true) {
+    if (!isEmptyProviderResponse(response) || options?.activeRequest?.streamingRequested === true
+      || options?.provider?.allowResponseRetries === false) {
       return {
         response,
         cancelled: false,
@@ -5013,8 +5015,11 @@ class ChatController {
       !providerResponseHasMcpToolCall(response) &&
       !isConciseNoteChangeClarification(response)
     );
-    if (activeRequest?.streamingRequested === true && missingRequiredToolCall) {
-      void this.logDiagnostic("provider.note_change_tool.streaming_contract_failed", {
+    if (missingRequiredToolCall && (activeRequest?.streamingRequested === true || provider?.allowResponseRetries === false)) {
+      const diagnostic = activeRequest?.streamingRequested === true
+        ? "provider.note_change_tool.streaming_contract_failed"
+        : "provider.note_change_tool.buffered_contract_failed";
+      void this.logDiagnostic(diagnostic, {
         ...createMcpToolChainDiagnostic(chainState),
         phase,
         model: safeDiagnosticLabel(model),
@@ -8739,11 +8744,13 @@ class ChatController {
       await this.flushProviderProgressRender(activeRequest);
     }
     if (
-      activeRequest?.streamingRequested === true &&
+      (activeRequest?.streamingRequested === true || provider?.allowResponseRetries === false) &&
       isEmptyProviderResponse(response) &&
       !didProviderAttemptUnavailableToolCall(response)
     ) {
-      throw new Error("The provider returned an empty streaming response.");
+      throw new Error(activeRequest?.streamingRequested === true
+        ? "The provider returned an empty streaming response."
+        : "The provider returned an empty response.");
     }
     return {
       blocked: false,

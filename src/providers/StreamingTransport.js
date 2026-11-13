@@ -110,6 +110,7 @@ async function consumeServerSentEvents(response, onEvent) {
     } catch {
       // The stream may already have released its reader after cancellation.
     }
+    response.close?.();
   }
 
   if (eventCount === 0) {
