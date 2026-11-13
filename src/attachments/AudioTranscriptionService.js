@@ -4,6 +4,7 @@ const {
   AudioValidationError,
   inspectAudioBuffer
 } = require("./AudioInspector");
+const { normalizeVoiceSpeechThreshold } = require("../settings/AudioTranscriptionSettings");
 
 const DEFAULT_MAX_AUDIO_FILES = 3;
 const DEFAULT_MAX_COMBINED_AUDIO_BYTES = 30 * 1024 * 1024;
@@ -548,6 +549,22 @@ function readFiniteNumber(value) {
 const VOICE_RECORDING_LIMIT_MS = 5 * 60 * 1000;
 const VOICE_OPERATION_TIMEOUT_MS = 15000;
 const VOICE_MAX_BYTES = 15 * 1024 * 1024;
+const VOICE_STOP_ERROR_CODES = new Set([
+  "voice-recording-empty",
+  "voice-recording-invalid",
+  "transcription-not-configured",
+  "transcription-endpoint-invalid",
+  "transcription-endpoint-unsafe",
+  "transcription-model-missing",
+  "transcription-secret-missing",
+  "transcription-authentication-failed",
+  "transcription-rate-limited",
+  "transcription-provider-rejected",
+  "transcription-provider-unavailable",
+  "transcription-response-invalid",
+  "transcription-result-empty",
+  "transcription-result-invalid"
+]);
 
 // This processor is bundled source, never user/skill content. It has no network or file access.
 const VOICE_CAPTURE_PROCESSOR = `
@@ -598,9 +615,10 @@ function voiceError(code, message) {
 
 function encodeVoiceWav(chunks, sampleRate) {
   const count = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  if (!count || !Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000 ||
+  if (!count) throw voiceError("voice-recording-empty", "The microphone did not capture audio samples.");
+  if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000 ||
       count * 2 + 44 > VOICE_MAX_BYTES || count > sampleRate * 300) {
-    throw voiceError("voice-recording-invalid", "The recording is empty or exceeds the voice input limit.");
+    throw voiceError("voice-recording-invalid", "The recording format or size is outside the voice input limits.");
   }
   const buffer = new ArrayBuffer(44 + count * 2);
   const view = new DataView(buffer);
@@ -615,6 +633,56 @@ function encodeVoiceWav(chunks, sampleRate) {
   let offset = 44;
   for (const chunk of chunks) for (const sample of chunk) { view.setInt16(offset, sample, true); offset += 2; }
   return buffer;
+}
+
+function hasVoiceActivity(audio, speechThresholdDbfs) {
+  const headerSize = 44;
+  const wav = new DataView(audio);
+  const sampleRate = wav.getUint32(24, true);
+  const sampleBytes = wav.byteLength - headerSize;
+  // The desktop encoder emits one fixed-format mono PCM16 data chunk.
+  if (wav.getUint32(4, true) !== wav.byteLength - 8 ||
+      wav.getUint32(12) !== 0x666d7420 || wav.getUint32(16, true) !== 16 || // "fmt "
+      wav.getUint16(20, true) !== 1 || wav.getUint16(22, true) !== 1 ||
+      sampleRate < 8000 || sampleRate > 96000 || wav.getUint32(28, true) !== sampleRate * 2 ||
+      wav.getUint16(32, true) !== 2 || wav.getUint16(34, true) !== 16 ||
+      wav.getUint32(36) !== 0x64617461 || wav.getUint32(40, true) !== sampleBytes || sampleBytes % 2 !== 0) { // "data"
+    throw voiceError("voice-recording-invalid", "The recording does not match the microphone WAV format.");
+  }
+
+  const frameSamples = Math.round(sampleRate * 0.02);
+  const windowSamples = Math.round(sampleRate * 0.2);
+  const minimumSamples = Math.ceil(sampleRate * 0.1);
+  const thresholdDbfs = normalizeVoiceSpeechThreshold(speechThresholdDbfs);
+  const minimumPower = 32768 ** 2 * 10 ** (thresholdDbfs / 10);
+  const activeFrames = [];
+  let activeSamples = 0;
+  const sampleCount = sampleBytes / 2;
+  for (let start = 0; start < sampleCount; start += frameSamples) {
+    const end = Math.min(start + frameSamples, sampleCount);
+    const count = end - start;
+    let sum = 0;
+    let sumOfSquares = 0;
+    for (let offset = headerSize + start * 2; offset < headerSize + end * 2; offset += 2) {
+      const sample = wav.getInt16(offset, true);
+      sum += sample;
+      sumOfSquares += sample * sample;
+    }
+    // Mean-square power after removing the frame's DC offset.
+    const power = sumOfSquares / count - (sum / count) ** 2;
+    if (power < minimumPower) continue;
+
+    const windowStart = end - windowSamples;
+    while (activeFrames.length && activeFrames[0].end <= windowStart) {
+      const expired = activeFrames.shift();
+      activeSamples -= expired.end - expired.start;
+    }
+    activeFrames.push({ start, end });
+    activeSamples += count;
+    const outsideWindow = Math.max(0, windowStart - activeFrames[0].start);
+    if (activeSamples - outsideWindow >= minimumSamples) return true;
+  }
+  return false;
 }
 
 async function createDesktopVoiceCapture({ signal, onError }, host = globalThis) {
@@ -713,8 +781,9 @@ class VoiceInputSession {
     this.state = { phase: "idle", error: "" };
   }
 
-  publish(phase, error = "") {
+  publish(phase, error = "", failure) {
     this.state = { phase, error };
+    if (failure) this.state.failure = failure;
     this.onChange(this.state);
   }
 
@@ -750,11 +819,11 @@ class VoiceInputSession {
     this.publish("idle");
   }
 
-  fail(operation, message) {
+  fail(operation, message, failure) {
     if (this.operation !== operation) return;
     this.operation = null;
     this.release(operation);
-    this.publish("error", message);
+    this.publish("error", message, failure);
   }
 
   async start() {
@@ -792,31 +861,58 @@ class VoiceInputSession {
     clearTimeout(operation.timer);
     const timeoutMs = Number.isFinite(operation.configuration.timeoutMs)
       ? Math.max(5000, Math.min(300000, operation.configuration.timeoutMs)) : this.operationTimeoutMs;
-    operation.timer = setTimeout(() => this.fail(operation, "Voice transcription timed out. The recording was discarded."), timeoutMs);
+    let stage = "capture-finalization";
+    operation.timer = setTimeout(() => this.fail(operation, "Voice transcription timed out. The recording was discarded.",
+      { stage, code: "timeout" }), timeoutMs);
     this.publish("transcribing");
     try {
       this.validate(operation);
       let audio = await raceWithAbort(operation.capture.stop(), operation.controller.signal);
       this.validate(operation);
+      stage = "recording-validation";
       inspectAudioBuffer(audio, { name: "voice-input.wav", extension: "wav", mimeType: "audio/wav", size: audio.byteLength },
         { maxBytes: VOICE_MAX_BYTES, maxDurationMs: VOICE_RECORDING_LIMIT_MS });
+      if (!hasVoiceActivity(audio, operation.configuration.speechThresholdDbfs)) {
+        this.operation = null;
+        this.release(operation);
+        this.publish("no-speech");
+        return null;
+      }
+      stage = "provider-preparation";
       const response = await raceWithAbort(Promise.resolve().then(() => {
         this.validate(operation);
         return this.transcribe({ audio, model: operation.configuration.model, signal: operation.controller.signal,
-          beforeUpload: () => this.validate(operation) }, operation.configuration);
+          beforeUpload: () => {
+            this.validate(operation);
+            stage = "provider-request";
+          } }, operation.configuration);
       }), operation.controller.signal);
       audio = null;
       this.validate(operation);
-      if (typeof response?.text !== "string" || response.text.length > DEFAULT_MAX_TRANSCRIPT_CHARS * 2) throw new Error("Invalid transcript");
+      stage = "transcript-validation";
+      if (typeof response?.text !== "string" || response.text.length > DEFAULT_MAX_TRANSCRIPT_CHARS * 2) {
+        throw voiceError("transcription-result-invalid", "The transcription result is invalid.");
+      }
       const normalized = normalizeTranscript(response.text, DEFAULT_MAX_TRANSCRIPT_CHARS);
-      if (!normalized.text || normalized.truncated) throw new Error("Invalid transcript");
+      if (!normalized.text) throw voiceError("transcription-result-empty", "The transcription result is empty.");
+      if (normalized.truncated) throw voiceError("transcription-result-invalid", "The transcription result exceeds the voice input limit.");
       const result = { text: normalized.text, binding: operation.configuration.binding, revision: this.resultRevision };
       this.operation = null;
       this.release(operation);
       this.publish("idle");
       return result;
-    } catch {
-      this.fail(operation, "Voice transcription failed or returned no usable speech. The draft was kept unchanged.");
+    } catch (error) {
+      const failure = { stage, code: "failed" };
+      let message = "Voice transcription failed or returned no usable speech. The draft was kept unchanged.";
+      if (error instanceof AudioTranscriptionError && VOICE_STOP_ERROR_CODES.has(error.code)) {
+        failure.code = error.code;
+        const { httpStatus } = error;
+        if (stage === "provider-request" && Number.isInteger(httpStatus) && httpStatus >= 300 && httpStatus <= 599) {
+          failure.httpStatus = httpStatus;
+          message = `Voice transcription failed (HTTP ${httpStatus}). The draft was kept unchanged.`;
+        }
+      }
+      this.fail(operation, message, failure);
       return null;
     }
   }

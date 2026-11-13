@@ -65,7 +65,9 @@ class OpenAiCompatibleTranscriptionAdapter {
       );
     }
     if (response.status < 200 || response.status >= 300) {
-      throw createHttpError(response.status);
+      const error = createHttpError(response.status);
+      error.httpStatus = response.status;
+      throw error;
     }
 
     const data = readJsonResponse(response);

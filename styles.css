@@ -467,6 +467,20 @@
   width: 70px;
 }
 
+.codriver-voice-input-sensitivity {
+  min-width: 0;
+  width: 110px;
+}
+
+.codriver-voice-input-threshold {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+  min-width: 60px;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .codriver-voice-input-setting.is-invalid .codriver-audio-transcription-select {
   border-color: var(--text-error);
 }
@@ -2206,27 +2220,55 @@
   white-space: nowrap;
 }
 
-.codriver-provider-preset-setting .codriver-model-select-trigger,
-.codriver-provider-model-id-setting input {
+.codriver-provider-preset-setting .codriver-model-select-trigger {
   width: 22.4rem;
   max-width: 100%;
   min-width: 0;
+}
+
+.codriver-provider-modal {
+  --codriver-provider-model-controls-width: 20rem;
+}
+
+.codriver-provider-modal .codriver-provider-model-setting,
+.codriver-openai-provider-modal .codriver-provider-model-id-setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) min(var(--codriver-provider-model-controls-width), 65%);
+  gap: 8px;
+}
+
+.codriver-openai-provider-modal .codriver-provider-model-id-setting {
+  border-top: 0;
 }
 
 .codriver-provider-modal.codriver-openai-provider-modal .codriver-provider-model-id-setting[hidden] {
   display: none;
 }
 
-.codriver-openai-provider-modal .codriver-provider-model-setting .setting-item-control {
+.codriver-provider-modal .codriver-provider-model-setting .setting-item-control,
+.codriver-openai-provider-modal .codriver-provider-model-id-setting .setting-item-control {
+  justify-self: end;
+  max-width: var(--codriver-provider-model-controls-width);
   min-width: 0;
-  flex-wrap: wrap;
+  width: 100%;
+}
+
+.codriver-provider-modal .codriver-provider-model-setting .setting-item-control {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
   gap: 8px;
+}
+
+.codriver-provider-model-id-setting input {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
 }
 
 .is-mobile .codriver-openai-provider-modal .codriver-provider-preset-setting,
 .is-mobile .codriver-openai-provider-modal .codriver-provider-endpoint-setting,
 .is-mobile .codriver-openai-provider-modal .codriver-provider-model-id-setting,
-.is-mobile .codriver-openai-provider-modal .codriver-provider-model-setting {
+.is-mobile .codriver-provider-modal .codriver-provider-model-setting {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 8px;
@@ -2236,7 +2278,7 @@
   .codriver-openai-provider-modal .codriver-provider-preset-setting,
   .codriver-openai-provider-modal .codriver-provider-endpoint-setting,
   .codriver-openai-provider-modal .codriver-provider-model-id-setting,
-  .codriver-openai-provider-modal .codriver-provider-model-setting {
+  .codriver-provider-modal .codriver-provider-model-setting {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
@@ -2307,6 +2349,67 @@
 .codriver-picker-search-first .codriver-model-popover-search {
   margin-top: 0;
   margin-bottom: 6px;
+}
+
+.codriver-model-popover-compact,
+.codriver-model-picker-compact-trigger {
+  --no-tooltip: true;
+}
+
+.codriver-model-popover-compact .codriver-model-popover-heading {
+  color: var(--text-accent);
+  padding-bottom: 4px;
+}
+
+.codriver-model-popover-compact .codriver-model-popover-provider + .codriver-model-popover-provider {
+  border-top: 1px solid var(--background-modifier-border);
+  margin-top: 6px;
+  padding-top: 4px;
+}
+
+.codriver-model-popover-compact button.codriver-model-popover-option {
+  align-items: center;
+  background: transparent;
+  box-shadow: none;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 12px;
+}
+
+.codriver-model-popover-compact button.codriver-model-popover-option:not(:disabled, [aria-selected="true"]):hover {
+  background: var(--background-modifier-hover);
+}
+
+.codriver-model-popover-compact button.codriver-model-popover-option[aria-selected="true"] {
+  background: color-mix(in srgb, var(--interactive-accent) 12%, transparent);
+  font-weight: inherit;
+}
+
+.codriver-model-popover-compact button.codriver-model-popover-option::after {
+  content: "";
+}
+
+.codriver-model-popover-compact button.codriver-model-popover-option[aria-selected="true"]::after {
+  border: solid var(--text-accent);
+  border-width: 0 2px 2px 0;
+  box-sizing: border-box;
+  height: 9px;
+  justify-self: center;
+  transform: rotate(45deg);
+  width: 5px;
+}
+
+.codriver-model-popover-compact .codriver-model-popover-search-field {
+  flex: 0 0 auto;
+  margin: 6px 0 0;
+  min-width: 0;
+}
+
+.codriver-model-popover-search-field input.codriver-model-popover-search {
+  --input-border-width-focus: 1px;
+  box-sizing: border-box;
+  display: block;
+  margin: 0;
 }
 
 .codriver-model-picker-button:focus-visible,

@@ -64,7 +64,7 @@ function getOpenAiCompatiblePresetUpdate(draft, id) {
   if (id !== "custom" && genericName) update.name = preset.name;
   if (endpointChanged) {
     Object.assign(update, { endpoint: preset.endpoint, apiKeySecretName: "", model: "", models: [], hiddenModels: [],
-      temperature: "", topP: "", topK: "", reasoningEffort: "" });
+      temperature: "", topP: "", topK: "", reasoningEffort: "", enableCors: false });
   }
   return { update, endpointChanged };
 }

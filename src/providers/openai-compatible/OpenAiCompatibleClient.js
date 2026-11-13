@@ -1,5 +1,6 @@
 const { requestUrl } = require("obsidian");
 const { DEFAULT_OPENAI_COMPATIBLE_BASE_URL } = require("../../constants");
+const { createDesktopChatUrl, openDesktopStreamingResponse } = require("../DesktopStreamingTransport");
 const {
   consumeServerSentEvents,
   isSuccessfulResponse,
@@ -32,6 +33,8 @@ class OpenAiCompatibleClient {
     this.requestOptions = normalizeRequestOptions(options.requestOptions);
     this.diagnostics = options.diagnostics ?? null;
     this.fetch = options.fetch;
+    this.enableCors = options.enableCors === true;
+    this.desktopChatBaseUrl = this.enableCors && options.desktopCorsStreaming === true ? String(baseUrl ?? "") : null;
   }
 
   async createHeaders(extraHeaders = {}, onDiagnosticSecret) {
@@ -98,7 +101,7 @@ class OpenAiCompatibleClient {
       body.parallel_tool_calls = false;
     }
 
-    if (typeof options.onProgress === "function") {
+    if ((!this.enableCors || this.desktopChatBaseUrl !== null) && typeof options.onProgress === "function") {
       return await this.createStreamingChatCompletion(model, body, nativeTools, signal, options.onProgress, options.onDiagnosticSecret);
     }
 
@@ -111,21 +114,18 @@ class OpenAiCompatibleClient {
       body: JSON.stringify(body)
     };
 
-    if (signal) {
-      request.signal = signal;
-    }
-
     const response = await this.sendRequest(request, {
       event: "provider.openai.chat.request.failed",
       endpoint: summarizeEndpoint(this.baseUrl),
       model
-    });
+    }, signal);
     const jsonRead = readResponseJson(response);
+    const responseStatus = Number.isInteger(response?.status) ? response.status : null;
 
     await this.logDiagnostic("provider.openai.chat.response.received", {
       endpoint: summarizeEndpoint(this.baseUrl),
       model,
-      response: createChatResponseSummary(response, jsonRead)
+      response: this.enableCors ? { status: responseStatus, hasJson: jsonRead.hasJson } : createChatResponseSummary(response, jsonRead)
     });
 
     if (response.status < 200 || response.status >= 300) {
@@ -133,8 +133,9 @@ class OpenAiCompatibleClient {
         status: "failed",
         endpoint: summarizeEndpoint(this.baseUrl),
         model,
-        response: createProviderHttpErrorSummary(response, jsonRead)
+        response: this.enableCors ? { status: responseStatus } : createProviderHttpErrorSummary(response, jsonRead)
       });
+      if (this.enableCors) throw new Error(`Chat completion request failed with status ${responseStatus ?? "unknown"}.`);
       throw new Error(createProviderHttpErrorMessage("Chat completion request", response, jsonRead));
     }
 
@@ -144,7 +145,7 @@ class OpenAiCompatibleClient {
         status: "failed",
         endpoint: summarizeEndpoint(this.baseUrl),
         model,
-        response: createRejectedChatResponseSummary(response, jsonRead)
+        response: this.enableCors ? { status: responseStatus, hasJson: jsonRead.hasJson } : createRejectedChatResponseSummary(response, jsonRead)
       });
       throw new Error(`The provider responded, but not with an OpenAI-compatible chat response. ${endpointGuidance(this.baseUrl)}`);
     }
@@ -173,6 +174,7 @@ class OpenAiCompatibleClient {
 
     const metadata = createOpenAiResponseMetadata(data, firstChoice);
     const providerContext = createOpenAiProviderContext(body.messages, message, message.tool_calls, toolCalls);
+    signal?.throwIfAborted();
     return {
       content,
       toolCalls,
@@ -185,8 +187,9 @@ class OpenAiCompatibleClient {
   }
 
   async createStreamingChatCompletion(model, body, nativeTools, signal, onProgress, onDiagnosticSecret) {
+    const desktopUrl = this.desktopChatBaseUrl === null ? null : createDesktopChatUrl(this.desktopChatBaseUrl);
     const request = {
-      url: `${this.baseUrl}/chat/completions`,
+      url: desktopUrl?.href ?? `${this.baseUrl}/chat/completions`,
       method: "POST",
       headers: await this.createHeaders({
         Accept: "text/event-stream",
@@ -200,17 +203,34 @@ class OpenAiCompatibleClient {
     };
     let response;
     try {
-      response = await openStreamingResponse(request, { fetch: this.fetch });
+      response = desktopUrl
+        ? await openDesktopStreamingResponse(desktopUrl, request)
+        : await openStreamingResponse(request, { fetch: this.fetch });
     } catch (error) {
+      const aborted = signal?.aborted === true || error?.name === "AbortError";
+      const connectionFailed = !aborted && !desktopUrl && error instanceof TypeError;
       await this.logDiagnostic("provider.openai.chat.request.failed", {
         endpoint: summarizeEndpoint(this.baseUrl),
         model,
-        error: createProviderRequestErrorSummary(error)
+        reason: aborted ? "cancelled" : connectionFailed ? "stream-connection-failed" : "stream-unavailable"
       });
+      if (connectionFailed) {
+        throw new Error("Could not connect to the provider for streaming. Check the endpoint and network. If the provider blocks browser requests due to CORS, turn on Enable CORS in the provider settings.");
+      }
       throw error;
     }
 
     if (!isSuccessfulResponse(response)) {
+      if (desktopUrl) {
+        const status = response.status;
+        await this.logDiagnostic("provider.openai.chat.response.failed", {
+          status: "failed", endpoint: summarizeEndpoint(this.baseUrl), model, response: { status }
+        });
+        if (status >= 300 && status < 400) {
+          throw new Error(`Chat completion request returned a redirect (${status}). Use the final provider endpoint with Enable CORS.`);
+        }
+        throw new Error(`Chat completion request failed with status ${status}.`);
+      }
       const snapshot = await readFetchResponse(response);
       const jsonRead = createFetchJsonRead(snapshot);
       await this.logDiagnostic("provider.openai.chat.response.failed", {
@@ -235,6 +255,7 @@ class OpenAiCompatibleClient {
         throw new Error("The provider returned malformed JSON in the Chat Completions event stream.");
       }
       if (data?.error) {
+        if (desktopUrl) throw new Error("The provider reported an error in the Chat Completions stream.");
         const snapshot = {
           status: Number.isInteger(response.status) ? response.status : 200,
           headers: {},
@@ -281,6 +302,7 @@ class OpenAiCompatibleClient {
     const toolCalls = normalizeOpenAiToolCalls(rawToolCalls, nativeTools);
     const assistantMessage = createStreamingOpenAiAssistantMessage(state, rawToolCalls);
     const providerContext = createOpenAiProviderContext(body.messages, assistantMessage, rawToolCalls, toolCalls);
+    if (desktopUrl) signal?.throwIfAborted();
     return {
       content: state.content,
       toolCalls,
@@ -313,19 +335,36 @@ class OpenAiCompatibleClient {
     await this.diagnostics.debug(event, detail);
   }
 
-  async sendRequest(request, failureDiagnostic) {
+  async sendRequest(request, failureDiagnostic, signal) {
+    let onAbort;
     try {
-      return await requestUrl({
-        ...request,
-        throw: false
+      signal?.throwIfAborted();
+      if (!signal) return await requestUrl({ ...request, throw: false });
+
+      // Obsidian buffers the response and cannot abort an in-flight requestUrl call.
+      const cancelled = new Promise((_, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
       });
+      const response = await Promise.race([cancelled, requestUrl({ ...request, throw: false })]);
+      signal.throwIfAborted();
+      return response;
     } catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      const status = readErrorStatus(error);
       await this.logDiagnostic(failureDiagnostic.event, {
         endpoint: failureDiagnostic.endpoint,
         model: failureDiagnostic.model,
-        error: createProviderRequestErrorSummary(error)
+        error: this.enableCors ? { status } : createProviderRequestErrorSummary(error)
       });
+      if (this.enableCors) {
+        throw new Error(status === null
+          ? "Could not connect to the provider. Check the endpoint and network."
+          : `Chat completion request failed with status ${status}.`);
+      }
       throw error;
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
     }
   }
 }

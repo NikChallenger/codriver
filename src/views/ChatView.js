@@ -2505,25 +2505,18 @@ class ChatView extends ItemView {
     const selectedModelId = this.chatController.getSelectedModelId();
     const modelPickerButton = modelPicker.createEl("button", {
       cls: "codriver-model-picker-button",
-      attr: {
-        type: "button",
-        "aria-label": "Select model",
-        title: selectedModelId ? `Model: ${selectedModelId}` : "Select model"
-      }
+      attr: { type: "button", "aria-label": "Select model" }
     });
     setIcon(modelPickerButton, "bot");
     this.modelPickerButtonEl = modelPickerButton;
     modelPickerButton.disabled = modelChoices.length === 0;
-    if (modelPickerButton.disabled) modelPickerButton.title = "No visible models";
+    if (modelPickerButton.disabled) modelPickerButton.setAttribute("aria-description", "No visible models");
     modelPicker.createDiv({
       cls: "codriver-selected-model-name",
-      text: selectedModelId || "No model",
-      attr: {
-        title: selectedModelId || "No model selected"
-      }
+      text: selectedModelId || "No model"
     });
     bindModelPicker(this, modelPickerButton, {
-      label: "Select model", preferAbove: true,
+      label: "Select model", compact: true, preferAbove: true,
       selectedValue: encodeModelOptionValue(selectedProviderId, selectedModelId),
       groups: modelChoices.map((provider) => ({
         label: provider.providerName,
@@ -2578,7 +2571,7 @@ class ChatView extends ItemView {
       void submitDraft();
     });
     const voiceStatusText = voiceState.error || ({ starting: "Waiting for microphone...", recording: "Recording. Click Stop to transcribe. Escape to cancel.",
-      transcribing: "Transcribing... Escape to cancel." }[voiceState.phase] ?? "");
+      transcribing: "Transcribing... Escape to cancel.", "no-speech": "No speech detected." }[voiceState.phase] ?? "");
     if (voiceStatusText) {
       composer.createDiv({ cls: `codriver-voice-status${voiceState.error ? " codriver-voice-error" : ""}`, text: voiceStatusText,
         attr: { role: "status", "aria-live": "polite", title: voiceStatusText } });
@@ -2599,7 +2592,10 @@ class ChatView extends ItemView {
       setIcon(microphone, recording ? "square" : "mic");
       microphone.toggleClass("is-recording", recording);
       microphone.disabled = unavailable || this.chatController.isSending() || ["starting", "transcribing"].includes(voiceState.phase);
-      microphone.addEventListener("mousedown", () => this.rememberVoiceCaret(input));
+      microphone.addEventListener("mousedown", (event) => {
+        this.rememberVoiceCaret(input);
+        if (event.button === 0 && input.ownerDocument?.activeElement === input) event.preventDefault();
+      });
       microphone.addEventListener("click", () => { if (!unavailable) void this.toggleVoiceInput(); });
     }
   }
